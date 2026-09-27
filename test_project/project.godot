@@ -2,7 +2,7 @@
 
 config/name="godot-libpd-test"
 config/features=PackedStringArray("4.6")
-run/main_scene="res://scenes/test_instance.tscn"
+run/main_scene="res://scenes/boot_check.tscn"
 
 [autoload]
 

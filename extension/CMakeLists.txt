@@ -56,6 +56,7 @@ add_library(godot_libpd SHARED
     src/libpd_worker.cpp
     src/core/pd_event_ring.cpp
     src/core/pd_command_queue.cpp
+    src/core/pd_audio_sink_generator.cpp
 )
 
 set_target_properties(godot_libpd PROPERTIES

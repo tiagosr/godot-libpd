@@ -1,5 +1,6 @@
 #include "libpd_instance.h"
 
+#include <godot_cpp/classes/audio_server.hpp>
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/file_access.hpp>
@@ -7,6 +8,7 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include <cmath>
 #include <cstdio>
 #include <future>
 #include <mutex>
@@ -46,9 +48,9 @@ LibpdInstance::LibpdInstance() :
 			cfg.samplerate = 44100;
 			cfg.n_ins = 0;
 			cfg.n_out = 2;
-			// Note: dry_sink is a later member; taking its address here is safe
-			// because the worker only dereferences it during processing (post-construction).
-			cfg.sink = &dry_sink;
+			// Note: sink is a later member; taking its address here is safe because
+			// the worker only dereferences it during processing (post-construction).
+			cfg.sink = &sink;
 			cfg.on_event = [](const godot_libpd::PdEvent &e) {
 				if (LibpdServer::get_singleton() != nullptr) {
 					LibpdServer::get_singleton()->push_event(e);
@@ -56,7 +58,8 @@ LibpdInstance::LibpdInstance() :
 			};
 			return cfg;
 		}()) {
-	// dry_sink is the default sink; replaced by GeneratorSink in Task 5.
+	// The main thread pumps the generator sink every frame.
+	set_process(true);
 }
 
 LibpdInstance::~LibpdInstance() {
@@ -106,8 +109,23 @@ void LibpdInstance::_exit_tree() {
 		worker.request_stop();
 		worker.join();
 	}
+	if (player != nullptr) {
+		// The player is a child of this node and is owned by the scene tree:
+		// Godot frees it during teardown. Only stop and unbind it here — never
+		// remove_child/delete, which would double-free the tree-owned child.
+		player->stop();
+		sink.set_playback(godot::Ref<godot::AudioStreamGeneratorPlayback>());
+		player = nullptr; // avoid dangling after the tree frees it
+	}
 	if (LibpdServer::get_singleton() != nullptr) {
 		LibpdServer::get_singleton()->unregister_instance(worker.instance_id());
+	}
+}
+
+void LibpdInstance::_process(double p_delta) {
+	// Main-thread pump: move worker-rendered audio into the Godot generator.
+	if (dsp_running.load()) {
+		sink.pump();
 	}
 }
 
@@ -115,7 +133,30 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 	if (initialized.load()) {
 		return false; // double init
 	}
+
+	// Fail-fast: the instance sample rate must match the AudioServer mix rate,
+	// otherwise the generator would resample/garble audio (spec §10).
+	const int mix_rate = (int)std::lround(godot::AudioServer::get_singleton()->get_mix_rate());
+	if (p_samplerate != mix_rate) {
+		_emit_failure((int)godot::Error::ERR_INVALID_PARAMETER, "samplerate " + itos(p_samplerate) +
+				" != AudioServer mix rate " + itos(mix_rate));
+		return false;
+	}
 	samplerate_value = p_samplerate;
+
+	// Godot-native audio sink (4.6 AudioStreamGenerator + playback pump).
+	generator.instantiate();
+	generator->set_mix_rate_mode(godot::AudioStreamGenerator::MIX_RATE_CUSTOM);
+	generator->set_mix_rate((float)p_samplerate);
+	generator->set_buffer_length(0.1f); // ~100ms headroom in the generator buffer
+
+	if (player == nullptr) {
+		player = memnew(godot::AudioStreamPlayer);
+		player->set_stream(generator);
+		add_child(player);
+	}
+
+	sink.setup(p_samplerate, p_n_out);
 
 	worker.start();
 
@@ -238,6 +279,23 @@ int LibpdInstance::start_dsp() {
 		_emit_failure(-1, "start_dsp before init");
 		return (int)Error::ERR_INVALID_DATA;
 	}
+
+	// Start the Godot playback and bind the generator playback to the sink
+	// (main thread only; the sink pumps into it from _process).
+	if (player == nullptr && generator.is_valid()) {
+		// (Re)create after a tree-exit teardown.
+		player = memnew(godot::AudioStreamPlayer);
+		player->set_stream(generator);
+		add_child(player);
+	}
+	if (player != nullptr) {
+		player->play();
+		auto pb = player->get_stream_playback(); // Ref<AudioStreamPlayback>
+		godot::Ref<godot::AudioStreamGeneratorPlayback> gen_pb;
+		gen_pb = pb; // templated operator= casts via Object::cast_to
+		sink.set_playback(gen_pb);
+	}
+
 	worker.set_dsp(true);
 	dsp_running = true;
 	if (LibpdServer::get_singleton() != nullptr) {
@@ -256,6 +314,10 @@ int LibpdInstance::stop_dsp() {
 	}
 	worker.set_dsp(false);
 	dsp_running = false;
+	if (player != nullptr) {
+		sink.set_playback(godot::Ref<godot::AudioStreamGeneratorPlayback>());
+		player->stop();
+	}
 	if (LibpdServer::get_singleton() != nullptr) {
 		godot_libpd::PdEvent e;
 		e.instance_id = worker.instance_id();
@@ -314,11 +376,11 @@ bool LibpdInstance::dsp_active() const {
 }
 
 uint64_t LibpdInstance::debug_blocks_pushed() const {
-	return dry_sink.blocks_pushed();
+	return sink.blocks_pushed();
 }
 
 float LibpdInstance::debug_sink_peak() const {
-	return dry_sink.peak();
+	return sink.peak();
 }
 
 void LibpdInstance::_emit_failure(int p_code, const String &p_text) {

@@ -2,10 +2,13 @@
 
 #include <atomic>
 
+#include <godot_cpp/classes/audio_stream_generator.hpp>
+#include <godot_cpp/classes/audio_stream_player.hpp>
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/godot.hpp>
 #include <godot_cpp/variant/packed_string_array.hpp>
 
+#include "core/pd_audio_sink_generator.h"
 #include "libpd_worker.h"
 
 namespace godot {
@@ -24,8 +27,9 @@ public:
 	LibpdInstance();
 	virtual ~LibpdInstance();
 
-	/// Initialize this pd instance. Returns false if already initialized or
-	/// the worker failed to initialize pd.
+	/// Initialize this pd instance. Returns false if already initialized, the
+	/// samplerate does not match the AudioServer mix rate, or the worker
+	/// failed to initialize pd.
 	bool init(int p_samplerate = 44100, int p_n_ins = 0, int p_n_out = 2);
 
 	/// Open a patch. p_path may be a res:// or absolute path.
@@ -56,6 +60,7 @@ public:
 public:
 	void _enter_tree() override;
 	void _exit_tree() override;
+	void _process(double p_delta) override;
 
 protected:
 private:
@@ -72,7 +77,9 @@ private:
 
 	int64_t instance_id_value = 0;
 	godot_libpd::LibpdWorker worker;
-	godot_libpd::DrySink dry_sink;
+	godot_libpd::GeneratorSink sink;
+	godot::Ref<godot::AudioStreamGenerator> generator;
+	godot::AudioStreamPlayer *player = nullptr; // owned child
 	std::atomic<bool> initialized{false};
 	std::atomic<bool> has_patch{false};
 	std::atomic<bool> dsp_running{false};
