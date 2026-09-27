@@ -102,7 +102,7 @@ android.arm64 = "../../build/android-arm64/libgodot_libpd.so"
 - `config/name="godot-libpd-test"`, `config/features=PackedStringArray("4.6")`
 - `run/main_scene="res://scenes/boot_check.tscn"`
 - `audio/mixrate/mix_rate=44100`
-- autoload `LibpdServer` pointing at `res://scripts/libpd_server.gd` (create that file now as `extends LibpdServer` with an empty class body)
+- **Autoload wrapper** (verified finding): autoload scripts are parsed *before* extension classes are registered, so an autoload cannot `extends LibpdServer`. The autoload is a plain `Node` named **`Libpd`** (`scripts/libpd_server.gd`) with `@onready var server: LibpdServer = LibpdServer.new()` and `add_child(server)` in `_ready()`. All test/UI scripts reference the singleton as **`Libpd.server`**. Extension classes register at SCENE level. Also set `renderer/rendering_method="mobile"` + `.mobile="gl_compatibility"` for the Knulli targets.
 
 `test_project/scenes/boot_check.tscn`: a `Node2D` root with script `boot_check.gd`.
 `test_project/scripts/boot_check.gd`:
@@ -223,10 +223,10 @@ extends Node2D
 var got := {}
 
 func _ready():
-    LibpdServer.instance_print.connect(func(id, text): got["print"] = [id, text])
-    LibpdServer.instance_note_on.connect(func(id, ch, pitch, vel): got["note"] = [id, ch, pitch, vel])
-    LibpdServer.instance_dsp_active.connect(func(id, active): got["active"] = [id, active])
-    LibpdServer.debug_push_print(1, "hello pd")
+    Libpd.server.instance_print.connect(func(id, text): got["print"] = [id, text])
+    Libpd.server.instance_note_on.connect(func(id, ch, pitch, vel): got["note"] = [id, ch, pitch, vel])
+    Libpd.server.instance_dsp_active.connect(func(id, active): got["active"] = [id, active])
+    Libpd.server.debug_push_print(1, "hello pd")
     await get_tree().process_frame
     assert(got.has("print") and got["print"][0] == 1 and got["print"][1] == "hello pd", "print signal not delivered: %s" % got)
     print("TEST3_OK")
@@ -309,7 +309,7 @@ func _ready():
     assert(inst.load_patch("res://data/test_patch.pd") == Error.OK, "load failed")
     assert(inst.patch_loaded)
     var got_note := []
-    LibpdServer.instance_print.connect(func(id, text): if "test_patch" in text: got_note.append(text))
+    Libpd.server.instance_print.connect(func(id, text): if "test_patch" in text: got_note.append(text))
     assert(inst.start_dsp() == Error.OK)
     await get_tree().create_timer(0.3).timeout
     inst.send_midi(0, 60, 100)          # main thread, dsp running
@@ -450,7 +450,7 @@ func _ready():
         assert(inst.start_dsp() == Error.OK)
         instances.append(inst)
     var prints := {}
-    LibpdServer.instance_print.connect(func(id, text):
+    Libpd.server.instance_print.connect(func(id, text):
         if "test_patch" in text: prints[id] = prints.get(id, 0) + 1)
     await get_tree().create_timer(2.0).timeout
     assert(instances.size() == 4 and all([i.dsp_active for i in instances]), "not all instances running")
