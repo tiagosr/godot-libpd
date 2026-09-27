@@ -52,6 +52,8 @@ endif()
 add_library(godot_libpd SHARED
     src/register_types.cpp
     src/libpd_server.cpp
+    src/core/pd_event_ring.cpp
+    src/core/pd_command_queue.cpp
 )
 
 set_target_properties(godot_libpd PROPERTIES

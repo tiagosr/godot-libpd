@@ -227,7 +227,8 @@ func _ready():
     Libpd.server.instance_note_on.connect(func(id, ch, pitch, vel): got["note"] = [id, ch, pitch, vel])
     Libpd.server.instance_dsp_active.connect(func(id, active): got["active"] = [id, active])
     Libpd.server.debug_push_print(1, "hello pd")
-    await get_tree().process_frame
+    for i in 3:
+        await get_tree().process_frame   # bounded wait: the drain runs in the server's _process; one frame proved flaky
     assert(got.has("print") and got["print"][0] == 1 and got["print"][1] == "hello pd", "print signal not delivered: %s" % got)
     print("TEST3_OK")
     get_tree().quit(0)
