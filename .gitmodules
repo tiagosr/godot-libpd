@@ -1,0 +1,10 @@
+[submodule "extension/thirdparty/godot-cpp"]
+	path = extension/thirdparty/godot-cpp
+	url = https://github.com/godotengine/godot-cpp.git
+	branch = 4.5
+[submodule "extension/thirdparty/libpd"]
+	path = extension/thirdparty/libpd
+	url = https://github.com/libpd/libpd.git
+[submodule "extension/thirdparty/portmidi"]
+	path = extension/thirdparty/portmidi
+	url = https://github.com/PortMidi/PortMidi.git

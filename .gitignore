@@ -395,3 +395,7 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+
+# godot-libpd extension outputs
+extension/build/
+dist/

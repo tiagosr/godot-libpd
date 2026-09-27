@@ -1,0 +1,18 @@
+; godot-libpd GDExtension — canonical file.
+; The test project uses a copy at test_project/addons/godot-libpd/godot-libpd.gdextension
+; with the same relative library layout.
+
+[configuration]
+
+entry_symbol = "godot_libpd_library_init"
+compatibility_minimum = "4.5"
+reloadable = true
+
+[libraries]
+
+macos.debug = "res://build/macos/libgodot_libpd.dylib"
+macos.release = "res://build/macos/libgodot_libpd.dylib"
+linux.debug.arm64 = "res://build/linux/libgodot_libpd.so"
+linux.release.arm64 = "res://build/linux/libgodot_libpd.so"
+android.debug.arm64 = "res://build/android-arm64/libgodot_libpd.so"
+android.release.arm64 = "res://build/android-arm64/libgodot_libpd.so"
