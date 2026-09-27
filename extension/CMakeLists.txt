@@ -72,5 +72,20 @@ if(BUILD_PORTMIDI)
 endif()
 
 # ---------------------------------------------------------------------------
-# Host unit tests — added in Task 2 (libpd_core_tests)
+# Host unit tests (Task 2; off for cross builds)
 # ---------------------------------------------------------------------------
+option(BUILD_LIBPD_TESTS "Build host unit tests" ON)
+if(ANDROID)
+    set(BUILD_LIBPD_TESTS OFF)
+endif()
+if(BUILD_LIBPD_TESTS AND NOT ANDROID)
+    enable_testing()
+    add_executable(libpd_core_tests
+        tests/core_tests.cpp
+        src/core/pd_event_ring.cpp
+        src/core/pd_command_queue.cpp
+    )
+    target_include_directories(libpd_core_tests PRIVATE src)
+    target_link_libraries(libpd_core_tests PRIVATE pthread)
+    add_test(NAME core_tests COMMAND $<TARGET_FILE:libpd_core_tests>)
+endif()
