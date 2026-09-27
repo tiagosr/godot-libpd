@@ -69,6 +69,10 @@ void LibpdServer::debug_push_print(int64_t p_instance_id, const String &p_text) 
 	ring.push(e);
 }
 
+void LibpdServer::push_event(const godot_libpd::PdEvent &p_event) {
+	ring.push(p_event);
+}
+
 void LibpdServer::_process(double p_delta) {
 	(void)p_delta;
 	_drain_ring();

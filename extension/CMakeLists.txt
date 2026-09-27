@@ -52,6 +52,8 @@ endif()
 add_library(godot_libpd SHARED
     src/register_types.cpp
     src/libpd_server.cpp
+    src/libpd_instance.cpp
+    src/libpd_worker.cpp
     src/core/pd_event_ring.cpp
     src/core/pd_command_queue.cpp
 )

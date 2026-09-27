@@ -4,6 +4,7 @@
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
+#include "libpd_instance.h"
 #include "libpd_server.h"
 
 using namespace godot;
@@ -13,6 +14,7 @@ void initialize_godot_libpd_module(ModuleInitializationLevel p_level) {
 		return;
 	}
 	GDREGISTER_CLASS(LibpdServer);
+	GDREGISTER_CLASS(LibpdInstance);
 }
 
 void uninitialize_godot_libpd_module(ModuleInitializationLevel p_level) {

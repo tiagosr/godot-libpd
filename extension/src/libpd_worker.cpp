@@ -1,0 +1,285 @@
+#include "libpd_worker.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+
+#include <algorithm>
+
+namespace godot_libpd {
+
+namespace {
+
+// C hook trampolines: libpd calls these on the worker thread.
+void c_printhook(const char *p_s) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr && p_s != nullptr) {
+		ctx->emit_print(p_s);
+	}
+}
+
+void c_noteonhook(int p_channel, int p_pitch, int p_velocity) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		ctx->emit_note_on(p_channel, p_pitch, p_velocity);
+	}
+}
+
+} // namespace
+
+LibpdWorker::LibpdWorker(Config p_config) :
+		config(p_config) {}
+
+LibpdWorker::~LibpdWorker() {
+	request_stop();
+	join();
+}
+
+void LibpdWorker::start() {
+	if (thread_started) {
+		return;
+	}
+	thread_started = true;
+	thread = std::thread([this] {
+		run();
+	});
+}
+
+bool LibpdWorker::is_running() const {
+	return thread_started;
+}
+
+void LibpdWorker::request_stop() {
+	stop_requested = true;
+	// Nudge the queue so a waiting worker wakes up promptly.
+	PdCommand stop;
+	stop.opcode = PdCommand::STOP_THREAD;
+	queue.push(stop);
+}
+
+void LibpdWorker::join() {
+	if (thread.joinable()) {
+		thread.join();
+	}
+	thread_started = false;
+}
+
+void LibpdWorker::push_command(const PdCommand &p_command) {
+	queue.push(p_command);
+}
+
+void LibpdWorker::emit_print(const char *p_text) {
+	if (!config.on_event) {
+		return;
+	}
+	PdEvent e;
+	e.instance_id = config.instance_id;
+	e.type = PdEvent::PRINT;
+	// Truncate at 63 bytes on a UTF-8 boundary.
+	size_t len = std::strlen(p_text);
+	if (len > 63) {
+		len = 63;
+		while (len > 0 && ((static_cast<unsigned char>(p_text[len]) & 0xC0) == 0x80)) {
+			len--;
+		}
+	}
+	std::memcpy(e.data, p_text, len);
+	e.data[len] = '\0';
+	config.on_event(e);
+}
+
+void LibpdWorker::emit_note_on(int p_channel, int p_pitch, int p_velocity) {
+	if (!config.on_event) {
+		return;
+	}
+	PdEvent e;
+	e.instance_id = config.instance_id;
+	e.type = PdEvent::NOTE_ON;
+	e.data[0] = static_cast<char>(p_channel & 0x7F);
+	e.data[1] = static_cast<char>(p_pitch & 0x7F);
+	e.data[2] = static_cast<char>(p_velocity & 0x7F);
+	config.on_event(e);
+}
+
+void LibpdWorker::run() {
+	// The whole pd lifetime of this instance lives on this thread.
+	using namespace std::chrono;
+
+	for (;;) {
+		if (stop_requested) {
+			break;
+		}
+
+		// 1) Drain all currently pending commands (pd calls only happen here).
+		PdCommand command;
+		while (queue.pop(&command, 0) == 1) {
+			execute_command(command);
+			if (command.opcode == PdCommand::STOP_THREAD) {
+				stop_requested = true;
+			}
+		}
+		if (stop_requested) {
+			break;
+		}
+
+		// 2) dsp block + pacing.
+		if (dsp_on.load() && pd_instance != nullptr && patch_handle != nullptr) {
+			const int bs = libpd_blocksize();
+			const int frames = bs * n_out;
+			if ((int)out_buffer.size() >= frames) {
+				libpd_process_float(1, nullptr, out_buffer.data());
+				if (config.sink != nullptr) {
+					config.sink->push_block(out_buffer.data(), bs, n_out);
+				}
+			}
+			// 3) Pacing: sleep to the next tick.
+			const auto period = duration_cast<nanoseconds>(
+					duration<double>((double)bs / (double)samplerate));
+			next_tick += period;
+			const auto now = steady_clock::now();
+			if (next_tick <= now) {
+				// Fell behind: resync, don't spiral.
+				next_tick = now + period / 2;
+			} else {
+				std::this_thread::sleep_until(next_tick);
+			}
+		} else {
+			// 3) Idle: block for a command or the stop signal.
+			if (queue.pop(&command, 1000) == 1) {
+				execute_command(command);
+				if (command.opcode == PdCommand::STOP_THREAD) {
+					stop_requested = true;
+				}
+			}
+		}
+	}
+
+	// Teardown on the worker thread (spec §5).
+	if (patch_handle != nullptr) {
+		libpd_closefile(patch_handle);
+		patch_handle = nullptr;
+	}
+	if (pd_instance != nullptr) {
+		libpd_free_instance(pd_instance);
+		pd_instance = nullptr;
+	}
+}
+
+void LibpdWorker::execute_command(const PdCommand &p_command) {
+	auto fulfill = [&](int p_result) {
+		if (p_command.result != nullptr) {
+			auto *slot = static_cast<std::shared_ptr<std::promise<int>> *>(p_command.result);
+			(*slot)->set_value(p_result);
+		}
+	};
+
+	switch (p_command.opcode) {
+		case PdCommand::INIT: {
+			{
+				static std::once_flag pd_globals_once;
+				std::call_once(pd_globals_once, [] {
+					const int err = libpd_init();
+					if (err != 0) {
+						std::fprintf(stderr, "godot-libpd: libpd_init() failed (%d)\n", err);
+					}
+				});
+			}
+			pd_instance = libpd_new_instance();
+			if (pd_instance == nullptr) {
+				fulfill(-1);
+				return;
+			}
+			libpd_set_instance(pd_instance);
+			samplerate = p_command.i32;
+			const int n_ins = (int)((p_command.i64 / 1000) & 0xFF);
+			n_out = (int)(p_command.i64 & 0xFF);
+			const int err = libpd_init_audio(n_ins, n_out, samplerate);
+			if (err != 0) {
+				fulfill(-1);
+				return;
+			}
+			// Turn pd's dsp engine on once; the dsp_on flag in run() gates whether
+			// libpd_process_float is actually called (libpd has no realtime callback).
+			libpd_start_message(1);
+			libpd_add_float(1.0f);
+			libpd_finish_message("pd", "dsp");
+			blocksize = libpd_blocksize();
+			out_buffer.resize((size_t)blocksize * n_out);
+			libpd_set_printhook(c_printhook);
+			libpd_set_noteonhook(c_noteonhook);
+			libpd_set_instancedata(this, nullptr);
+			fulfill(0);
+			return;
+		}
+		case PdCommand::LOAD: {
+			if (patch_handle != nullptr) {
+				libpd_closefile(patch_handle);
+				patch_handle = nullptr;
+			}
+			const std::string name = p_command.path;
+			// libpd_openfile takes (file, dir).
+			const size_t slash = name.find_last_of("/\\");
+			const std::string file = (slash == std::string::npos) ? name : name.substr(slash + 1);
+			const std::string dir = (slash == std::string::npos) ? "." : name.substr(0, slash);
+			if (!p_command.search.empty()) {
+				libpd_add_to_search_path(p_command.search.c_str());
+			}
+			patch_handle = libpd_openfile(file.c_str(), dir.c_str());
+			fulfill(patch_handle != nullptr ? 0 : -1);
+			return;
+		}
+		case PdCommand::UNLOAD: {
+			if (patch_handle != nullptr) {
+				libpd_closefile(patch_handle);
+				patch_handle = nullptr;
+			}
+			fulfill(0);
+			return;
+		}
+		case PdCommand::MESSAGE: {
+			// Parse the space-joined args into atoms (float if numeric, else symbol).
+			static thread_local t_atom atoms[16];
+			int argc = 0;
+			std::string rest = p_command.args;
+			size_t pos = 0;
+			while (argc < 16 && pos < rest.size()) {
+				size_t sp = rest.find(' ', pos);
+				std::string tok = (sp == std::string::npos)
+						? rest.substr(pos)
+						: rest.substr(pos, sp - pos);
+				if (!tok.empty()) {
+					char *end = nullptr;
+					const float f = std::strtof(tok.c_str(), &end);
+					if (end != tok.c_str() && *end == '\0') {
+						libpd_set_float(&atoms[argc], f);
+					} else {
+						libpd_set_symbol(&atoms[argc], tok.c_str());
+					}
+					argc++;
+				}
+				pos = (sp == std::string::npos) ? rest.size() : sp + 1;
+			}
+			if (argc == 0 && p_command.args.empty()) {
+				libpd_message(p_command.path.c_str(), "", 0, nullptr);
+			} else {
+				libpd_message(p_command.path.c_str(), "", argc, atoms);
+			}
+			return;
+		}
+		case PdCommand::MIDI: {
+			const int channel = p_command.i32;
+			const int pitch = (int)((p_command.i64 >> 32) & 0x7F);
+			const int velocity = (int)(p_command.i64 & 0x7F);
+			// High-level API: reaches [notein] (raw libpd_midibyte only feeds [midiin]).
+			// velocity == 0 acts as note-off.
+			libpd_noteon(channel & 0x0F, pitch & 0x7F, velocity & 0x7F);
+			return;
+		}
+		case PdCommand::STOP_THREAD: {
+			stop_requested = true;
+			return;
+		}
+	}
+}
+
+} // namespace godot_libpd

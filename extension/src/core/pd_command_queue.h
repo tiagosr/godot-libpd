@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
 
 namespace godot_libpd {
 
@@ -26,9 +27,12 @@ struct PdCommand {
 	uint32_t opcode = 0;
 	int32_t i32 = 0;
 	int64_t i64 = 0;
-	const char *path = nullptr;  // caller-owned, valid until executed
-	const char *args = nullptr;  // caller-owned, valid until executed
-	const char *search = nullptr; // caller-owned, valid until executed
+	std::string path;  // e.g. patch file, receiver, search dir
+	std::string args;  // e.g. space-joined message args
+	std::string search; // LOAD: search path dir (may be empty)
+	// Optional: pointer to a std::shared_ptr<std::promise<int>> owned by the
+	// main thread; the worker fulfils it with the call's result code.
+	void *result = nullptr;
 };
 
 /**

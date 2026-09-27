@@ -37,6 +37,9 @@ public:
 	/// headless integration tests; real events arrive via the libpd hooks).
 	void debug_push_print(int64_t p_instance_id, const String &p_text);
 
+	/// Push an arbitrary event (called from worker threads via the libpd hooks).
+	void push_event(const godot_libpd::PdEvent &p_event);
+
 	void register_instance(int64_t p_instance_id);
 	void unregister_instance(int64_t p_instance_id);
 
