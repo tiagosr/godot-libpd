@@ -18,3 +18,5 @@ textures/vram_compression/import_etc2_astc=true
 
 renderer/rendering_method="mobile"
 renderer/rendering_method.mobile="gl_compatibility"
+renderer/rendering_method.linuxbsd="gl_compatibility"
+rendering/gl_compatibility/driver.linuxbsd="opengl3_es"

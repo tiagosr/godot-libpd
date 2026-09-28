@@ -12,7 +12,9 @@ echo "== HEAD: $(git rev-parse --short HEAD) (branch: $(git branch --show-curren
 
 echo "== [1/2] Godot 4.6 linux-arm64 release engine (scons, -j$(nproc))"
 # 4.6 target values: editor | template_release | template_debug (no bare "release")
-scons platform=linux target=template_release arch=arm64 dev_build=false -j"$(nproc)"
+# fbdev=yes builds the framebuffer display server (bare-Linux handhelds).
+# x11/wayland stay available so the host fallback path keeps working.
+scons platform=linux target=template_release arch=arm64 dev_build=false fbdev=yes -j"$(nproc)"
 # 4.6 names template binaries godot.<platform>.<target>.<arch>
 file bin/godot.linuxbsd.template_release.arm64
 

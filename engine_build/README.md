@@ -46,10 +46,44 @@ engine load, extension load, pd init, patch load from the pck-extracted
 file, DSP start, rendered audio blocks, MIDI note → pd print round-trip,
 multi-instance spawn/kill, clean teardown (worker join < 5 ms).
 
-GUI mode needs a display server (X11/Wayland) — Knulli ships neither
-(ES uses SDL2/fbcon), so on-device verification is headless until a
-display backend is chosen (SDL2/fbcon, DRM, or a compositor such as MIR;
-see spec §9).
+### GUI mode: `DisplayServerFbdev` (the vendor DC display path)
+
+Knulli ships no X11/Wayland. The Brick's panel is scanned out by the
+vendor **PowerVR display controller** (`pvrsrvkm`/`disp`), *not* by
+`/dev/fb0`. A process claims the panel by creating an **EGL window
+surface** — the vendor NULL-window-system backend
+(`libpvrNULL_WSEGL`, `WSEGL_CreateWindowDrawable`, logs
+`MALI_CreateWindow`) allocates the DC buffer — and then presenting with
+**`eglSwapBuffers()`**. This is exactly what EmulationStation and the
+SDL2-based ports (e.g. trackerjolo) do; it is what the `fbdev` display
+server in `platform/linuxbsd/fbdev/` implements:
+
+- One fixed fullscreen window (1024x768; geometry read from `/dev/fb0`,
+  which is opened **read-only** — never written).
+- GLES3 compatibility rasterizer renders into the window surface's
+  default framebuffer; `swap_buffers()` presents via `eglSwapBuffers()`
+  and paces to ~60fps (`GODOT_FBDEV_FPS`).
+- `eglCreateWindowSurface(display, cfg, /*window=*/0, NULL)` is the claim
+  call; `eglCreatePbufferSurface` does *not* claim the display (proven
+  on-device: PBuffer+swap renders into a buffer nobody scans out).
+- The old `glReadPixels`→fb0 blit survives behind `GODOT_FBDEV_FB0=1`
+  for diagnostics only. Writing fb0 while ES runs only produces flicker
+  and is not scanned out once a port holds the DC.
+- Registered **first** in `OS_LinuxBSD`, so it is the default driver;
+  without `/dev/fb0` (desktop hosts) `create` fails and the engine falls
+  back to x11/wayland.
+- The project must request the Compatibility renderer on linuxbsd
+  (`rendering_method.linuxbsd=gl_compatibility` in `project.godot`);
+  Vulkan is broken on the Brick (ICD present, `vkCreateInstance` fails).
+
+Build with `fbdev=yes` (already in `build-knulli-engine.sh`).
+
+Verified on-device (2026-09-29): ES menu → port launch → Godot splash →
+test UI (stable, no flicker) → engine exit → ES menu restored. The
+probe suite in `engine_build/tools/` (`drm_probe.c`, `egl_probe.c`,
+`vk_probe.c`, `fbtest.c`, `swaptest.c`, `winstest.c`) documents how this
+was established: fb0 is a separate fb that ES also paints; the DC is
+the real panel path.
 
 First thing to check on failure: `ldd --version` on-device. **The current
 builds need glibc >= 2.35** (max `GLIBC_2.35` symbol in both the engine and

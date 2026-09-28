@@ -48,6 +48,7 @@ def get_opts():
         BoolVariable("udev", "Use udev for gamepad connection callbacks", True),
         BoolVariable("x11", "Enable X11 display", True),
         BoolVariable("wayland", "Enable Wayland display", True),
+        BoolVariable("fbdev", "Enable the framebuffer (fbdev) display server for bare-Linux handhelds", False),
         BoolVariable("libdecor", "Enable libdecor support", True),
         BoolVariable("touch", "Enable touch events", True),
         BoolVariable("execinfo", "Use libexecinfo on systems where glibc is not available", False),
@@ -489,6 +490,11 @@ def configure(env: "SConsEnvironment"):
 
         env.Append(CPPDEFINES=["WAYLAND_ENABLED"])
         env.Append(LIBS=["rt"])  # Needed by glibc, used by _allocate_shm_file
+
+    if env["fbdev"]:
+        # No extra link dependencies: EGL/GLES come from the glad loader,
+        # which dlopens libEGL.so.1 / libGLESv2.so.2 at runtime.
+        env.Append(CPPDEFINES=["FBDEV_ENABLED"])
 
     if env["accesskit"]:
         if env["accesskit_sdk_path"] != "":

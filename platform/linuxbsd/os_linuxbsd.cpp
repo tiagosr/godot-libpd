@@ -47,6 +47,10 @@
 #include "x11/display_server_x11.h"
 #endif
 
+#ifdef FBDEV_ENABLED
+#include "fbdev/display_server_fbdev.h"
+#endif
+
 #ifdef WAYLAND_ENABLED
 #include "wayland/detect_prime_egl.h"
 #include "wayland/display_server_wayland.h"
@@ -1298,6 +1302,13 @@ OS_LinuxBSD::OS_LinuxBSD() {
 
 #ifdef ALSA_ENABLED
 	AudioDriverManager::add_driver(&driver_alsa);
+#endif
+
+#ifdef FBDEV_ENABLED
+	// Registered first so it becomes the default display server; on hosts
+	// without a framebuffer the create fails and the engine falls back to
+	// the next registered driver (x11/wayland).
+	DisplayServerFbdev::register_fbdev_driver();
 #endif
 
 #ifdef X11_ENABLED
