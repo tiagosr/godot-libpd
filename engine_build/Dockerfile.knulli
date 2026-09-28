@@ -1,0 +1,53 @@
+# Docker builder for the Godot 4.6 linux-arm64 RELEASE engine + the
+# godot-libpd extension .so, for the Knulli CFW (Batocera fork) Allwinner
+# handhelds:
+#   H700  - RG35XX*, RGCubeXX     (kernel 4.9.170)
+#   A133  - Trimui Brick          (kernel 4.9.191)
+#
+# Runs natively on linux/arm64 (Apple Silicon). The repo is MOUNTED at /src
+# (engine sources at the repo root + extension/ + test_project/) and built
+# in place by /build/build-knulli-engine.sh — the image itself is
+# board-agnostic and contains only toolchain + system deps.
+#
+# NOTE: the build context is the (small) engine_build/ directory, NOT the
+# repo root — the engine clone plus its .git is several GB.
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Engine (scons, platform=linux) deps: X11 display, GLES3/OpenGL/EGL,
+# Vulkan (module), ALSA audio, fontconfig/freetype fonts, zlib.
+# Extension (cmake) deps: cmake + ninja + gcc.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    file \
+    git \
+    libasound2-dev \
+    libegl-dev \
+    libfontconfig1-dev \
+    libfreetype-dev \
+    libgl1-mesa-dev \
+    libgles-dev \
+    libvulkan-dev \
+    libxkbcommon-dev \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-pip \
+    xorg-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# scons >= 4.2 is required by Godot 4.6 (SConstruct); pip gives a known-good
+# modern version. cmake >= 3.25 is required by libpd (Ubuntu 22.04 ships
+# 3.22); pinned < 4 to keep broad compatibility with the vendored projects.
+RUN pip3 install --no-cache-dir scons "cmake>=3.25,<4"
+
+COPY build-knulli-engine.sh /build/build-knulli-engine.sh
+RUN chmod +x /build/build-knulli-engine.sh
+
+# Repo root is mounted here at runtime.
+WORKDIR /src
+CMD ["/bin/bash", "/build/build-knulli-engine.sh"]

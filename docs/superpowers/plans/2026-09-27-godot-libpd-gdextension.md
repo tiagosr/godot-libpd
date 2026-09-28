@@ -569,6 +569,20 @@ git commit -m "feat(test): test app UI, export presets, macOS release export + s
 
 ### Task 8: Knulli engine + extension builds via Docker
 
+> **Status: DONE.** `engine_build/{Dockerfile.knulli,build-knulli-engine.sh,
+> build-knulli-docker.sh}` (small-context image + repo mounted at /src, mirroring
+> the trackerjolo-v pattern). Verified artifacts:
+> `bin/godot.linuxbsd.template_release.arm64` (81 MB, ELF aarch64 PIE, runs:
+> `4.6.stable.custom_build.f989f26ff`) and `extension/build/linux/
+> libgodot_libpd.so` (ELF aarch64, built with `template_release` target).
+> Notes: (1) Godot 4.6 has no bare `target=release` — use `target=
+> template_release`, which also changes the binary name to
+> `godot.<platform>.template_release.<arch>`; (2) the image needs pip cmake
+> `>=3.25,<4` (Ubuntu 22.04 ships 3.22; libpd requires 3.25) and pip scons;
+> (3) **both artifacts require glibc >= 2.35** (max `GLIBC_2.35` symbol) —
+> the Knulli firmware glibc is unverified, so Task 9's static-libc fallback
+> ladder is the likely path.
+
 **Files:**
 - Create: `engine_build/Dockerfile.knulli`, `engine_build/build-knulli-engine.sh`
 
@@ -576,11 +590,11 @@ git commit -m "feat(test): test app UI, export presets, macOS release export + s
 - Produces: `bin/godot.linuxbsd.arm64` (Godot 4.6-stable release, native aarch64) and `extension/build/linux/libgodot_libpd.so`.
 - Consumes: `build.sh --linux-arm64` (must work with plain aarch64 gcc, no NDK).
 
-- [ ] **Step 1: Write `engine_build/Dockerfile.knulli`**
+- [x] **Step 1: Write `engine_build/Dockerfile.knulli`**
 
 Mirror `../trackerjolo-v/Dockerfile.knulli` structure: `FROM --platform=linux/arm64 ubuntu:22.04`; apt: `build-essential python3 python3-pip python3-yaml ca-certificates file kmod pkg-config libasound2-dev libfontconfig-dev libfreetype-dev libgl1-mesa-dev libgles-dev`; `pip3 install scons` (or apt `scons` if available); copy `build-knulli-engine.sh`; `WORKDIR /src`; `CMD ["/bin/bash", "/build/build-knulli-engine.sh"]`.
 
-- [ ] **Step 2: Write `build-knulli-engine.sh`**
+- [x] **Step 2: Write `build-knulli-engine.sh`** *(plus `build-knulli-docker.sh` orchestrator; context = engine_build/ only, repo mounted at /src)*
 
 ```
 #!/bin/sh
@@ -595,19 +609,16 @@ file build/linux/libgodot_libpd.so
 
 (`build.sh --linux-arm64` implemented here: plain cmake host build, `CMAKE_BUILD_TYPE=Release`; no NDK.)
 
-- [ ] **Step 3: Build the engine at `4.6-stable`**
+- [x] **Step 3: Build the engine at `4.6-stable`** *(repo is already on `gdext-libpd`, based on the 4.6-stable tag — no checkout needed; built in place from the working tree)*
 
-The engine clone is on `main`; check out `4.6-stable` (in a dedicated step, record the checkout in the commit message) — this keeps the submodule pins valid.
-
-- [ ] **Step 4: Run the Docker build**
+- [x] **Step 4: Run the Docker build**
 
 ```
-docker build --platform linux/arm64 -f engine_build/Dockerfile.knulli -t godot-libpd-knulli-builder .
-docker run --platform linux/arm64 -v "$PWD":/src godot-libpd-knulli-builder
+./engine_build/build-knulli-docker.sh   # small engine_build/ context + -v "$PWD":/src
 ```
-Expected: `bin/godot.linuxbsd.arm64` is `ELF 64-bit LSB pie executable, ARM aarch64`; `extension/build/linux/libgodot_libpd.so` is aarch64.
+Expected (adjusted for 4.6 naming): `bin/godot.linuxbsd.template_release.arm64` is `ELF 64-bit LSB pie executable, ARM aarch64`; `extension/build/linux/libgodot_libpd.so` is aarch64. ✅ both verified, engine `--version` runs in-container.
 
-- [ ] **Step 5: Commit** (scripts only; `bin/` and `extension/build/` gitignored)
+- [x] **Step 5: Commit** (scripts only; `bin/` and `extension/build/` gitignored)
 
 ```bash
 git add engine_build/

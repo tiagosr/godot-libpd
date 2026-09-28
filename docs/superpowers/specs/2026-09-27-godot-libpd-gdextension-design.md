@@ -181,8 +181,12 @@ run like a Knulli `.sh` launcher.
 ### Known risk: old glibc/kernel on Knulli
 
 Kernel is 4.9 (A133: 4.9.191, H700: 4.9.170) and the firmware glibc may be
-older than Godot 4.6's linux-arm64 expectations. Detection happens on first
-device test. Contained fallbacks, no other part of the design changes:
+older than Godot 4.6's linux-arm64 expectations. **Measured (Task 8):** the
+ubuntu 22.04-built engine and extension both link against **glibc >= 2.35**
+(max `GLIBC_2.35` symbol), so the firmware glibc version is the first thing
+to check on-device (`ldd --version` / `strings /lib/ld-*`). Detection happens
+on first device test. Contained fallbacks, no other part of the design
+changes:
 
 1. build the engine with a lowered minimum glibc (`--glibc-version`), or
 2. statically link libc into the release binary in the Docker build.
