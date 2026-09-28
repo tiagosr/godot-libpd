@@ -20,6 +20,9 @@ cd "$(dirname "$0")/.."
 BOARD=${1:-all}
 GODOT_BIN=${GODOT_BIN:-/Applications/Godot.app/Contents/MacOS/Godot}
 APP_NAME=${APP_NAME:-test}
+# Directory name the bundle gets copied to on the device (roms/ports/<dir>/);
+# used by the thin port-level launcher.
+PORT_APP_DIR=${PORT_APP_DIR:-godot-libpd}
 ENGINE=bin/godot.linuxbsd.template_release.arm64
 [ -x "$ENGINE" ] || { echo "error: $ENGINE missing - run ./engine_build/build-knulli-docker.sh first" >&2; exit 1; }
 
@@ -54,8 +57,15 @@ pack() {
   printf '#!/bin/sh\nexec "$(dirname "$0")/%s" "$@"\n' "$APP_NAME" > "$out/godot.sh"
   chmod +x "$out/godot.sh"
 
+  # Thin port-level entry (copy to roms/ports/<PORT_APP_DIR>.sh alongside the
+  # bundle dir). Deliberately free of nested $(...) substitutions: on the
+  # A133 (kernel 4.9) a dash stuck in a nested subshell with a torn-down adb
+  # PTY spins at 100% CPU and becomes unkillable (device needs a reboot).
+  printf '#!/bin/sh\n# Thin port entry: place at roms/ports/%s.sh next to the app dir.\ncd "$(dirname "$0")/%s" || exit 1\nexec ./godot.sh "$@"\n' "$PORT_APP_DIR" "$PORT_APP_DIR" > "$out/port-launcher.sh"
+  chmod +x "$out/port-launcher.sh"
+
   ls -la "$out"
-  echo "== $out ready (copy to device, e.g. roms/ports/, and run ./godot.sh)"
+  echo "== $out ready (copy to device roms/ports/$PORT_APP_DIR/, then port-launcher.sh to roms/ports/$PORT_APP_DIR.sh)"
 }
 
 case "$BOARD" in

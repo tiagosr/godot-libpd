@@ -1,14 +1,29 @@
 #include "libpd_worker.h"
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
 #include <algorithm>
 
+#include "core/pd_debug.h"
+
 namespace godot_libpd {
 
 namespace {
+
+// One timeline line for instance p_id (global ms base, see pd_debug.h).
+void wlog(uint32_t p_id, const char *p_fmt, ...) {
+	char msg[224];
+	va_list ap;
+	va_start(ap, p_fmt);
+	std::vsnprintf(msg, sizeof(msg), p_fmt, ap);
+	va_end(ap);
+	char line[320];
+	std::snprintf(line, sizeof(line), "[%10.1f ms] inst %u | %s", pd_dbg_elapsed_ms(), p_id, msg);
+	pd_dbg_log(p_id, line);
+}
 
 // C hook trampolines: libpd calls these on the worker thread.
 void c_printhook(const char *p_s) {
@@ -104,26 +119,37 @@ void LibpdWorker::emit_note_on(int p_channel, int p_pitch, int p_velocity) {
 void LibpdWorker::run() {
 	// The whole pd lifetime of this instance lives on this thread.
 	using namespace std::chrono;
+	wlog(config.instance_id, "thread start (samplerate=%d n_out=%d)", samplerate, n_out);
+
+	uint64_t dsp_blocks = 0;
+	bool last_dsp_branch = false;
 
 	for (;;) {
 		if (stop_requested) {
+			wlog(config.instance_id, "loop: stop_requested -> exit");
 			break;
 		}
 
 		// 1) Drain all currently pending commands (pd calls only happen here).
 		PdCommand command;
 		while (queue.pop(&command, 0) == 1) {
+			wlog(config.instance_id, "cmd %u", command.opcode);
 			execute_command(command);
 			if (command.opcode == PdCommand::STOP_THREAD) {
 				stop_requested = true;
 			}
 		}
 		if (stop_requested) {
+			wlog(config.instance_id, "post-cmd: stop_requested -> exit");
 			break;
 		}
 
 		// 2) dsp block + pacing.
 		if (dsp_on.load() && pd_instance != nullptr && patch_handle != nullptr) {
+			if (!last_dsp_branch) {
+				wlog(config.instance_id, "dsp branch: ON");
+				last_dsp_branch = true;
+			}
 			const int bs = libpd_blocksize();
 			const int frames = bs * n_out;
 			if ((int)out_buffer.size() >= frames) {
@@ -131,6 +157,10 @@ void LibpdWorker::run() {
 				if (config.sink != nullptr) {
 					config.sink->push_block(out_buffer.data(), bs, n_out);
 				}
+			}
+			dsp_blocks++;
+			if ((dsp_blocks % 1000) == 1) {
+				wlog(config.instance_id, "dsp blocks=%llu", (unsigned long long)dsp_blocks);
 			}
 			// 3) Pacing: sleep to the next tick.
 			const auto period = duration_cast<nanoseconds>(
@@ -145,7 +175,12 @@ void LibpdWorker::run() {
 			}
 		} else {
 			// 3) Idle: block for a command or the stop signal.
+			if (last_dsp_branch) {
+				wlog(config.instance_id, "dsp branch: OFF");
+				last_dsp_branch = false;
+			}
 			if (queue.pop(&command, 1000) == 1) {
+				wlog(config.instance_id, "idle: cmd %u", command.opcode);
 				execute_command(command);
 				if (command.opcode == PdCommand::STOP_THREAD) {
 					stop_requested = true;
@@ -156,12 +191,16 @@ void LibpdWorker::run() {
 
 	// Teardown on the worker thread (spec §5).
 	if (patch_handle != nullptr) {
+		wlog(config.instance_id, "teardown: libpd_closefile start");
 		libpd_closefile(patch_handle);
 		patch_handle = nullptr;
+		wlog(config.instance_id, "teardown: libpd_closefile done");
 	}
 	if (pd_instance != nullptr) {
+		wlog(config.instance_id, "teardown: libpd_free_instance start");
 		libpd_free_instance(pd_instance);
 		pd_instance = nullptr;
+		wlog(config.instance_id, "teardown: libpd_free_instance done; thread exit");
 	}
 }
 
@@ -175,6 +214,7 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 
 	switch (p_command.opcode) {
 		case PdCommand::INIT: {
+			wlog(config.instance_id, "INIT: libpd_new_instance start");
 			{
 				static std::once_flag pd_globals_once;
 				std::call_once(pd_globals_once, [] {
@@ -185,6 +225,7 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 				});
 			}
 			pd_instance = libpd_new_instance();
+			wlog(config.instance_id, "INIT: libpd_new_instance done (null=%d)", pd_instance == nullptr);
 			if (pd_instance == nullptr) {
 				fulfill(-1);
 				return;
@@ -193,7 +234,9 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			samplerate = p_command.i32;
 			const int n_ins = (int)((p_command.i64 / 1000) & 0xFF);
 			n_out = (int)(p_command.i64 & 0xFF);
+			wlog(config.instance_id, "INIT: libpd_init_audio start (%d/%d/%d)", n_ins, n_out, samplerate);
 			const int err = libpd_init_audio(n_ins, n_out, samplerate);
+			wlog(config.instance_id, "INIT: libpd_init_audio done (err=%d)", err);
 			if (err != 0) {
 				fulfill(-1);
 				return;
@@ -208,6 +251,7 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			libpd_set_printhook(c_printhook);
 			libpd_set_noteonhook(c_noteonhook);
 			libpd_set_instancedata(this, nullptr);
+			wlog(config.instance_id, "INIT: done (blocksize=%d)", blocksize);
 			fulfill(0);
 			return;
 		}
@@ -224,7 +268,9 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			if (!p_command.search.empty()) {
 				libpd_add_to_search_path(p_command.search.c_str());
 			}
+			wlog(config.instance_id, "LOAD: libpd_openfile start (%s, %s)", file.c_str(), dir.c_str());
 			patch_handle = libpd_openfile(file.c_str(), dir.c_str());
+			wlog(config.instance_id, "LOAD: libpd_openfile done (ok=%d)", patch_handle != nullptr);
 			fulfill(patch_handle != nullptr ? 0 : -1);
 			return;
 		}

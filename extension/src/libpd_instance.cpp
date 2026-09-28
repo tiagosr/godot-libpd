@@ -9,12 +9,14 @@
 #include <godot_cpp/variant/string.hpp>
 
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <future>
 #include <mutex>
 
 #include "z_libpd.h"
 
+#include "core/pd_debug.h"
 #include "libpd_server.h"
 
 using namespace godot;
@@ -24,6 +26,18 @@ int64_t LibpdInstance::_next_instance_id = 0;
 namespace {
 
 typedef std::shared_ptr<std::promise<int>> IntPromise;
+
+// Main-thread timeline line (global ms base; see core/pd_debug.h).
+void mlog(uint32_t p_id, const char *p_fmt, ...) {
+	char line[288];
+	va_list ap;
+	va_start(ap, p_fmt);
+	std::vsnprintf(line, sizeof(line), p_fmt, ap);
+	va_end(ap);
+	char full[384];
+	std::snprintf(full, sizeof(full), "[%10.1f ms] %s", godot_libpd::pd_dbg_elapsed_ms(), line);
+	godot_libpd::pd_dbg_log(p_id, full);
+}
 
 // Helper: run a worker command that fulfils a promise, and wait (bounded)
 // for its result. p_push receives the promise slot to attach to the command.
@@ -63,8 +77,10 @@ LibpdInstance::LibpdInstance() :
 }
 
 LibpdInstance::~LibpdInstance() {
+	mlog((uint32_t)worker.instance_id(), "[main] ~LibpdInstance: join start");
 	worker.request_stop();
 	worker.join();
+	mlog((uint32_t)worker.instance_id(), "[main] ~LibpdInstance: join done");
 }
 
 void LibpdInstance::_bind_methods() {
@@ -106,8 +122,10 @@ void LibpdInstance::_exit_tree() {
 	// Synchronous teardown (spec §5): stop, join, then the pd instance is
 	// freed on the worker thread.
 	if (worker.is_running()) {
+		mlog((uint32_t)worker.instance_id(), "[main] _exit_tree: request_stop+join start");
 		worker.request_stop();
 		worker.join();
+		mlog((uint32_t)worker.instance_id(), "[main] _exit_tree: join done");
 	}
 	if (player != nullptr) {
 		// The player is a child of this node and is owned by the scene tree:
@@ -168,6 +186,7 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 		cmd.result = slot;
 		worker.push_command(cmd);
 	});
+	mlog((uint32_t)worker.instance_id(), "[main] init: wait_for_command done (res=%d)", res);
 
 	if (res != 0) {
 		_emit_failure(-1, "libpd initialization failed");
@@ -253,6 +272,7 @@ int LibpdInstance::load_patch(const String &p_path, const PackedStringArray &p_s
 		cmd.result = slot;
 		worker.push_command(cmd);
 	});
+	mlog((uint32_t)worker.instance_id(), "[main] load_patch: wait_for_command done (res=%d)", res);
 
 	if (res != 0) {
 		_emit_failure((int)Error::ERR_FILE_NOT_FOUND, "failed to open patch: " + p_path);
@@ -303,6 +323,7 @@ int LibpdInstance::start_dsp() {
 
 	worker.set_dsp(true);
 	dsp_running = true;
+	mlog((uint32_t)worker.instance_id(), "[main] start_dsp");
 	if (LibpdServer::get_singleton() != nullptr) {
 		godot_libpd::PdEvent e;
 		e.instance_id = worker.instance_id();
@@ -319,6 +340,7 @@ int LibpdInstance::stop_dsp() {
 	}
 	worker.set_dsp(false);
 	dsp_running = false;
+	mlog((uint32_t)worker.instance_id(), "[main] stop_dsp");
 	if (player != nullptr) {
 		sink.set_playback(godot::Ref<godot::AudioStreamGeneratorPlayback>());
 		player->stop();

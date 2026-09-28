@@ -12,6 +12,12 @@ extends Control
 const PATCH := "res://data/test_patch.pd"
 const MAX_LOG_LINES := 20
 
+# --smoke diagnostics: a flushed progress file (survives a hard kill, unlike
+# block-buffered stdout) + a wall-clock watchdog so a hang can never run long
+# enough to overload the target device (e.g. the A133's kernel watchdog).
+const SMOKE_PROGRESS := "/tmp/smoke_progress.log"
+const SMOKE_TIMEOUT_MS := 15000
+
 @onready var status_label: Label = $VBox/StatusLabel
 @onready var instance_label: Label = $VBox/InstanceLabel
 @onready var log: RichTextLabel = $VBox/Log
@@ -27,9 +33,19 @@ var _loaded := {}          # instance_id -> true
 var _dsp_running := false
 var _mix_rate := 44100
 
+# --smoke diagnostics state.
+var _smoke_file: FileAccess = null
+var _smoke_start := 0
+var _smoke_active := false
+var _smoke_done := false
+
 func _ready() -> void:
 	_mix_rate = int(AudioServer.get_mix_rate())
 	if "--smoke" in OS.get_cmdline_args():
+		_smoke_active = true
+		_smoke_start = Time.get_ticks_msec()
+		_smoke_file = FileAccess.open(SMOKE_PROGRESS, FileAccess.WRITE)
+		_smoke_log("START mix_rate=%d pid_args=%s" % [_mix_rate, str(OS.get_cmdline_args())])
 		_run_smoke()
 		return
 	load_btn.pressed.connect(_on_load_pressed)
@@ -48,45 +64,84 @@ func _ready() -> void:
 # --------------------------------------------------------------------------
 # --smoke headless self-test
 # --------------------------------------------------------------------------
+func _smoke_log(step: String) -> void:
+	var msg := "SMOKE | %7d ms | %s" % [Time.get_ticks_msec() - _smoke_start, step]
+	print(msg)
+	if _smoke_file != null:
+		_smoke_file.store_line(msg)
+		_smoke_file.flush()
+
+func _finish_smoke(code: int) -> void:
+	_smoke_done = true
+	if _smoke_file != null:
+		_smoke_file.close()
+		_smoke_file = null
+	get_tree().quit(code)
+
+func _process(_delta: float) -> void:
+	# Wall-clock watchdog: independent of any single await, force-exit if the
+	# smoke test has not finished in time (guards the target device from a
+	# hung, CPU-spinning process). Only active in --smoke mode.
+	if _smoke_active and not _smoke_done:
+		if Time.get_ticks_msec() - _smoke_start > SMOKE_TIMEOUT_MS:
+			_smoke_log("WATCHDOG_TIMEOUT quit(2)")
+			_smoke_done = true
+			get_tree().quit(2)
+
 func _run_smoke() -> void:
 	# 1) create + init
+	_smoke_log("step1 new + init")
 	var inst := LibpdInstance.new()
 	add_child(inst)
 	if not inst.init(_mix_rate):
-		print("SMOKE_FAIL init"); get_tree().quit(1); return
+		_smoke_log("SMOKE_FAIL init"); _finish_smoke(1); return
+	_smoke_log("step1 init ok")
 	# 2) load
+	_smoke_log("step2 load_patch")
 	if inst.load_patch(PATCH) != Error.OK:
-		print("SMOKE_FAIL load"); get_tree().quit(1); return
+		_smoke_log("SMOKE_FAIL load"); _finish_smoke(1); return
+	_smoke_log("step2 load ok")
 	# 3) start dsp, expect rendered blocks
 	if inst.start_dsp() != Error.OK:
-		print("SMOKE_FAIL start"); get_tree().quit(1); return
+		_smoke_log("SMOKE_FAIL start"); _finish_smoke(1); return
+	_smoke_log("step3 start_dsp ok, await 0.5s")
 	await get_tree().create_timer(0.5).timeout
+	_smoke_log("step3 woke, blocks_pushed=%d" % inst.debug_blocks_pushed)
 	if inst.debug_blocks_pushed <= 0:
-		print("SMOKE_FAIL blocks"); get_tree().quit(1); return
+		_smoke_log("SMOKE_FAIL blocks"); _finish_smoke(1); return
 	# 4) send a note, expect a print
 	var got_print := []
 	Libpd.server.instance_print.connect(func(id, text):
 		if "test_patch" in text:
 			got_print.append(1))
 	inst.send_midi(0, 60, 100)
+	_smoke_log("step4 midi sent, await 0.5s")
 	await get_tree().create_timer(0.5).timeout
+	_smoke_log("step4 woke, got_print=%d" % got_print.size())
 	if got_print.is_empty():
-		print("SMOKE_FAIL print"); get_tree().quit(1); return
+		_smoke_log("SMOKE_FAIL print"); _finish_smoke(1); return
 	# 5) spawn a second instance, run, free it
+	_smoke_log("step5 second instance new+init+load+start")
 	var inst2 := LibpdInstance.new()
 	add_child(inst2)
 	if not inst2.init(_mix_rate) or inst2.load_patch(PATCH) != Error.OK or inst2.start_dsp() != Error.OK:
-		print("SMOKE_FAIL second"); get_tree().quit(1); return
+		_smoke_log("SMOKE_FAIL second"); _finish_smoke(1); return
+	_smoke_log("step5 second ok, await 0.5s")
 	await get_tree().create_timer(0.5).timeout
+	_smoke_log("step5 woke, stopping+freeing inst2")
 	inst2.stop_dsp()
 	inst2.queue_free()
 	await get_tree().process_frame
+	_smoke_log("step5 inst2 freed (dtor+worker.join done)")
 	# 6) stop + free first, success
+	_smoke_log("step6 stopping+freeing first")
 	inst.stop_dsp()
 	inst.queue_free()
 	await get_tree().process_frame
+	_smoke_log("step6 first freed")
 	print("SMOKE_OK")
-	get_tree().quit(0)
+	_smoke_log("SMOKE_OK calling quit(0)")
+	_finish_smoke(0)
 
 # --------------------------------------------------------------------------
 # UI handlers
