@@ -79,11 +79,15 @@ void LibpdServer::_process(double p_delta) {
 }
 
 void LibpdServer::_drain_ring() {
-	// Bounded per frame so a print flood can't starve the main thread;
-	// the ring drops the oldest on overflow (see PdEventRing).
-	godot_libpd::PdEvent events[128];
-	for (size_t i = 0; i < ring.pop(events, 128); i++) {
-		const godot_libpd::PdEvent &e = events[i];
+	// Pop one event at a time and emit immediately, bounded per frame so a print
+	// flood can't starve the main thread (the ring itself drops the oldest on
+	// overflow — see PdEventRing). A batch pop into a large stack buffer followed
+	// by a tight emit loop dropped signal deliveries under load (Task 6); this
+	// form keeps each emit independent and avoids the large stack allocation.
+	constexpr int MAX_PER_FRAME = 128;
+	godot_libpd::PdEvent e;
+	int processed = 0;
+	while (processed < MAX_PER_FRAME && ring.pop(&e, 1) == 1) {
 		switch (e.type) {
 			case godot_libpd::PdEvent::PRINT:
 				emit_signal("instance_print", (int64_t)e.instance_id, String(e.data));
@@ -96,6 +100,7 @@ void LibpdServer::_drain_ring() {
 				emit_signal("instance_dsp_active", (int64_t)e.instance_id, e.data[0] != 0);
 				break;
 		}
+		processed++;
 	}
 }
 

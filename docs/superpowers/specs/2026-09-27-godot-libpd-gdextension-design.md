@@ -58,6 +58,14 @@ LibpdServer.get_instance(id: int) -> LibpdInstance
 No worker thread ever calls into Godot or emits signals directly. This is the
 only thread-crossing mechanism → deadlock-free by construction.
 
+**Drain strategy (Task 6 finding):** the ring is drained one event at a time
+(`pop(&e, 1)`, emit, repeat), bounded to 128 events/frame. A batch `pop` into a
+large stack buffer (`PdEvent events[128]`) followed by a tight `emit_signal`
+loop dropped signal deliveries under load (reproducible: 4 workers, ~1 of ~4
+prints reached the main thread). One-at-a-time pop+emit is correct, keeps each
+emit independent, avoids the large stack allocation, and is still bounded per
+frame so a print flood cannot starve the main thread.
+
 ### `LibpdInstance` (Node)
 
 ```gdscript
