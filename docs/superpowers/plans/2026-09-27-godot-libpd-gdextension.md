@@ -629,6 +629,16 @@ git commit -m "build(engine): Knulli aarch64 release engine + linux extension vi
 
 ### Task 9: Knulli packaging + Trimui Brick device verification
 
+> **Status: PACKAGED + host-verified; device test pending (operator).**
+> Custom 4.6 engine installed as the 4.6.2 `linux_release.arm64` template
+> (official backed up to `dist/linux_release.arm64.official-backup`); Linux
+> preset set to arm64; `engine_build/package-knulli.sh` produced
+> `dist/knulli/{a133,h700}/` (`test`, `test.pck`, `libgodot_libpd.so`,
+> `godot.sh`) and verifies aarch64 + custom-build BuildID. Host smoke:
+> `./godot.sh --headless --smoke` in the docker linux/arm64 container →
+> **SMOKE_OK** on the custom engine. `engine_build/README.md` documents the
+> flow + glibc (>= 2.35 required) fallback ladder.
+
 **Files:**
 - Create: `engine_build/package-knulli.sh`, `dist/` outputs (gitignored)
 
@@ -636,7 +646,7 @@ git commit -m "build(engine): Knulli aarch64 release engine + linux extension vi
 - Consumes: Task 8 binary + Task 7 Linux export preset + extension linux build.
 - Produces: `dist/knulli/<board>/` folder (board ∈ `a133`, `h700`) ready to copy to the device: the exported app (binary with embedded pck, **built from our custom engine binary**), the extension `.so`, `godot.sh` launcher.
 
-- [ ] **Step 1: Install the custom binary as the 4.6.2 linux-arm64 template**
+- [x] **Step 1: Install the custom binary as the 4.6.2 linux-arm64 template** *(macOS template dir is `~/Library/Application Support/Godot/export_templates/4.6.2.stable/`; file `linux_release.arm64`; official backed up to dist/)*
 
 ```
 mkdir -p ~/.local/share/godot/templates/4.6.2-stable/
@@ -645,7 +655,7 @@ cp bin/godot.linuxbsd.arm64 ~/.local/share/godot/templates/4.6.2-stable/Godot_v4
 
 (Linux export = editor copies the template binary and injects the pck, so exporting from this template embeds **our** binary. Note the replacement; keep a backup of the official file in `dist/`.)
 
-- [ ] **Step 2: Export + package**
+- [x] **Step 2: Export + package** *(export path renamed to drop the misleading `.x86_64` suffix; `file` confirms aarch64; .so bundled next to the binary; SMOKE_OK in docker proves the load path)*
 
 `engine_build/package-knulli.sh BOARD=a133`:
 1. `godot --headless --path test_project --export-release "Linux" dist/knulli/$BOARD/test`
@@ -654,22 +664,22 @@ cp bin/godot.linuxbsd.arm64 ~/.local/share/godot/templates/4.6.2-stable/Godot_v4
 4. write `godot.sh`: `#!/bin/sh\nexec "$(dirname "$0")/test" "$@"`, `chmod +x`,
 5. repeat for `BOARD=h700` (identical content; board label only).
 
-- [ ] **Step 3: Operator step — device test on the Trimui Brick**
+- [ ] **Step 3: Operator step — device test on the Trimui Brick** *(pending; check `ldd --version` on-device first — builds need glibc >= 2.35)*
 
 User copies `dist/knulli/a133/` to the Brick (e.g. `roms/ports/`), runs `./godot.sh`.
 Expected: test app opens, Load → Start → Send Test Note produces **audible sine out of the 3.5 mm jack**, prints appear, +Instance works.
 
-- [ ] **Step 4: glibc fallback ladder (only if Step 3 fails with `GLIBC_x.x not found` or missing-symbol errors)**
+- [ ] **Step 4: glibc fallback ladder (only if Step 3 fails; documented in engine_build/README.md)**
 
 1. Rebuild engine with static libc: `scons platform=linux target=release arch=arm64 dev_build=false static_libc=true` (in the same Docker), repackage.
 2. If static libc fails, lower the glibc floor in `platform/linux/detect.py` (build flag / env) and rebuild.
 3. Re-run device test after each step. Record what worked in `engine_build/README.md`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit** *(scripts + README now; glibc outcome note will be added after the device test)*
 
 ```bash
-git add engine_build/
-git commit -m "build(knulli): device packaging + launcher; note glibc outcome"
+git add engine_build/ test_project/
+git commit -m "build(knulli): packaging + launcher + docker host smoke"
 ```
 
 ---
