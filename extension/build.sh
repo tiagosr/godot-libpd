@@ -7,10 +7,19 @@
 set -e
 cd "$(dirname "$0")"
 
+# godot-cpp MUST be generated for the `template_release` target, NOT the
+# default `template_debug`. The debug target compiles godot-cpp with
+# DEBUG_ENABLED; a DEBUG_ENABLED extension loaded into a *release* export
+# template (no DEBUG_ENABLED) corrupts the heap during class registration
+# (signal/method binding) and segfaults — Task 7 finding. The template_release
+# dylib also loads fine in the editor and the debug template, so one build
+# serves all three.
+GODOTCPP_FLAGS="-DGODOTCPP_TARGET=template_release"
+
 configure() {
 	local dir="$1"; shift
 	local platform_dir="$1"; shift
-	cmake -B "build/cmake-${platform_dir}" -G Ninja "$@"
+	cmake -B "build/cmake-${platform_dir}" -G Ninja $GODOTCPP_FLAGS "$@"
 }
 
 build() {

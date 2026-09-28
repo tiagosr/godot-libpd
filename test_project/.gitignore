@@ -1,2 +1,4 @@
 .godot/*
 !.godot/extension_list.cfg
+dist/*
+export_templates/*

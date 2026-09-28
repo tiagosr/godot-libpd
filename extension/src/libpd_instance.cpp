@@ -181,11 +181,16 @@ String LibpdInstance::resolve_patch_path(const String &p_path, bool *r_ok) {
 	*r_ok = false;
 	if (p_path.begins_with("res://")) {
 		const String abs = ProjectSettings::get_singleton()->globalize_path(p_path);
-		if (FileAccess::file_exists(abs)) {
+		// Only use the globalized path directly if it is an absolute, real
+		// filesystem path (the editor case). In exported builds res:// usually
+		// maps into the .pck (or a CWD-relative location) that libpd's C open()
+		// cannot reach, so we fall through and extract to a real file below.
+		if (abs.is_absolute_path() && FileAccess::file_exists(abs)) {
 			*r_ok = true;
 			return abs;
 		}
-		// Pack-only resource: copy it out so the C library can open it.
+		// Pack-only (or non-real) resource: copy it out so the C library can
+		// open it from the real filesystem.
 		Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::READ);
 		if (!f.is_valid()) {
 			return String();

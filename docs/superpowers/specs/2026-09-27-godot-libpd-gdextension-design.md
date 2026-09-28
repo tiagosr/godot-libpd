@@ -187,6 +187,45 @@ device test. Contained fallbacks, no other part of the design changes:
 1. build the engine with a lowered minimum glibc (`--glibc-version`), or
 2. statically link libc into the release binary in the Docker build.
 
+### Export & extension build gotchas (Task 7 findings)
+
+All discovered while making the macOS release export pass `--smoke` (editor
+headless runs passed throughout — several of these only manifest in the
+**release template**):
+
+1. **godot-cpp must be generated with `GODOTCPP_TARGET=template_release`.**
+   The default `template_debug` target compiles godot-cpp with
+   `DEBUG_ENABLED`. A `DEBUG_ENABLED` dylib loaded into a *release* export
+   template (built without `DEBUG_ENABLED`) corrupts the heap during class
+   registration (signal/method binding) → SIGSEGV/SIGABRT, 100%
+   reproducible, at any point in shutdown/init. The debug template and the
+   editor (both `DEBUG_ENABLED`) load the debug-target dylib fine, which is
+   what hid it. The `template_release` dylib loads correctly in the editor,
+   debug template, and release template alike — one build serves all.
+   (`build.sh` sets the flag; do not remove it.)
+2. **macOS arm64 needs a custom template.** The official 4.6.2 `macos.zip`
+   ships only `godot_macos_{debug,release}.universal`; the exporter demands
+   `godot_macos_{debug,release}.arm64` for `binary_format/architecture=
+   "arm64"`. `make-macos-arm64-template.sh` (repo root) lipos the arm64
+   slices and repackages → `test_project/export_templates/macos-arm64.zip`
+   (gitignored artifact; referenced by the preset's `custom_template`).
+3. **`rendering/textures/vram_compression/import_etc2_astc=true`** must be
+   enabled in `project.godot` or the macOS arm64 export is refused.
+4. **Text data files are not exported by `all_resources`.** The exporter
+   skips files the editor classifies as `TextFile`; `test_patch.pd` would
+   silently be absent from the pck. The presets set `include_filter="*.pd"`
+   to force-include it. (Same will apply to any future text data files.)
+5. **libpd opens real files, not pck resources.** In exported builds
+   `globalize_path("res://…")` returns a path (often relative) that Godot's
+   pck-aware `FileAccess` can read but libpd's C `open()` cannot. `load_patch`
+   therefore only trusts a globalized path that is absolute *and* exists on
+   the real filesystem; otherwise it extracts the resource to
+   `<user_dir>/godot_libpd/<file>` first.
+6. **`--smoke` mode**: the test app runs a headless 6-step self-test when
+   launched with `--smoke` (init → load → dsp+blocks → note→print →
+   2nd instance spawn/kill → teardown) and exits 0/1. This is the automated
+   acceptance check for every platform's exported app.
+
 ## 9. Test app
 
 Single scene, `test.tscn`, one `Control` root with:

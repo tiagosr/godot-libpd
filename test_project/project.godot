@@ -2,7 +2,7 @@
 
 config/name="godot-libpd-test"
 config/features=PackedStringArray("4.6")
-run/main_scene="res://scenes/boot_check.tscn"
+run/main_scene="res://scenes/test.tscn"
 
 [autoload]
 
@@ -13,6 +13,7 @@ Libpd="*res://scripts/libpd_server.gd"
 mixrate/mix_rate=44100
 
 [rendering]
+textures/vram_compression/import_etc2_astc=true
 
 renderer/rendering_method="mobile"
 renderer/rendering_method.mobile="gl_compatibility"

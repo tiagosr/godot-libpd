@@ -500,6 +500,18 @@ git commit -m "test(extension): multi-instance stress + teardown guarantees"
 
 ### Task 7: Test app UI + macOS release export + smoke test
 
+> **Status: DONE (macOS).** `test.tscn` + `test_main.gd` implemented; three export
+> presets created; macOS arm64 release export produced and passing `--smoke`
+> (SMOKE_OK, exit 0) plus clean `--quit` and a successful GUI launch.
+> Two real bugs fixed along the way (documented in spec §8
+> "Export & extension build gotchas"): (1) godot-cpp had to be regenerated with
+> `GODOTCPP_TARGET=template_release` (the debug-target dylib heap-corrupts in
+> the release template); (2) `load_patch` must extract pack-only `res://`
+> resources to a real file because libpd uses the C filesystem, not the pck.
+> Also: `include_filter="*.pd"` to force-include the text patch, ETC2-ASTC on,
+> and a custom arm64 macOS template via `make-macos-arm64-template.sh`.
+> Step 6 (operator manual macOS run) is the remaining human action.
+
 **Files:**
 - Create: `test_project/scenes/test.tscn`, `test_project/scripts/test_main.gd`
 - Modify: `test_project/project.godot` (main scene → `test.tscn`), create `test_project/export_presets.cfg` (macOS release + Linux + Android presets)
@@ -509,11 +521,11 @@ git commit -m "test(extension): multi-instance stress + teardown guarantees"
 - Consumes: `LibpdServer` signals + `LibpdInstance` API (Tasks 3–6).
 - Produces: the runnable test app per spec §9, plus a `--smoke` argument mode in `test_main.gd` (the exported app runs the headless self-test and exits when launched with `--smoke`; this works inside release exports without extra files) used by all platform verifications.
 
-- [ ] **Step 1: Implement the test scene**
+- [x] **Step 1: Implement the test scene**
 
 `test.tscn` + `test_main.gd` exactly per spec §9: Label (title, instance count, samplerate), Buttons Load Patch / Start-Stop DSP / Send Test Note / +Instance / Kill Last, RichTextLabel (last 20 `instance_print` lines, auto-scroll). `+Instance` adds a new `LibpdInstance` that loads the same patch and starts dsp automatically; `Kill Last` frees the most recent. Wire the three `LibpdServer` signals. The initial scene contains one pre-created (but not yet initialized) `LibpdInstance`; "Load Patch" initializes it at `AudioServer.get_mix_rate()` if not already.
 
-- [ ] **Step 2: Implement the `--smoke` argument mode in `test_main.gd`**
+- [x] **Step 2: Implement the `--smoke` argument mode in `test_main.gd`**
 
 When `OS.get_cmdline_args()` contains `--smoke`, `_ready()` skips the UI and runs, then quits:
 
@@ -524,15 +536,15 @@ When `OS.get_cmdline_args()` contains `--smoke`, `_ready()` skips the UI and run
 5. spawn a second instance, run 0.5 s, free it,
 6. stop + free first, `print("SMOKE_OK")`, `quit(0)`; any failure → `quit(1)`.
 
-- [ ] **Step 3: Run the UI locally and verify by hand**
+- [x] **Step 3: Run the UI locally and verify by hand** *(UI driven headless: all 5 button handlers verified end-to-end; GUI launch confirmed non-crashing — audible-audio confirmation is the operator step)*
 
 Run: `godot --path ../test_project` (editor opens the scene) → Run. Click Load → Start → Send Test Note: audible sine appears and stops with velocity 0; prints visible; +Instance doubles the note; Kill Last removes it without crash. Fix whatever this reveals.
 
-- [ ] **Step 4: Create export presets**
+- [x] **Step 4: Create export presets**
 
 `export_presets.cfg` with three presets: `MacOS` (release, arch arm64, export to `dist/macos/`), `Linux` (release), `Android` (debug + release, arm64-v8a). Keep defaults; verify each preset appears in the editor's export dialog.
 
-- [ ] **Step 5: Export macOS release + run smoke**
+- [x] **Step 5: Export macOS release + run smoke** *(SMOKE_OK, exit 0)*
 
 Run:
 ```
@@ -542,15 +554,15 @@ godot --headless --path ../test_project --export-release "MacOS"
 (Use the actual export path/binary name from the preset.)
 Expected: exit 0, `SMOKE_OK`.
 
-- [ ] **Step 6: Operator step — manual macOS run**
+- [ ] **Step 6: Operator step — manual macOS run** *(pending: user runs `dist/macos/godot-libpd-test.app`)*
 
 User runs the exported app, plays the buttons, confirms audio + UI per spec §9 success criteria.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
-git add test_project/
-git commit -m "feat(test): full test app UI + export presets + smoke self-test"
+git add -A
+git commit -m "feat(test): test app UI, export presets, macOS release export + smoke"
 ```
 
 ---
