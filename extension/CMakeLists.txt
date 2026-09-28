@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(godot_libpd CXX)
+project(godot_libpd C CXX)
 
 # ---------------------------------------------------------------------------
 # Platform naming for output dir
@@ -59,6 +59,10 @@ add_library(godot_libpd SHARED
     src/core/pd_debug.cpp
     src/core/pd_audio_sink_generator.cpp
 )
+if(ANDROID)
+    # bionic lacks glob(3) below API 28; libpd links it (see file header).
+    target_sources(godot_libpd PRIVATE src/compat/android_glob_stub.c)
+endif()
 
 set_target_properties(godot_libpd PROPERTIES
     OUTPUT_NAME "godot_libpd"

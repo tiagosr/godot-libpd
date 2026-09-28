@@ -1,6 +1,7 @@
 [application]
 
 config/name="godot-libpd-test"
+config/icon="res://icon.svg"
 config/features=PackedStringArray("4.6")
 run/main_scene="res://scenes/test.tscn"
 

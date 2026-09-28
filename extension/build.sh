@@ -48,11 +48,13 @@ case "${1:-}" in
 		fi
 		configure build/cmake-android android-arm64 \
 			-DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+			-DCMAKE_ANDROID_NDK="$NDK" \
+			-DCMAKE_ANDROID_STL_TYPE=c++_shared \
 			-DANDROID_ABI=arm64-v8a \
 			-DANDROID_PLATFORM=android-21 \
 			-DCMAKE_BUILD_TYPE=Release \
 			-DBUILD_PORTMIDI=OFF
-		build build/cmake-android
+		build build/cmake-android-arm64
 		;;
 	*)
 		echo "usage: $0 --macos | --linux-arm64 | --android" >&2
