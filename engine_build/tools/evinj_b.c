@@ -16,6 +16,7 @@ static int push(int fd,int type,unsigned code,int val){
 }
 int main(int argc,char**argv){
   int presses = argc>1?atoi(argv[1]):3;
+  int delay = argc>2?atoi(argv[2]):0;
   int fd=open("/dev/uinput",O_WRONLY|O_NONBLOCK);
   if(fd<0){perror("uinput");return 1;}
   ioctl(fd,UI_SET_EVBIT,EV_KEY);
@@ -26,6 +27,7 @@ int main(int argc,char**argv){
   ioctl(fd,UI_DEV_SETUP,&us);
   if(ioctl(fd,UI_DEV_CREATE)<0){perror("create");return 1;}
   printf("synth-b ready\n"); fflush(stdout);
+  if(delay) ms(delay);
   for(int i=0;i<presses;i++){
     push(fd,EV_KEY,305,1); push(fd,EV_SYN,0,0);
     ms(300);

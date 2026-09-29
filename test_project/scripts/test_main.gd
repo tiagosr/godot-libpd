@@ -59,10 +59,8 @@ func _ready() -> void:
 	# One pre-created (not yet initialized) instance.
 	_add_instance(false)
 	_log("godot-libpd test app ready (mix rate %d)" % _mix_rate)
-	// Physical Brick labels (SDL/Xbox mapping: SOUTH=A, EAST=B, WEST=X,
-	// NORTH=Y — the Brick prints A/B and X/Y swapped relative to that).
-	_log("dpad moves - button labeled B activates")
-	_log("quit: button labeled A (ESC) or Start+Select")
+	_log("dpad moves - labeled B activates")
+	_log("quit: labeled A or Start+Select")
 	_refresh_labels()
 
 func _input(event: InputEvent) -> void:

@@ -139,14 +139,44 @@ that sends ESC/quit. This matches what SDL apps on the device do.
 Diagnostics: `GODOT_FBDEV_EVLOG=1` → raw events to
 `/tmp/godot_evdev.log`; `[evdev]` lines in `/tmp/godot_fbdev_diag.log`.
 
-Verified on-device (2026-09-29) with synthetic uinput controllers
-(`engine_build/tools/evinject.c`, `evinj_b.c`, `evinj_ss.c` — create a
-device with the same BTN codes and inject scripted presses; **always run
-with ES suspended**, otherwise ES consumes the injected presses and
-launches games): full button stream read, KEY+JOY echo in the test app,
-ESC → clean self-exit, START+SELECT → clean self-exit. Note: the uinput
-device must outlive the app's boot (~8 s: 80 MB exfat load) or the
-startup scan misses it.
+**GDScript gotcha (Godot 4.6 line):** the GDScript 2.0 tokenizer does
+not support `//` line comments (only `#`) — a `//` line is a parse
+error (`Expected statement, found "/"`), silently killing the whole
+script at load. Verified on the 4.6.2 editor and this 4.6-stable
+engine. Use `#` comments in all project scripts.
+
+Verified on-device (2026-09-29) two ways:
+- **Physical controller** (evdump capture of the real uinput device):
+  A=305 (EAST), B=304 (SOUTH), X=307 (NORTH), Y=308 (WEST), L1=310,
+  R1=311, Select=314, Start=315, D-pad=HAT0X/Y — all covered by the
+  table above.
+- **Synthetic uinput controllers** (`engine_build/tools/evinject.c`,
+  `evinj_b.c`, `evinj_ss.c` — create a device with the same BTN codes
+  and inject scripted presses; **always run with ES suspended**, or ES
+  consumes the injected presses and launches games; injectors take an
+  optional startup delay so presses land after the app's device scan):
+  full button stream read, KEY+JOY echo in the test app, ESC → clean
+  self-exit via the app's `_unhandled_input`, START+SELECT → clean
+  self-exit via the DS fallback.
+
+**The A133's `/userdata` (exfat) wedges minutes after boot** (reads
+hang forever, silent, survives soft reboot; cold power cycle usually
+recovers). The port must not read `/userdata` at launch: stage the app
+to tmpfs while the volume is healthy and let the ES entry script
+(`engine_build/port/godot-libpd.sh`) exec the staged copy:
+
+```sh
+mkdir -p /tmp/godot-app
+cp /userdata/roms/ports/godot-libpd/{test,test.pck,libgodot_libpd.so} /tmp/godot-app/
+chmod +x /tmp/godot-app/test
+```
+
+One-shot adb variant: `adb shell 'cp /userdata/roms/ports/godot-libpd/test* /userdata/roms/ports/godot-libpd/libgodot_libpd.so /tmp/godot-app/'`.
+Note: background processes via adb die when the adb session closes
+(SIGHUP, and `nohup` does not help) — keep the shell alive with a
+trailing `sleep`. Note: an `/etc/init.d/S99*` staging script was tried and abandoned —
+it vanished after a reboot (why is unexplained), so manual staging is
+the working procedure.
 
 ### On-device hang diagnostics (PD_DBG)
 
