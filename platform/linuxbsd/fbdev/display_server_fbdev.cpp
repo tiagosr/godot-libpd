@@ -53,8 +53,29 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdarg>
+
+#ifdef __has_include
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
+#endif
+#endif
+#include <signal.h>
 
 namespace {
+
+// Debug aid: SIGUSR1 dumps the receiving thread's native backtrace to
+// /tmp/godot_bt.log (async-signal-safe path) and keeps running.
+// Install with GODOT_FBDEV_BT=1.
+void fbdev_bt_handler(int) {
+	void *bt[128];
+	int n = backtrace(bt, 128);
+	int fd = ::open("/tmp/godot_bt.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (fd >= 0) {
+		backtrace_symbols_fd(bt, n, fd);
+		::close(fd);
+	}
+}
 // Unbuffered crash-proof diagnostics: raw write() to a tmpfs file so the
 // timeline survives segfaults and stdio buffering. Disable with
 // GODOT_FBDEV_DIAG=0.
@@ -68,6 +89,26 @@ void fbdev_diag(const char *msg) {
 		ssize_t w = write(diag_fd, msg, strlen(msg));
 		(void)w;
 	}
+}
+
+void fbdev_diagf(const char *fmt, ...) {
+	char buf[256];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	fbdev_diag(buf);
+}
+
+// Bisection gates (diagnostics): disable one event class to isolate
+// the D-pad main-thread spin.
+static bool fbdev_evkey_on() {
+	const char *e = getenv("GODOT_FBDEV_EVKEY");
+	return !e || e[0] != '0';
+}
+static bool fbdev_evjoy_on() {
+	const char *e = getenv("GODOT_FBDEV_EVJOY");
+	return !e || e[0] != '0';
 }
 
 void fbdev_diag_egl_err(const char *what) {
@@ -203,7 +244,13 @@ DisplayServer *DisplayServerFbdev::create_func(const String &p_rendering_driver,
 
 DisplayServerFbdev::DisplayServerFbdev() {
 	native_menu = memnew(NativeMenu);
+	if (const char *bt = getenv("GODOT_FBDEV_BT")) {
+		if (bt[0] == '1') {
+		signal(SIGUSR1, fbdev_bt_handler);
+		}
+	}
 	Input::get_singleton()->set_event_dispatch_function(_dispatch_input_events);
+	fbdev_diagf("[evdev] gates: key=%d joy=%d\n", (int)fbdev_evkey_on(), (int)fbdev_evjoy_on());
 	// Events pushed before the main loop starts are buffered by Input.
 	evdev_thread.start(&DisplayServerFbdev::_evdev_thread_trampoline, this);
 }
@@ -486,7 +533,7 @@ void DisplayServerFbdev::_evdev_thread_trampoline(void *p_user) {
 
 void DisplayServerFbdev::evdev_push_key(Key p_key, int p_joypad_btn, bool p_pressed, bool p_echo) {
 	Ref<InputEvent> key_ev;
-	{
+	if (fbdev_evkey_on()) {
 		Ref<InputEventKey> k;
 		k.instantiate();
 		k->set_keycode(p_key);
@@ -502,21 +549,27 @@ void DisplayServerFbdev::evdev_push_key(Key p_key, int p_joypad_btn, bool p_pres
 		key_ev = k;
 	}
 	Ref<InputEvent> joy_ev;
-	if (p_joypad_btn >= 0) {
+	if (p_joypad_btn >= 0 && fbdev_evjoy_on()) {
 		Ref<InputEventJoypadButton> jb;
 		jb.instantiate();
 		jb->set_button_index((JoyButton)p_joypad_btn);
 		jb->set_pressed(p_pressed);
 		joy_ev = jb;
 	}
+	uint64_t pushed = 0;
 	{
 		MutexLock lock(evdev_queue_mutex);
 		if (key_ev.is_valid()) {
 			evdev_queue.push_back(key_ev);
+			pushed++;
 		}
 		if (joy_ev.is_valid()) {
 			evdev_queue.push_back(joy_ev);
+			pushed++;
 		}
+	}
+	if (pushed) {
+		evdev_push_count.fetch_add(pushed, std::memory_order_relaxed);
 	}
 }
 
@@ -535,6 +588,15 @@ void DisplayServerFbdev::process_events() {
 	}
 	for (const Ref<InputEvent> &e : pending) {
 		Input::get_singleton()->parse_input_event(e);
+	}
+	{
+		static uint64_t report_frame = 0;
+		if ((report_frame++ % 600) == 0) {
+			fbdev_diagf("[evdev] report frame=%llu push_total=%llu pending=%d\n",
+				(unsigned long long)report_frame,
+				(unsigned long long)evdev_push_count.load(std::memory_order_relaxed),
+				(int)evdev_queue.size());
+		}
 	}
 	if (quit_requested) {
 		fbdev_diag("[evdev] START+SELECT -> quit\n");

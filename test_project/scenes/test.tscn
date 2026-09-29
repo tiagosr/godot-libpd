@@ -54,8 +54,8 @@ text = "+Instance"
 layout_mode = 2
 text = "Kill Last"
 
-[node name="Log" type="RichTextLabel" parent="VBox"]
+[node name="Log" type="Label" parent="VBox"]
 layout_mode = 2
 size_flags_vertical = 3
 text = ""
-fit_content = false
+autowrap_mode = 3

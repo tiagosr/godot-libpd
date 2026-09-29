@@ -137,7 +137,26 @@ that sends ESC/quit. This matches what SDL apps on the device do.
    thread).
 
 Diagnostics: `GODOT_FBDEV_EVLOG=1` → raw events to
-`/tmp/godot_evdev.log`; `[evdev]` lines in `/tmp/godot_fbdev_diag.log`.
+`/tmp/godot_evdev.log`; `[evdev]` lines in `/tmp/godot_fbdev_diag.log`
+(incl. gate state + delivered-event counters); `GODOT_FBDEV_BT=1` →
+SIGUSR1 on the app dumps the main thread's native backtrace to
+`/tmp/godot_bt.log` (engine is built **unstripped** so offsets resolve
+via `nm`/`addr2line`); `GODOT_FBDEV_EVKEY=0` / `GODOT_FBDEV_EVJOY=0`
+suppress key/joy event delivery (spin bisection).
+
+**Known engine issue — RichTextLabel text-shaping spin (4.6-stable,
+A133 build):** sustained input that feeds a `RichTextLabel` log
+(`append_text`/`delete_line`/`scroll_to_line` per event) saturates the
+main thread in `TextParagraph::_shape_lines` (TextServerAdvanced/
+FreeType+HarfBuzz) — the app freezes and quit-keys stop working. The
+test app therefore logs through a plain multi-line `Label` (GDScript
+ring buffer + one `label.text` rewrite per event), which is stable
+under 25+ events/s synthetic D-pad hammering (verified 2026-09-29:
+454 events, main thread ~43%, steady 60fps). Repro recipe for the
+later engine-level fix: old RichTextLabel pck + `evinj_hat2` +
+`GODOT_FBDEV_BT=1`; the hot frames are `TextParagraph::_shape_lines`,
+`RichTextLabel::_validate_line_caches`/`get_line_count`, and the
+scrollbar `Range::set_value`.
 
 **GDScript gotcha (Godot 4.6 line):** the GDScript 2.0 tokenizer does
 not support `//` line comments (only `#`) — a `//` line is a parse

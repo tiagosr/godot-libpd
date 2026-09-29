@@ -20,7 +20,7 @@ const SMOKE_TIMEOUT_MS := 15000
 
 @onready var status_label: Label = $VBox/StatusLabel
 @onready var instance_label: Label = $VBox/InstanceLabel
-@onready var log: RichTextLabel = $VBox/Log
+@onready var log: Label = $VBox/Log
 @onready var load_btn: Button = $VBox/Buttons/LoadPatchBtn
 @onready var start_stop_btn: Button = $VBox/Buttons/StartStopBtn
 @onready var note_btn: Button = $VBox/Buttons/SendNoteBtn
@@ -28,6 +28,7 @@ const SMOKE_TIMEOUT_MS := 15000
 @onready var kill_btn: Button = $VBox/Buttons/KillLastBtn
 
 var _instances: Array = [] # LibpdInstance nodes (scene-tree children)
+var _log_lines: Array = [] # ring buffer of the last MAX_LOG_LINES strings
 var _inited := {}          # instance_id -> true
 var _loaded := {}          # instance_id -> true
 var _dsp_running := false
@@ -258,8 +259,10 @@ func _refresh_labels() -> void:
 	instance_label.text = "instances: %d   dsp: %s" % [_instances.size(), "RUNNING" if _dsp_running else "stopped"]
 
 func _log(text: String) -> void:
-	log.append_text(text + "\n")
-	while log.get_line_count() > MAX_LOG_LINES:
-		log.delete_line(0)
-	if log.get_line_count() > 0:
-		log.scroll_to_line(log.get_line_count() - 1)
+	# Plain Label log: keep a GDScript-side ring buffer and rewrite the whole
+	# label. (RichTextLabel append/delete/scroll paths hit a text-shaping spin
+	# on the A133 build; plain Label layout is far simpler.)
+	_log_lines.append(text)
+	while _log_lines.size() > MAX_LOG_LINES:
+		_log_lines.pop_front()
+	log.text = "\n".join(_log_lines)

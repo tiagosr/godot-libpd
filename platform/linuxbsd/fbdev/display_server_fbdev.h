@@ -112,6 +112,7 @@ private:
 	Mutex evdev_queue_mutex;
 	Vector<Ref<InputEvent>> evdev_queue;
 	bool evdev_quit_requested = false;
+	std::atomic<uint64_t> evdev_push_count{ 0 }; // actual events pushed to the queue
 
 	void evdev_thread_main();
 	static void _evdev_thread_trampoline(void *p_user);

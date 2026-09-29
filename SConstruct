@@ -856,7 +856,11 @@ else:
             # Apple Clang, its linker doesn't like -s.
             env.AppendUnique(LINKFLAGS=["-Wl,-S", "-Wl,-x", "-Wl,-dead_strip"])
         else:
-            env.AppendUnique(LINKFLAGS=["-s"])
+            # Keep the full .symtab (unstripped, ~19MB larger) so on-device
+            # backtraces (GODOT_FBDEV_BT=1 + SIGUSR1, crash handlers) resolve
+            # to function names. Re-enable "-s" for size-constrained shipping.
+            # env.AppendUnique(LINKFLAGS=["-s"])
+            pass
 
     # Linker needs optimization flags too, at least for Emscripten.
     # For other toolchains, this _may_ be useful for LTO too to disambiguate.
