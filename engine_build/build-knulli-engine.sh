@@ -14,7 +14,14 @@ echo "== [1/2] Godot 4.6 linux-arm64 release engine (scons, -j$(nproc))"
 # 4.6 target values: editor | template_release | template_debug (no bare "release")
 # fbdev=yes builds the framebuffer display server (bare-Linux handhelds).
 # x11/wayland stay available so the host fallback path keeps working.
-scons platform=linux target=template_release arch=arm64 dev_build=false fbdev=yes -j"$(nproc)"
+# sdl=no: CRITICAL on bare-Linux handhelds. With the default (sdl=yes),
+# OS_LinuxBSD::initialize_joypads() also creates a JoypadSDL, whose
+# built-in SDL evdev backend opens the SAME /dev/input devices as the
+# fbdev display server's own evdev thread. Both readers feed the Input
+# singleton -> every physical D-pad/button press is delivered to scripts
+# TWICE (two distinct InputEvent objects). The fbdev DS is the sole input
+# source for these devices, so the SDL joypad driver must be out of the build.
+scons platform=linux target=template_release arch=arm64 dev_build=false fbdev=yes sdl=no -j"$(nproc)"
 # 4.6 names template binaries godot.<platform>.<target>.<arch>
 file bin/godot.linuxbsd.template_release.arm64
 

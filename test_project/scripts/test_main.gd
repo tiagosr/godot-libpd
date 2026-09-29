@@ -49,6 +49,7 @@ func _ready() -> void:
 		_smoke_log("START mix_rate=%d pid_args=%s" % [_mix_rate, str(OS.get_cmdline_args())])
 		_run_smoke()
 		return
+	_ensure_ui_actions()
 	load_btn.pressed.connect(_on_load_pressed)
 	start_stop_btn.pressed.connect(_on_start_stop_pressed)
 	note_btn.pressed.connect(_on_note_pressed)
@@ -59,10 +60,53 @@ func _ready() -> void:
 	Libpd.server.instance_dsp_active.connect(_on_instance_dsp_active)
 	# One pre-created (not yet initialized) instance.
 	_add_instance(false)
+	# Initial GUI focus so D-pad navigation has a starting point.
+	load_btn.grab_focus()
 	_log("godot-libpd test app ready (mix rate %d)" % _mix_rate)
-	_log("dpad moves - labeled B activates")
+	_log("dpad moves focus - labeled B activates")
 	_log("quit: labeled A or Start+Select")
 	_refresh_labels()
+
+func _ensure_ui_actions() -> void:
+	# The test project ships no [input] map, so register the standard
+	# ui_* navigation actions: arrow keys (what the evdev DS maps the
+	# D-pad to) plus the joypad D-pad buttons the same events carry.
+	# JoyButton: A=0 Back=4 DPAD_UP=11 DPAD_DOWN=12 DPAD_LEFT=13 DPAD_RIGHT=14.
+	var nav := {
+		"ui_left": [KEY_LEFT, 13],
+		"ui_right": [KEY_RIGHT, 14],
+		"ui_up": [KEY_UP, 11],
+		"ui_down": [KEY_DOWN, 12],
+	}
+	for action: String in nav:
+		if not InputMap.has_action(action):
+			InputMap.add_action(action)
+		var ke := InputEventKey.new()
+		ke.physical_keycode = nav[action][0]
+		InputMap.action_add_event(action, ke)
+		var je := InputEventJoypadButton.new()
+		je.button_index = nav[action][1]
+		InputMap.action_add_event(action, je)
+	var accept := [KEY_ENTER, KEY_SPACE, 0] # Enter, Space, joypad A
+	for v: int in accept:
+		if not InputMap.has_action("ui_accept"):
+			InputMap.add_action("ui_accept")
+		if v < 10000:
+			var ke2 := InputEventKey.new()
+			ke2.physical_keycode = v
+			InputMap.action_add_event("ui_accept", ke2)
+		else:
+			var je2 := InputEventJoypadButton.new()
+			je2.button_index = v
+			InputMap.action_add_event("ui_accept", je2)
+	if not InputMap.has_action("ui_cancel"):
+		InputMap.add_action("ui_cancel")
+	var ke3 := InputEventKey.new()
+	ke3.physical_keycode = KEY_ESCAPE
+	InputMap.action_add_event("ui_cancel", ke3)
+	var je3 := InputEventJoypadButton.new()
+	je3.button_index = 4 # Back
+	InputMap.action_add_event("ui_cancel", je3)
 
 func _input(event: InputEvent) -> void:
 	# Evdev input echo (display-server level, pre-Control) so handheld
@@ -79,10 +123,11 @@ func _input(event: InputEvent) -> void:
 		_log(jmsg)
 
 func _unhandled_input(event: InputEvent) -> void:
-	# B (mapped to ESC) quits so the frontend can always take the display
-	# back; A/Enter activates the focused button.
-	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ESCAPE:
-		_log("quitting (B/ESC)")
+	# ui_cancel (B/ESC, or joypad Back) quits so the frontend can always
+	# take the display back; ui_accept (labeled B -> Enter, or joypad A)
+	# activates the focused button.
+	if event.is_action_pressed("ui_cancel"):
+		_log("quitting (ui_cancel: B/ESC/Back)")
 		get_tree().quit()
 		accept_event()
 

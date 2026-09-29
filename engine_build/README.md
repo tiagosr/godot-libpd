@@ -108,7 +108,29 @@ thread corrupts the main loop (node callbacks + GDScript must run on the
 main thread; observed: main thread spinning at 100% after an ESC press).
 - Each button emits **both** an `InputEventKey` and an
 `InputEventJoypadButton`, so `Input.is_key_pressed`, InputMap key
-actions, and InputMap joypad actions all work.
+actions, and InputMap joypad actions all work. The D-pad (hat) emits
+**joypad buttons only** (SDL channel model: a gamepad hat is a gamepad
+channel; keyboard-classified devices provide the arrow keys).
+- **Logical press de-dup:** firmware input layers can expose the same
+physical button through several event devices (controller mirror +
+keyboard mirror). The evdev thread tracks the logical pressed state per
+key/joypad button (and the D-pad direction is tracked globally, not
+per-device), so a press is emitted once and a release once no matter how
+many devices report it.
+
+**CRITICAL — build with `sdl=no`.** With the default `sdl=yes`,
+`OS_LinuxBSD::initialize_joypads()` also creates a `JoypadSDL`, whose
+built-in SDL evdev backend opens the **same** `/dev/input` devices this
+display server's evdev thread reads and feeds them into the `Input`
+singleton via `Input::joy_hat`/`joy_button` (a second, distinct
+`InputEventJoypadButton` per edge). Every D-pad/button press then reaches
+scripts **twice** (two objects, two unique instance ids) — GUI
+navigation skips buttons, fires double-actions. This is invisible in the
+evdev log (both readers see the same raw stream) and survives any
+dedup inside a single reader; it only stops when the SDL joypad driver
+is out of the build. The fbdev DS is the sole input source for these
+devices, so `sdl=no` is part of the knulli build recipe
+(`build-knulli-engine.sh`).
 
 Mapping (SDL/Xbox convention — the same one RetroArch & co. get from
 SDL on this device):
@@ -122,7 +144,7 @@ SDL on this device):
 | BTN_START 315 | F1 | START |
 | BTN_SELECT 314 | F2 | BACK |
 | BTN_TL/TR 310/311 | Q/W | L1/R1 |
-| ABS_HAT0X/Y 16/17 | arrows | DPAD |
+| ABS_HAT0X/Y 16/17 | — (joypad only) | DPAD |
 | ABS_X/Y 0/1 | arrows | — |
 
 **Label caveat:** the Brick's physical silkscreen is swapped relative to

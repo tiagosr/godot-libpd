@@ -531,9 +531,43 @@ void DisplayServerFbdev::_evdev_thread_trampoline(void *p_user) {
 	static_cast<DisplayServerFbdev *>(p_user)->evdev_thread_main();
 }
 
+// Logical pressed-state lookup (evdev thread only). p_is_joy namespaces the
+// id space (keys use the Key value, joypad buttons use 1'000'000 + button).
+bool DisplayServerFbdev::evdev_dedup_state(int64_t p_id, bool p_is_joy, bool p_pressed, bool p_echo, bool &r_allow) {
+	for (EvdevDedup &e : evdev_dedup) {
+		if (e.id == p_id) {
+			if (p_pressed) {
+				// Suppress repeats and duplicate presses while held
+				// (mirrored devices / key repeat).
+				r_allow = !e.pressed && !p_echo;
+				e.pressed = true;
+			} else {
+				// Drop stale releases (device A releases while mirrored
+				// device B still reports pressed -> logical state stays).
+				r_allow = e.pressed;
+				e.pressed = false;
+			}
+			return true;
+		}
+	}
+	if (p_pressed && !p_echo) {
+		evdev_dedup.push_back(EvdevDedup{ p_id, true });
+	}
+	r_allow = p_pressed && !p_echo;
+	return false;
+}
+
 void DisplayServerFbdev::evdev_push_key(Key p_key, int p_joypad_btn, bool p_pressed, bool p_echo) {
+	bool allow_key = false, allow_joy = false;
+	const bool has_key = p_key != Key::NONE;
+	if (has_key) {
+		evdev_dedup_state((int64_t)p_key, false, p_pressed, p_echo, allow_key);
+	}
+	if (p_joypad_btn >= 0) {
+		evdev_dedup_state(1000000 + p_joypad_btn, true, p_pressed, p_echo, allow_joy);
+	}
 	Ref<InputEvent> key_ev;
-	if (fbdev_evkey_on()) {
+	if (has_key && allow_key && fbdev_evkey_on()) {
 		Ref<InputEventKey> k;
 		k.instantiate();
 		k->set_keycode(p_key);
@@ -549,7 +583,7 @@ void DisplayServerFbdev::evdev_push_key(Key p_key, int p_joypad_btn, bool p_pres
 		key_ev = k;
 	}
 	Ref<InputEvent> joy_ev;
-	if (p_joypad_btn >= 0 && fbdev_evjoy_on()) {
+	if (p_joypad_btn >= 0 && allow_joy && fbdev_evjoy_on()) {
 		Ref<InputEventJoypadButton> jb;
 		jb.instantiate();
 		jb->set_button_index((JoyButton)p_joypad_btn);
@@ -589,15 +623,6 @@ void DisplayServerFbdev::process_events() {
 	for (const Ref<InputEvent> &e : pending) {
 		Input::get_singleton()->parse_input_event(e);
 	}
-	{
-		static uint64_t report_frame = 0;
-		if ((report_frame++ % 600) == 0) {
-			fbdev_diagf("[evdev] report frame=%llu push_total=%llu pending=%d\n",
-				(unsigned long long)report_frame,
-				(unsigned long long)evdev_push_count.load(std::memory_order_relaxed),
-				(int)evdev_queue.size());
-		}
-	}
 	if (quit_requested) {
 		fbdev_diag("[evdev] START+SELECT -> quit\n");
 		MainLoop *ml = OS::get_singleton()->get_main_loop();
@@ -608,6 +633,15 @@ void DisplayServerFbdev::process_events() {
 		}
 	}
 	Input::get_singleton()->flush_buffered_events();
+	{
+		static uint64_t report_frame = 0;
+		if ((report_frame++ % 600) == 0) {
+			fbdev_diagf("[evdev] report frame=%llu push_total=%llu pending=%d\n",
+				(unsigned long long)report_frame,
+				(unsigned long long)evdev_push_count.load(std::memory_order_relaxed),
+				(int)evdev_queue.size());
+		}
+	}
 }
 
 void DisplayServerFbdev::evdev_thread_main() {
@@ -722,8 +756,14 @@ void DisplayServerFbdev::evdev_thread_main() {
 						evdev_quit_requested = true;
 					}
 				} else if (ev.type == EV_ABS) {
-					// D-pad / axis sign changes -> directional key+joypad edges.
-					// Each axis has a negative-side and positive-side binding.
+					// D-pad / axis sign changes -> directional edges. SDL model:
+					// a gamepad hat is a GAMEPAD channel — synthesize joypad
+					// D-pad buttons only (no arrow-key synthesis from the hat;
+					// real arrow keys come from keyboard-classified devices).
+					// State is GLOBAL (not per-device) because firmware input
+					// layers can mirror the same physical D-pad through several
+					// event devices; one logical edge = one press. evdev_push_key
+					// additionally de-dups the logical pressed state.
 					auto axis_edge = [&](int &state, int val, Key neg_key, int neg_jbtn, Key pos_key, int pos_jbtn) {
 						int dir = val > 0 ? 1 : (val < 0 ? -1 : 0);
 						if (dir != state) {
@@ -738,10 +778,10 @@ void DisplayServerFbdev::evdev_thread_main() {
 					};
 					switch (ev.code) {
 						case ABS_HAT0X:
-							axis_edge(dev.hat_x, ev.value, Key::LEFT, (int)JoyButton::DPAD_LEFT, Key::RIGHT, (int)JoyButton::DPAD_RIGHT);
+							axis_edge(evdev_hat_x, ev.value, Key::NONE, (int)JoyButton::DPAD_LEFT, Key::NONE, (int)JoyButton::DPAD_RIGHT);
 							break;
 						case ABS_HAT0Y:
-							axis_edge(dev.hat_y, ev.value, Key::UP, (int)JoyButton::DPAD_UP, Key::DOWN, (int)JoyButton::DPAD_DOWN);
+							axis_edge(evdev_hat_y, ev.value, Key::NONE, (int)JoyButton::DPAD_UP, Key::NONE, (int)JoyButton::DPAD_DOWN);
 							break;
 						case ABS_X:
 							axis_edge(dev.abs_x, ev.value, Key::LEFT, -1, Key::RIGHT, -1);

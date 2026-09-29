@@ -114,9 +114,28 @@ private:
 	bool evdev_quit_requested = false;
 	std::atomic<uint64_t> evdev_push_count{ 0 }; // actual events pushed to the queue
 
+	// Logical press dedup (evdev thread only): firmware input layers can
+	// expose the same physical button through several event devices (a
+	// controller mirror + a keyboard mirror). Track the logical pressed
+	// state per key/joypad-button so a press is emitted once and a release
+	// once, no matter how many devices report it (SDL model: per-device
+	// channel classification + state-based polling).
+	struct EvdevDedup {
+		int64_t id = 0;
+		bool pressed = false;
+	};
+	Vector<EvdevDedup> evdev_dedup;
+
+	// Global D-pad state (evdev thread only): all mirror devices report
+	// the same hat direction, so one logical edge = one press, even when
+	// two devices deliver the transition.
+	int evdev_hat_x = 0;
+	int evdev_hat_y = 0;
+
 	void evdev_thread_main();
 	static void _evdev_thread_trampoline(void *p_user);
 	void evdev_push_key(Key p_key, int p_joypad_btn, bool p_pressed, bool p_echo);
+	bool evdev_dedup_state(int64_t p_id, bool p_is_joy, bool p_pressed, bool p_echo, bool &r_allow);
 
 	NativeMenu *native_menu = nullptr;
 	Callable input_event_callback;
