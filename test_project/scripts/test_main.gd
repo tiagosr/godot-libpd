@@ -59,7 +59,33 @@ func _ready() -> void:
 	# One pre-created (not yet initialized) instance.
 	_add_instance(false)
 	_log("godot-libpd test app ready (mix rate %d)" % _mix_rate)
+	// Physical Brick labels (SDL/Xbox mapping: SOUTH=A, EAST=B, WEST=X,
+	// NORTH=Y — the Brick prints A/B and X/Y swapped relative to that).
+	_log("dpad moves - button labeled B activates")
+	_log("quit: button labeled A (ESC) or Start+Select")
 	_refresh_labels()
+
+func _input(event: InputEvent) -> void:
+	# Evdev input echo (display-server level, pre-Control) so handheld
+	# button activity is visible on-device. Raw codes: the physical
+	# evdev code is in the DS-level mapping, the keycode/button index
+	# here is the Godot-side result.
+	if event is InputEventKey and event.pressed and not event.echo:
+		var kmsg := "input: KEY code=%d phys=%d" % [event.keycode, event.physical_keycode]
+		print(kmsg)
+		_log(kmsg)
+	elif event is InputEventJoypadButton and event.pressed:
+		var jmsg := "input: JOY button=%d" % event.button_index
+		print(jmsg)
+		_log(jmsg)
+
+func _unhandled_input(event: InputEvent) -> void:
+	# B (mapped to ESC) quits so the frontend can always take the display
+	# back; A/Enter activates the focused button.
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ESCAPE:
+		_log("quitting (B/ESC)")
+		get_tree().quit()
+		accept_event()
 
 # --------------------------------------------------------------------------
 # --smoke headless self-test

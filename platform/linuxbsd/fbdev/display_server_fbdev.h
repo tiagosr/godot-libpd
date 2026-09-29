@@ -32,6 +32,9 @@
 
 #ifdef FBDEV_ENABLED
 
+#include <atomic>
+
+#include "core/os/mutex.h"
 #include "platform_gl.h"
 #include "servers/display/display_server.h"
 
@@ -87,6 +90,32 @@ private:
 
 	Vector<uint8_t> readback;
 	uint64_t last_swap_usec = 0;
+
+	// Evdev input (firmware uinput gamepad + key sources, e.g. the Trimui
+	// Brick's `trimui_inputd` -> /dev/uinput -> /dev/input/eventN).
+	struct EvdevDev {
+		int fd = -1;
+		char name[64] = { 0 };
+		// axis/edge state for press/release synthesis
+		int hat_x = 0, hat_y = 0, abs_x = 0, abs_y = 0;
+		bool start_held = false, select_held = false;
+	};
+	Vector<EvdevDev> evdev_devs;
+	Thread evdev_thread;
+	std::atomic<bool> evdev_stop{ false };
+
+	// Cross-thread input handoff: the evdev thread only ever appends to
+	// this queue; process_events() (main thread, once per iteration)
+	// delivers the events to Input. Calling Input/SceneTree APIs from the
+	// evdev thread directly is not safe (node callbacks + GDScript run on
+	// the main thread only).
+	Mutex evdev_queue_mutex;
+	Vector<Ref<InputEvent>> evdev_queue;
+	bool evdev_quit_requested = false;
+
+	void evdev_thread_main();
+	static void _evdev_thread_trampoline(void *p_user);
+	void evdev_push_key(Key p_key, int p_joypad_btn, bool p_pressed, bool p_echo);
 
 	NativeMenu *native_menu = nullptr;
 	Callable input_event_callback;
@@ -207,9 +236,7 @@ public:
 
 	int64_t window_get_native_handle(HandleType p_handle_type, WindowID p_window = MAIN_WINDOW_ID) const override { return 0; }
 
-	void process_events() override {
-		Input::get_singleton()->flush_buffered_events();
-	}
+	void process_events() override;
 
 	void set_native_icon(const String &p_filename) override {}
 	void set_icon(const Ref<Image> &p_icon) override {}

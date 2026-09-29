@@ -89,6 +89,65 @@ First thing to check on failure: `ldd --version` on-device. **The current
 builds need glibc >= 2.35** (max `GLIBC_2.35` symbol in both the engine and
 the .so, built on Ubuntu 22.04). Knulli's Buildroot glibc is 2.40 — OK.
 
+### Input: evdev (the firmware uinput gamepad)
+
+The Brick's controller is a **uinput device** created by the
+`trimui_inputd` daemon (polls GPIO → `/dev/uinput` → `/dev/input/event3`,
+reported as `TRIMUI Brick Controller`, id `045e:028e:0114`).
+`DisplayServerFbdev` reads it with a dedicated thread:
+
+- At DS construction the thread scans `/dev/input/event*`, opens every
+device with key/abs capability (`EVIOCGBIT` — note: this ioctl returns
+the **byte count copied**, not 0; test `>= 0`, and give the KEY mask its
+full 12 longs or older kernels reject it), and `poll()`s them.
+- **Events are never dispatched from the evdev thread.** They are queued
+(mutex-protected) and delivered to `Input::parse_input_event()` from
+`DisplayServer::process_events()` — main thread, once per iteration,
+same pattern as the X11/Wayland servers. Dispatching from the evdev
+thread corrupts the main loop (node callbacks + GDScript must run on the
+main thread; observed: main thread spinning at 100% after an ESC press).
+- Each button emits **both** an `InputEventKey` and an
+`InputEventJoypadButton`, so `Input.is_key_pressed`, InputMap key
+actions, and InputMap joypad actions all work.
+
+Mapping (SDL/Xbox convention — the same one RetroArch & co. get from
+SDL on this device):
+
+| evdev | Godot key | joypad button |
+|---|---|---|
+| BTN_SOUTH 304 | ENTER | A |
+| BTN_EAST 305 | ESC | B |
+| BTN_WEST 308 | SPACE | X |
+| BTN_NORTH 307 | E | Y |
+| BTN_START 315 | F1 | START |
+| BTN_SELECT 314 | F2 | BACK |
+| BTN_TL/TR 310/311 | Q/W | L1/R1 |
+| ABS_HAT0X/Y 16/17 | arrows | DPAD |
+| ABS_X/Y 0/1 | arrows | — |
+
+**Label caveat:** the Brick's physical silkscreen is swapped relative to
+the Xbox positions — south is printed **B**, east **A**, west **Y**,
+north **X**. So on the Brick the *labeled A* button (east) is the one
+that sends ESC/quit. This matches what SDL apps on the device do.
+
+**Quit paths** (so the frontend always gets the display back):
+1. App-level: ESC (labeled-A button) in the app's `_unhandled_input`.
+2. DS-level fallback: START+SELECT held together → `SceneTree::quit()`
+   from `process_events()` (flag set by the evdev thread, acted on main
+   thread).
+
+Diagnostics: `GODOT_FBDEV_EVLOG=1` → raw events to
+`/tmp/godot_evdev.log`; `[evdev]` lines in `/tmp/godot_fbdev_diag.log`.
+
+Verified on-device (2026-09-29) with synthetic uinput controllers
+(`engine_build/tools/evinject.c`, `evinj_b.c`, `evinj_ss.c` — create a
+device with the same BTN codes and inject scripted presses; **always run
+with ES suspended**, otherwise ES consumes the injected presses and
+launches games): full button stream read, KEY+JOY echo in the test app,
+ESC → clean self-exit, START+SELECT → clean self-exit. Note: the uinput
+device must outlive the app's boot (~8 s: 80 MB exfat load) or the
+startup scan misses it.
+
 ### On-device hang diagnostics (PD_DBG)
 
 The extension and smoke test carry env-gated debug logging (zero overhead

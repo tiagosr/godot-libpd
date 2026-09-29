@@ -32,14 +32,23 @@
 
 #include "display_server_fbdev.h"
 
+#include "core/input/input.h"
+#include "core/input/input_enums.h"
 #include "core/os/os.h"
 #include "drivers/gles3/rasterizer_gles3.h"
 #include "platform_gl.h"
+#include "scene/main/scene_tree.h"
 
+// linux/input.h defines KEY_* macros that collide with Godot's Key enum
+// (e.g. KEY_DELETE), so it must come AFTER all Godot headers.
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/input.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -65,6 +74,98 @@ void fbdev_diag_egl_err(const char *what) {
 	char buf[160];
 	snprintf(buf, sizeof(buf), "[%s] FAILED (eglError=0x%04x)\n", what, eglGetError());
 	fbdev_diag(buf);
+}
+
+// Raw evdev event logger (GODOT_FBDEV_EVLOG=1), same crash-proof pattern.
+void fbdev_evdev_log(const char *name, const struct input_event &ev) {
+	static int lfd = -2;
+	if (lfd == -2) {
+		const char *on = getenv("GODOT_FBDEV_EVLOG");
+		lfd = (on && on[0] == '1') ? open("/tmp/godot_evdev.log", O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
+	}
+	if (lfd >= 0) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		char buf[96];
+		int n = snprintf(buf, sizeof(buf), "t=%ld.%03ld %s type=%d code=%d val=%d\n",
+				(long)ts.tv_sec, (long)(ts.tv_nsec / 1000000), name, ev.type, ev.code, ev.value);
+		if (n > 0) {
+			ssize_t w = write(lfd, buf, (size_t)n);
+			(void)w;
+		}
+	}
+}
+
+// Map an evdev KEY code to a Godot key (+ optional joypad button).
+// Trimui Brick (firmware uinput gamepad): A=BTN_SOUTH, B=BTN_EAST,
+// X=BTN_WEST, Y=BTN_NORTH, START=BTN_START, SELECT=BTN_SELECT,
+// L1=BTN_TL, R1=BTN_TR, dpad=ABS_HAT0X/Y.
+static bool fbdev_evdev_map_key(int p_code, Key &r_key, int &r_joypad_btn) {
+	r_joypad_btn = -1;
+	switch (p_code) {
+		case BTN_SOUTH: // physical A
+			r_key = Key::ENTER;
+			r_joypad_btn = (int)JoyButton::A;
+			return true;
+		case BTN_EAST: // physical B
+			r_key = Key::ESCAPE;
+			r_joypad_btn = (int)JoyButton::B;
+			return true;
+		case BTN_NORTH: // physical Y
+			r_key = Key::E;
+			r_joypad_btn = (int)JoyButton::Y;
+			return true;
+		case BTN_WEST: // physical X
+			r_key = Key::SPACE;
+			r_joypad_btn = (int)JoyButton::X;
+			return true;
+		case BTN_START:
+			r_key = Key::F1;
+			r_joypad_btn = (int)JoyButton::START;
+			return true;
+		case BTN_SELECT:
+			r_key = Key::F2;
+			r_joypad_btn = (int)JoyButton::BACK;
+			return true;
+		case BTN_TL: // L1
+			r_key = Key::Q;
+			r_joypad_btn = (int)JoyButton::LEFT_SHOULDER;
+			return true;
+		case BTN_TR: // R1
+			r_key = Key::W;
+			r_joypad_btn = (int)JoyButton::RIGHT_SHOULDER;
+			return true;
+		case BTN_TL2: // L2
+			r_key = Key::F4;
+			r_joypad_btn = (int)/* triggers: no JoyButton slot */ -1;
+			return true;
+		case BTN_TR2: // R2
+			r_key = Key::F5;
+			r_joypad_btn = (int)/* triggers: no JoyButton slot */ -1;
+			return true;
+		case BTN_THUMBL:
+			r_key = Key::F6;
+			r_joypad_btn = (int)JoyButton::LEFT_STICK;
+			return true;
+		case BTN_THUMBR:
+			r_key = Key::F7;
+			r_joypad_btn = (int)JoyButton::RIGHT_STICK;
+			return true;
+		case KEY_UP:
+			r_key = Key::UP;
+			return true;
+		case KEY_DOWN:
+			r_key = Key::DOWN;
+			return true;
+		case KEY_LEFT:
+			r_key = Key::LEFT;
+			return true;
+		case KEY_RIGHT:
+			r_key = Key::RIGHT;
+			return true;
+		default:
+			return false;
+	}
 }
 
 } // namespace
@@ -103,9 +204,20 @@ DisplayServer *DisplayServerFbdev::create_func(const String &p_rendering_driver,
 DisplayServerFbdev::DisplayServerFbdev() {
 	native_menu = memnew(NativeMenu);
 	Input::get_singleton()->set_event_dispatch_function(_dispatch_input_events);
+	// Events pushed before the main loop starts are buffered by Input.
+	evdev_thread.start(&DisplayServerFbdev::_evdev_thread_trampoline, this);
 }
 
 DisplayServerFbdev::~DisplayServerFbdev() {
+	evdev_stop = true;
+	if (evdev_thread.is_started()) {
+		evdev_thread.wait_to_finish();
+	}
+	for (EvdevDev &d : evdev_devs) {
+		if (d.fd >= 0) {
+			::close(d.fd);
+		}
+	}
 	if (egl_ok) {
 		eglMakeCurrent(EGL_NO_DISPLAY, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 		if (egl_surface != EGL_NO_SURFACE) {
@@ -366,6 +478,222 @@ void DisplayServerFbdev::swap_buffers() {
 		usleep((useconds_t)(frame_budget_usec - elapsed));
 	}
 	last_swap_usec = OS::get_singleton()->get_ticks_usec();
+}
+
+void DisplayServerFbdev::_evdev_thread_trampoline(void *p_user) {
+	static_cast<DisplayServerFbdev *>(p_user)->evdev_thread_main();
+}
+
+void DisplayServerFbdev::evdev_push_key(Key p_key, int p_joypad_btn, bool p_pressed, bool p_echo) {
+	Ref<InputEvent> key_ev;
+	{
+		Ref<InputEventKey> k;
+		k.instantiate();
+		k->set_keycode(p_key);
+		k->set_physical_keycode(p_key); // no hardware scancodes; logical code
+		k->set_key_label(p_key);
+		k->set_pressed(p_pressed);
+		k->set_echo(p_echo);
+		// Keep modifier state consistent so is_action() works on releases.
+		if (p_key == Key::SHIFT) k->set_shift_pressed(p_pressed);
+		if (p_key == Key::CTRL) k->set_ctrl_pressed(p_pressed);
+		if (p_key == Key::ALT) k->set_alt_pressed(p_pressed);
+		if (p_key == Key::META) k->set_meta_pressed(p_pressed);
+		key_ev = k;
+	}
+	Ref<InputEvent> joy_ev;
+	if (p_joypad_btn >= 0) {
+		Ref<InputEventJoypadButton> jb;
+		jb.instantiate();
+		jb->set_button_index((JoyButton)p_joypad_btn);
+		jb->set_pressed(p_pressed);
+		joy_ev = jb;
+	}
+	{
+		MutexLock lock(evdev_queue_mutex);
+		if (key_ev.is_valid()) {
+			evdev_queue.push_back(key_ev);
+		}
+		if (joy_ev.is_valid()) {
+			evdev_queue.push_back(joy_ev);
+		}
+	}
+}
+
+void DisplayServerFbdev::process_events() {
+	// Main thread, once per iteration: deliver queued evdev events to
+	// Input (same pattern as the X11/Wayland display servers' OS event
+	// queues), and handle the DS-level quit fallback.
+	Vector<Ref<InputEvent>> pending;
+	bool quit_requested = false;
+	{
+		MutexLock lock(evdev_queue_mutex);
+		pending = evdev_queue;
+		evdev_queue.clear();
+		quit_requested = evdev_quit_requested;
+		evdev_quit_requested = false;
+	}
+	for (const Ref<InputEvent> &e : pending) {
+		Input::get_singleton()->parse_input_event(e);
+	}
+	if (quit_requested) {
+		fbdev_diag("[evdev] START+SELECT -> quit\n");
+		MainLoop *ml = OS::get_singleton()->get_main_loop();
+		if (ml) {
+			if (SceneTree *st = Object::cast_to<SceneTree>(ml)) {
+				st->quit();
+			}
+		}
+	}
+	Input::get_singleton()->flush_buffered_events();
+}
+
+void DisplayServerFbdev::evdev_thread_main() {
+	// Discover input devices (firmware uinput devices appear here too).
+	DIR *dir = opendir("/dev/input");
+	if (!dir) {
+		fbdev_diag("[evdev] /dev/input missing\n");
+		return;
+	}
+	while (true) {
+		struct dirent *e = readdir(dir);
+		if (!e) {
+			break;
+		}
+		if (strncmp(e->d_name, "event", 5) != 0) {
+			continue;
+		}
+		String dev_path = String("/dev/input/") + e->d_name;
+		const char *path = dev_path.utf8().get_data();
+		int fd = open(path, O_RDWR | O_NONBLOCK);
+		if (fd < 0) {
+			fd = open(path, O_RDONLY | O_NONBLOCK);
+		}
+		if (fd < 0) {
+			char line[160];
+			snprintf(line, sizeof(line), "[evdev] open %s FAILED errno=%d\n", e->d_name, errno);
+			fbdev_diag(line);
+			continue;
+		}
+		// Only devices that can emit key or axis events. Buffer sizes match
+		// the kernel masks (KEY_MAX=0x2ff -> 12 longs, ABS_MAX -> 8 longs).
+		unsigned long kbits[12] = { 0 }, abits[8] = { 0 };
+		ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(kbits)), kbits);
+		bool has_keys = false;
+		for (int w = 0; w < 12; w++) {
+			if (kbits[w]) {
+				has_keys = true;
+			}
+		}
+		ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abits)), abits);
+		bool has_abs = false;
+		for (int w = 0; w < 8; w++) {
+			if (abits[w]) {
+				has_abs = true;
+			}
+		}
+		if (!has_keys && !has_abs) {
+			char line[96];
+			snprintf(line, sizeof(line), "[evdev] skip %s (no key/abs)\n", e->d_name);
+			fbdev_diag(line);
+			close(fd);
+			continue;
+		}
+		EvdevDev dev;
+		dev.fd = fd;
+		ioctl(fd, EVIOCGNAME(sizeof(dev.name) - 1), dev.name);
+		evdev_devs.push_back(dev);
+		char line[96];
+		snprintf(line, sizeof(line), "[evdev] opened %s (%s)\n", e->d_name, dev.name);
+		fbdev_diag(line);
+	}
+	closedir(dir);
+
+	if (evdev_devs.is_empty()) {
+		fbdev_diag("[evdev] no usable devices\n");
+		return;
+	}
+
+	Vector<struct pollfd> pfds;
+	for (const EvdevDev &d : evdev_devs) {
+		struct pollfd p;
+		p.fd = d.fd;
+		p.events = POLLIN;
+		pfds.push_back(p);
+	}
+
+	while (!evdev_stop) {
+		poll(pfds.ptrw(), (nfds_t)pfds.size(), 100);
+		for (int i = 0; i < pfds.size(); i++) {
+			if (!(pfds[i].revents & POLLIN)) {
+				continue;
+			}
+			EvdevDev &dev = evdev_devs.write[i];
+			struct input_event ev;
+			while (read(dev.fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+				if (evdev_stop) {
+					break;
+				}
+				if (ev.type == EV_SYN) {
+					continue;
+				}
+				fbdev_evdev_log(dev.name, ev);
+
+				if (ev.type == EV_KEY) {
+					bool pressed = ev.value != 0;
+					bool repeat = ev.value == 2;
+					Key key;
+					int jbtn = -1;
+					if (fbdev_evdev_map_key(ev.code, key, jbtn)) {
+						evdev_push_key(key, jbtn, pressed, repeat);
+					}
+					// DS-level quit fallback: START + SELECT together.
+					if (ev.code == BTN_START) {
+						dev.start_held = pressed;
+					}
+					if (ev.code == BTN_SELECT) {
+						dev.select_held = pressed;
+					}
+					if (dev.start_held && dev.select_held) {
+						// Flag only; process_events() acts on it (main thread).
+						MutexLock lock(evdev_queue_mutex);
+						evdev_quit_requested = true;
+					}
+				} else if (ev.type == EV_ABS) {
+					// D-pad / axis sign changes -> directional key+joypad edges.
+					// Each axis has a negative-side and positive-side binding.
+					auto axis_edge = [&](int &state, int val, Key neg_key, int neg_jbtn, Key pos_key, int pos_jbtn) {
+						int dir = val > 0 ? 1 : (val < 0 ? -1 : 0);
+						if (dir != state) {
+							if (state != 0) {
+								evdev_push_key(state < 0 ? neg_key : pos_key, state < 0 ? neg_jbtn : pos_jbtn, false, false);
+							}
+							if (dir != 0) {
+								evdev_push_key(dir < 0 ? neg_key : pos_key, dir < 0 ? neg_jbtn : pos_jbtn, true, false);
+							}
+							state = dir;
+						}
+					};
+					switch (ev.code) {
+						case ABS_HAT0X:
+							axis_edge(dev.hat_x, ev.value, Key::LEFT, (int)JoyButton::DPAD_LEFT, Key::RIGHT, (int)JoyButton::DPAD_RIGHT);
+							break;
+						case ABS_HAT0Y:
+							axis_edge(dev.hat_y, ev.value, Key::UP, (int)JoyButton::DPAD_UP, Key::DOWN, (int)JoyButton::DPAD_DOWN);
+							break;
+						case ABS_X:
+							axis_edge(dev.abs_x, ev.value, Key::LEFT, -1, Key::RIGHT, -1);
+							break;
+						case ABS_Y:
+							axis_edge(dev.abs_y, ev.value, Key::UP, -1, Key::DOWN, -1);
+							break;
+						default:
+							break;
+					}
+				}
+			}
+		}
+	}
 }
 
 #endif // FBDEV_ENABLED

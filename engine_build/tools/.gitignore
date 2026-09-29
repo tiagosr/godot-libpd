@@ -1,0 +1,15 @@
+# compiled probe binaries (built in docker from the .c sources)
+/evblock
+/evcaps
+/evdump
+/evinj_b
+/evinj_ss
+/evinject
+/evscan
+/fbtest
+/swaptest
+/winstest
+/drm_probe
+/egl_probe
+/eglpa_probe
+/vk_probe
