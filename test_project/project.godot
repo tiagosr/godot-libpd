@@ -1,22 +1,32 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
 [application]
 
 config/name="godot-libpd-test"
-config/icon="res://icon.svg"
-config/features=PackedStringArray("4.6")
 run/main_scene="res://scenes/test.tscn"
-
-[autoload]
-
-Libpd="*res://scripts/libpd_server.gd"
+config/features=PackedStringArray("4.6")
+config/icon="res://icon.svg"
 
 [audio]
 
 mixrate/mix_rate=44100
 
+[autoload]
+
+Libpd="*res://scripts/libpd_server.gd"
+
 [rendering]
-textures/vram_compression/import_etc2_astc=true
 
 renderer/rendering_method="mobile"
 renderer/rendering_method.mobile="gl_compatibility"
+textures/vram_compression/import_etc2_astc=true
 renderer/rendering_method.linuxbsd="gl_compatibility"
 rendering/gl_compatibility/driver.linuxbsd="opengl3_es"
