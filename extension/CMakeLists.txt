@@ -94,8 +94,16 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         tests/core_tests.cpp
         src/core/pd_event_ring.cpp
         src/core/pd_command_queue.cpp
+        src/core/pd_midi_framer.cpp
     )
     target_include_directories(libpd_core_tests PRIVATE src)
     target_link_libraries(libpd_core_tests PRIVATE pthread)
     add_test(NAME core_tests COMMAND $<TARGET_FILE:libpd_core_tests>)
+
+    add_executable(midi_framer_tests
+        tests/midi_framer_tests.cpp
+        src/core/pd_midi_framer.cpp
+    )
+    target_include_directories(midi_framer_tests PRIVATE src)
+    add_test(NAME midi_framer_tests COMMAND $<TARGET_FILE:midi_framer_tests>)
 endif()
