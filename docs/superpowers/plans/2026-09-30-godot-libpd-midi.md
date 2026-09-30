@@ -48,7 +48,7 @@ Failure modes the spec implies but no automated task test exercises — each mus
   - `enum class MidiKind : uint8_t { NOTE_ON, NOTE_OFF, CC, PROGRAM_CHANGE, PITCH_BEND, AFTERTOUCH, POLY_AFTERTOUCH };`
   - `struct MidiShortMsg { MidiKind kind; uint8_t channel; uint8_t d1; uint8_t d2; };` (PITCH_BEND: d1 = low 7 bits, d2 = high 7 bits; AFTERTOUCH: d1 = value, d2 unused; CC: d1 = controller, d2 = value; NOTE_ON/OFF: d1 = pitch, d2 = velocity; PROGRAM_CHANGE: d1 = program; POLY_AFTERTOUCH: d1 = pitch, d2 = value)
   - `struct MidiFramingSink { virtual void on_short(const MidiShortMsg &); virtual void on_byte(uint8_t); virtual void on_sysex(const uint8_t *data, int len); virtual void on_sysex_truncated(); }`
-  - `class MidiFramer { public: void feed(uint8_t p_byte); void reset(); };` — one framer per open input port; `feed()` may invoke the sink multiple times per byte (byte passthrough + short message on completion); `on_byte` is called for every non-sysex byte in original stream order (running status included) and is never called for bytes inside an F0..F7 sysex.
+  - `class MidiFramer { public: explicit MidiFramer(MidiFramingSink &p_sink); void feed(uint8_t p_byte); void reset(); };` (non-owning sink reference; caller keeps the sink alive for the framer's lifetime — router-side). — one framer per open input port; `feed()` may invoke the sink multiple times per byte (byte passthrough + short message on completion); `on_byte` is called for every non-sysex byte in original stream order (running status included) and is never called for bytes inside an F0..F7 sysex.
 - CMake: `libpd_core_tests` gains `src/core/pd_midi_framer.cpp` and a new `add_test(NAME midi_framer_tests COMMAND midi_framer_tests)` executable `tests/midi_framer_tests.cpp + src/core/pd_midi_framer.cpp`.
 
 - [ ] **Step 1: Write the failing tests** — `extension/tests/midi_framer_tests.cpp` (same CHECK-harness style as `core_tests.cpp`). Recording sink collects into vectors. Cases:
@@ -57,7 +57,7 @@ Failure modes the spec implies but no automated task test exercises — each mus
   - `running_status`: `0x90 0x3C 0x64  0x3D 0x50` → two NOTE_ONs (60/100 then 61/80); `on_byte` saw 5 bytes.
   - `cc`: `0xB3 0x07 0x7F` → CC ch3 ctrl7 val127.
   - `program_change_2byte`: `0xC1 0x2A` → PROGRAM_CHANGE ch1 prog42.
-  - `pitch_bend_14bit`: `0xE0 0x00 0x40` → PITCH_BEND value 16384 (d1=0, d2=64).
+  - `pitch_bend_14bit`: `0xE0 0x00 0x40` → PITCH_BEND d1=0, d2=64 (standard 14-bit value 8192 = d2*128+d1).
   - `aftertouch_and_poly`: `0xD0 0x5A` → AFTERTOUCH; `0xA0 0x3C 0x64` → POLY_AFTERTOUCH.
   - `sysex_whole`: `0xF0 0x7E 0x7F 0x09 0xF7` → one `on_sysex(4 bytes: 7E 7F 09 F7)` (F0 excluded, F7 included — store the body **including** F7? No: store everything between F0 and F7 **inclusive of F7**, exclusive of F0 — pin this: `data == {0x7E,0x7F,0x09,0xF7}`); **zero** `on_byte` calls for these 5 bytes.
   - `sysex_truncation`: F0 + 200×0x42 + F7 → `on_sysex` len == 127 and `on_sysex_truncated()` called once; framer back to normal after (next `0x90 0x00 0x40` still parses).
@@ -70,7 +70,7 @@ Run: `cd extension && ./build.sh --macos && ctest --test-dir build/cmake-macos -
 Expected: build FAILS (header missing) — or after creating empty stubs, tests FAIL.
 
 - [ ] **Step 3: Implement `MidiFramer`** in `pd_midi_framer.cpp`
-  State machine: `enum { NO_STATUS, STATUS_SEEN, IN_SYSEX }`; 2-byte message assembly from `status & 0xF0` (C0/E0 = 2-byte, F0 = sysex, else 3-byte). `on_byte` emission point: for every non-sysex byte that the framer accepts (including status and data bytes of completed messages, including realtime). Keep the class allocation-free (fixed state only).
+  State machine: `enum { NO_STATUS, STATUS_SEEN, IN_SYSEX }`; data-byte assembly from `status & 0xF0` (C0 and D0 = 1 data byte, F0 = sysex, all others incl. E0 = 2 data bytes — standard MIDI). `on_byte` emission point: for every non-sysex byte that the framer accepts (including status and data bytes of completed messages, including realtime). Keep the class allocation-free (fixed state only).
 - [ ] **Step 4: Run tests until green**
 
 Run: same as Step 2. Expected: PASS, all cases printed.
