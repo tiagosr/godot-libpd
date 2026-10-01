@@ -1,7 +1,5 @@
 #include "pd_event_ring.h"
 
-#include <atomic>
-
 namespace godot_libpd {
 
 void PdEventRing::push(const PdEvent &p_event) {

@@ -8,9 +8,3 @@
 [submodule "extension/thirdparty/portmidi"]
 	path = extension/thirdparty/portmidi
 	url = https://github.com/PortMidi/PortMidi.git
-[submodule "modules/libpd"]
-	path = modules/libpd
-	url = https://github.com/libpd/libpd.git
-[submodule "modules/portmidi"]
-	path = modules/portmidi
-	url = https://github.com/PortMidi/PortMidi.git

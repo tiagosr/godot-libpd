@@ -219,10 +219,10 @@ maintains running-status state. For each byte:
     `libpd_sysex` per byte; → GDScript `midi_sysex`). Sysex bytes are
     **not** emitted as raw pass-through (would corrupt `[midiin]`
     framing). > 127 bytes → truncate + warning.
-  - realtime (0xF1/0xF3/0xF5, single byte): raw pass-through only (fed
-    to `[midi realtime in]`), no high-level signal.
-  - other system common (0xF2/F4/F6-F7 outside sysex): raw pass-through
-    only, no signal.
+  - system common / real-time bytes (0xF1–0xFF, excluding the F0 that
+    starts sysex): raw pass-through only — single-byte messages that do
+    not disturb message assembly (fed to `[midiin]`), no high-level
+    signal.
 - Every non-sysex byte is also emitted as a `MIDI_BYTE` command to each
   routed instance, in original order (running status intact) →
   `libpd_midibyte` → `[midiin]` sees the pristine stream.
@@ -253,11 +253,12 @@ documented).
   are mutex-guarded; the MIDI I/O thread sees the change at its next
   poll).
 - **Close input:** auto-unroute everything on that port → control-queue
-  op on MIDI I/O thread: `Pm_AbortInput` (stops callback) → `Pm_Close` →
-  drop ring/framer state. API waits ≤ 500 ms; timeout → `midi_port_error`.
-- **Close output:** auto-unroute → control op: `Pm_Flush` → `Pm_Close`
-  (after the thread is done writing to it — same-thread ordering makes
-  this race-free).
+  op on MIDI I/O thread: `Pm_Close` (input is polled via `Pm_Read`, so
+  there is no callback to abort) → drop ring/framer state. API waits
+  ≤ 500 ms; timeout → `midi_port_error`.
+- **Close output:** auto-unroute → control op: `Pm_Close` (PortMIDI
+  tears the stream down; no `Pm_Flush` — same-thread ordering makes it
+  impossible for another `Pm_WriteShort` to follow the close).
 - **Device unplugged:** next `PmWrite` → `PmTerminated` → emit
   `midi_port_error(port_id, ...)`, auto-close, unroute. Input side: PM
   callback simply stops (no further events).

@@ -20,7 +20,7 @@ struct PdCommand {
 		LOAD = 1,      // path = patch path, search = search path dir (may be NULL)
 		UNLOAD = 2,
 		MESSAGE = 3,   // path = receiver, args = space-joined args string
-		MIDI = 4,      // i32 = channel, i64 = pitch*1000+velocity (packed)
+		MIDI = 4,      // i32 = channel, i64 = pitch<<32 | velocity (packed)
 		STOP_THREAD = 5,
 		MIDI_NOTE = 6,            // i32 = channel(0-15), i64 = pitch*256+velocity
 		MIDI_CC = 7,              // i32 = channel, i64 = controller*256+value
