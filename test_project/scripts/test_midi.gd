@@ -21,6 +21,14 @@ extends Control
 ## (a) the instance print of the note ("test_patch") AND (b) a
 ## midi_note_on for pitch 60 (IAC loopback: our output -> IAC bus -> our
 ## input). Both: MIDI_SMOKE_OK, quit(0). Timeout: dump state, quit(1).
+## Sysex leg: captures any midi_sysex that reaches the routed input
+## during the smoke window and reports it (MIDI_SMOKE_SYSEX seen=...). The
+## extension has no API to send sysex to an output port BY DESIGN
+## (input-only sysex, spec §1: the output raw path drops F0..F7 and the
+## vendored pd build has no [sysexout] hook), so the loopback cannot
+## inject one in-process — no output sysex API: the read-stage reassembly
+## is proven by extension/tests/midi_read_stage_tests.cpp, and a sysex
+## written to the same IAC bus by any host during the window is reported.
 
 # Both modes load the echo patch (notein -> print test_patch + noteout):
 # smoke mode needs [noteout] for the IAC loopback, GUI mode needs it for
@@ -65,6 +73,7 @@ var _smoke_start := 0
 var _smoke_got_print := false
 var _smoke_got_note := false
 var _smoke_done := false
+var _smoke_sysex: PackedByteArray = PackedByteArray()
 
 
 func _ready() -> void:
@@ -176,6 +185,11 @@ func _run_smoke() -> void:
 	Libpd.server.midi_note_on.connect(func(_port: int, _ch: int, pitch: int, _vel: int) -> void:
 		if pitch == 60:
 			_smoke_got_note = true)
+	Libpd.server.midi_sysex.connect(func(_port: int, data: PackedByteArray) -> void:
+		# Sysex leg capture: first midi_sysex on the routed input during
+		# the smoke window (see _report_smoke_sysex).
+		if _smoke_sysex.is_empty():
+			_smoke_sysex = data)
 	_instance.send_midi(0, 60, 100)
 	print("MIDI_SMOKE | note sent, waiting up to %d ms for print + looped note_on" % SMOKE_TIMEOUT_MS)
 	while not (_smoke_got_print and _smoke_got_note):
@@ -184,6 +198,7 @@ func _run_smoke() -> void:
 		await get_tree().process_frame
 	if _smoke_got_print and _smoke_got_note:
 		print("MIDI_SMOKE_OK print=1 note=1 (iac in_idx=%d out_idx=%d)" % [in_idx, out_idx])
+		_report_smoke_sysex()
 		await _finish_smoke(0)
 		return
 	await _smoke_fail("timeout print=%s note=%s (iac in_idx=%d out_idx=%d)" % [
@@ -194,6 +209,26 @@ func _smoke_fail(reason: String) -> void:
 	print("MIDI_SMOKE_FAIL %s" % reason)
 	_dump_smoke_state()
 	await _finish_smoke(1)
+
+
+func _report_smoke_sysex() -> void:
+	# Sysex leg (documented blocker): there is no in-process API to send
+	# sysex to the loopback output port — by design, sysex is input-only
+	# (spec §1: MidiOutWriter drops F0..F7 on the output raw path, and the
+	# vendored pd build has no [sysexout] hook). So the loopback cannot
+	# inject a sysex itself; the per-port read-stage reassembly is covered
+	# by extension/tests/midi_read_stage_tests.cpp (multi-word sysex, F7
+	# at every word position, F7-then-next-event, and a framer end-to-end
+	# case asserting the full F0..F7 signal contract). Any sysex that
+	# reaches the routed input from an external host during the smoke
+	# window is captured above and reported here.
+	if _smoke_sysex.size() > 0:
+		var framed := _smoke_sysex.size() >= 2 and _smoke_sysex[0] == 0xF0 and _smoke_sysex[_smoke_sysex.size() - 1] == 0xF7
+		print("MIDI_SMOKE_SYSEX seen len=%d full_f0_f7=%s (first=%d last=%d)" % [
+				_smoke_sysex.size(), str(framed),
+				_smoke_sysex[0], _smoke_sysex[_smoke_sysex.size() - 1]])
+	else:
+		print("MIDI_SMOKE_SYSEX_SKIP no output sysex API (input-only by design; read stage: midi_read_stage_tests)")
 
 
 func _finish_smoke(code: int) -> void:

@@ -27,32 +27,6 @@ constexpr const char *kVirtualOutName = "libpd test app out 0";
 #endif
 
 #ifdef PORTMIDI_ENABLED
-// PmEvent.message layout (portmidi.h / PmMakeEvent): 1-4 bytes of MIDI
-// data, low byte first; the high bit (0xFF000000) marks a long (sysex)
-// event — this is the 2.0.7 replacement for the brief's
-// PmReadLong/PmIsLongMessage pair.
-constexpr uint32_t kPmLongFlag = 0xFF000000;
-
-// Total bytes a short (non-sysex) PmEvent carries: pm_midi_length()
-// semantics from portmidi.c.
-int pm_short_bytes(uint32_t p_message) {
-	const uint8_t status = static_cast<uint8_t>(p_message & 0xFF);
-	if (status < 0x80) {
-		return 1; // not expected for short events; safe default
-	}
-	const uint8_t type = status & 0xF0;
-	if (type == 0xC0 || type == 0xD0) {
-		return 2; // program change, channel aftertouch
-	}
-	if (type == 0xF0) {
-		return status == 0xF2 ? 3 : 2; // song position; meta/sonoselect/tune/EOX
-	}
-	if (type == 0xF8) {
-		return 1; // realtime F8..FF
-	}
-	return 3; // 0x80..0xBF (channel), 0xE0 (pitch bend)
-}
-
 // Data bytes expected after a status byte in a raw [midiout] stream
 // (total message bytes - 1).
 int raw_data_need(uint8_t p_status) {
@@ -312,8 +286,10 @@ void MidiRouter::io_loop() {
 				}
 			}
 		}
-		// Stage 1 — read: Pm_Read + copy raw bytes into the per-port
-		// rings (pinned: the read stage does no parsing).
+		// Stage 1 — read: Pm_Read into the per-port rings. The per-port
+		// MidiReadStage converts each flagless 4-byte PmEvent word into
+		// raw stream bytes (sysex re-assembly); message framing stays in
+		// the framer stage below.
 		for (int pid : input_ports) {
 			Port *port = port_ptr(pid);
 			if (port == nullptr || port->pm_stream == nullptr) {
@@ -328,21 +304,9 @@ void MidiRouter::io_loop() {
 				continue;
 			}
 			for (int i = 0; i < n; ++i) {
-				const uint32_t m = events[i].message;
-				if (m & kPmLongFlag) {
-					// Long (sysex) event: all four bytes are stream
-					// bytes (F0/F7 included) — the framer re-frames them.
-					port->ring.push(static_cast<uint8_t>(m & 0xFF));
-					port->ring.push(static_cast<uint8_t>((m >> 8) & 0xFF));
-					port->ring.push(static_cast<uint8_t>((m >> 16) & 0xFF));
-					port->ring.push(static_cast<uint8_t>((m >> 24) & 0xFF));
-				} else {
-					// Short event: status + 0-2 data bytes, low byte first.
-					const int bytes = pm_short_bytes(m);
-					for (int b = 0; b < bytes; ++b) {
-						port->ring.push(static_cast<uint8_t>((m >> (8 * b)) & 0xFF));
-					}
-				}
+				port->read_stage.feed(events[i].message, [&](uint8_t byte) {
+					port->ring.push(byte);
+				});
 			}
 			// Asynchronous host-error check (same loop, per stream).
 			const int host_err = with_pm_mutex([&] {
@@ -667,6 +631,7 @@ void MidiRouter::close_port(int p_port_id) {
 			p.in_use = false;
 			p.pm_stream = nullptr;
 			p.ring.reset();
+			p.read_stage.reset();
 			if (p.input != nullptr) {
 				delete p.input;
 				p.input = nullptr;
@@ -695,6 +660,7 @@ void MidiRouter::handle_read_error(int p_port_id, int p_err) {
 			auto it = ports_.find(p_port_id);
 			if (it != ports_.end()) {
 				it->second->ring.reset();
+				it->second->read_stage.reset();
 				if (it->second->input != nullptr) {
 					it->second->input->framer.reset();
 				}

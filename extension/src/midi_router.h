@@ -11,8 +11,12 @@
 // PortMIDI 2.0.7 API note (the vendored API differs from the brief's
 // illustrative names; full mapping in task-4-report.md):
 //   - input: poll Pm_Read(PmEvent*) on the MIDI I/O thread (~1 ms);
-//     PmEvent.message carries 1-4 bytes low byte first, and the high bit
-//     (0xFF000000) marks a long (sysex) event;
+//     PmEvent.message is a plain "up to 4 bytes, low byte first" word
+//     with NO long-event flag (the vendored backend never sets
+//     0xFF000000): short events start at byte 0; sysex arrives as an
+//     F0-first run of words terminated by an F7 that zero-pads the rest
+//     of its word — the per-port MidiReadStage re-assembles the words
+//     into raw stream bytes before the framer frames them;
 //   - output: full-form short messages as PmMessage words via
 //     Pm_WriteShort(stream, 0, Pm_Message(status, d1, d2));
 //   - errors: PmError codes, Pm_GetErrorText, and per-stream async host
@@ -58,6 +62,131 @@ struct MidiSignalEvent {
 	int port_id = 0; // router port id (MidiRouter::open_input)
 	MidiShortMsg msg;
 	std::vector<uint8_t> sysex;
+};
+
+/**
+ * Per-port sysex read-stage state machine (pinned Task 4 interface,
+ * reworked for the vendored PortMIDI word layout — see file header).
+ * Pure: no PortMIDI, no threads, fixed state, allocation-free —
+ * trivially testable (tests/midi_read_stage_tests.cpp).
+ *
+ * The vendored backend delivers PmEvent.message as a plain
+ * little-endian "up to 4 bytes, low byte first" word — NO long-event
+ * flag: short events start at byte 0 (status + 0-2 data bytes, zero
+ * padding after); sysex arrives as a run of words where the first word
+ * has F0 in byte 0, continuation words carry up to 4 data bytes, and
+ * the final word carries F7 at byte k with zero padding after it (the
+ * backend enqueues the word at F7 and resets, so the padding is always
+ * zero in practice).
+ *
+ * feed() converts one word into raw stream bytes and pushes them via
+ * p_push in wire order; the router wires p_push to the per-port
+ * ByteRing, and the framer re-frames the stream (running status,
+ * short-message decode, sysex buffering).
+ *
+ * Sysex signal contract (pinned, verified against pd_midi_framer.cpp
+ * and LibpdServer): the framer's on_sysex body is F0-EXCLUSIVE and
+ * F7-INCLUSIVE (capped at 127 bytes); the server prepends the F0, so
+ * the emitted `midi_sysex` signal data is exactly one full F0..F7
+ * message.
+ */
+struct MidiReadStage {
+	// True while an F0..F7 message is open (F0 seen, F7 not yet).
+	bool in_sysex = false;
+
+	/**
+	 * Feed one PmEvent word (low byte first); the resulting stream bytes
+	 * are pushed via p_push (e.g. ByteRing::push) in wire order.
+	 */
+	template <typename Fn>
+	void feed(uint32_t p_message, Fn p_push) {
+		const uint8_t b[4] = {
+				static_cast<uint8_t>(p_message & 0xFF),
+				static_cast<uint8_t>((p_message >> 8) & 0xFF),
+				static_cast<uint8_t>((p_message >> 16) & 0xFF),
+				static_cast<uint8_t>((p_message >> 24) & 0xFF),
+		};
+		if (in_sysex || b[0] == 0xF0) {
+			in_sysex = true;
+			feed_sysex_word(b, p_push);
+			return;
+		}
+		// Short event: status + 0-2 data bytes, low byte first.
+		const int n = pm_short_bytes(b[0]);
+		for (int i = 0; i < n; ++i) {
+			p_push(b[i]);
+		}
+	}
+
+	/** Drop pending sysex state (port close / buffer-overflow reset). */
+	void reset() {
+		in_sysex = false;
+	}
+
+	/**
+	 * Total bytes a short (non-sysex) event carries: vendored
+	 * pm_midi_length() semantics (pm_common/portmidi.c). F4..F7 are
+	 * single-byte system-common messages (tune request, end of cable,
+	 * RT reset, ...) — NOT 2-byte messages.
+	 */
+	static int pm_short_bytes(uint8_t p_status) {
+		if (p_status < 0x80) {
+			return 1; // not expected for short events; safe default
+		}
+		const uint8_t type = p_status & 0xF0;
+		if (type == 0xC0 || type == 0xD0) {
+			return 2; // program change, channel aftertouch
+		}
+		if (type == 0xF0) {
+			if (p_status == 0xF2) {
+				return 3; // song position pointer
+			}
+			if (p_status >= 0xF4) {
+				return 1; // F4..F7: single-byte system common
+			}
+			return 2; // F1 (MTC quarter frame), F3 (song select)
+		}
+		if (type == 0xF8) {
+			return 1; // realtime F8..FF
+		}
+		return 3; // 0x80..0xBF (channel), 0xE0 (pitch bend)
+	}
+
+private:
+	// Sysex word (start or continuation): push stream bytes up to and
+	// including the F7. If the F7 lands at byte k < 3, bytes k+1..3 are
+	// zero padding in the vendored backend (enqueued at F7, then reset)
+	// and are never emitted; if a non-zero byte follows the F7, it
+	// starts the NEXT event: status (>= 0x80) -> a short event, of which
+	// only the bytes present in this word are emitted; data (< 0x80) ->
+	// one running-status continuation byte.
+	template <typename Fn>
+	void feed_sysex_word(const uint8_t *p_b, Fn p_push) {
+		for (int k = 0; k < 4; ++k) {
+			p_push(p_b[k]);
+			if (p_b[k] != 0xF7) {
+				continue;
+			}
+			in_sysex = false;
+			const int first = k + 1;
+			if (first >= 4 || p_b[first] == 0) {
+				return; // zero padding after the F7
+			}
+			if (p_b[first] >= 0x80) {
+				const int need = pm_short_bytes(p_b[first]);
+				int have = 4 - first;
+				if (need < have) {
+					have = need;
+				}
+				for (int i = first; i < first + have; ++i) {
+					p_push(p_b[i]);
+				}
+			} else {
+				p_push(p_b[first]);
+			}
+			return;
+		}
+	}
 };
 
 /**
@@ -387,6 +516,7 @@ private:
 		PortMidiStream *pm_stream = nullptr;
 #endif
 		ByteRing ring; // input only: read stage -> framer stage
+		MidiReadStage read_stage; // input only: PmEvent word -> stream bytes (sysex state)
 		PortInput *input = nullptr; // input only: owns framer + sink
 	};
 

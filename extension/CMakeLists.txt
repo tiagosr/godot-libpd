@@ -128,6 +128,16 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_include_directories(midi_writer_tests PRIVATE src)
     add_test(NAME midi_writer_tests COMMAND $<TARGET_FILE:midi_writer_tests>)
 
+    # Task 4 rework: MidiReadStage (per-port sysex read stage) is pure
+    # (no PortMIDI, no threads) and lives inline in midi_router.h; the
+    # framer is linked only for the end-to-end cases.
+    add_executable(midi_read_stage_tests
+        tests/midi_read_stage_tests.cpp
+        src/core/pd_midi_framer.cpp
+    )
+    target_include_directories(midi_read_stage_tests PRIVATE src)
+    add_test(NAME midi_read_stage_tests COMMAND $<TARGET_FILE:midi_read_stage_tests>)
+
     if(BUILD_PORTMIDI)
         # Task 7: PortMIDI virtual device lifecycle (create -> open ->
         # write -> close -> delete). Host API only; delivery is proven
