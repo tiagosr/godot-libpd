@@ -492,6 +492,9 @@ def configure(env: "SConsEnvironment"):
         env.Append(LIBS=["rt"])  # Needed by glibc, used by _allocate_shm_file
 
     if env["fbdev"]:
+        if not env["opengl3"]:
+            print_error("fbdev=yes requires opengl3=yes: the fbdev display server links the GLES3 rasterizer and the glad EGL loader, which are only compiled with opengl3=yes. Aborting.")
+            sys.exit(255)
         # No extra link dependencies: EGL/GLES come from the glad loader,
         # which dlopens libEGL.so.1 / libGLESv2.so.2 at runtime.
         env.Append(CPPDEFINES=["FBDEV_ENABLED"])

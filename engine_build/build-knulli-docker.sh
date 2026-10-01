@@ -20,6 +20,14 @@ echo "== Building builder image (cached after first run)"
 docker build --platform linux/arm64 -f engine_build/Dockerfile.knulli -t "$IMAGE" engine_build
 
 echo "== Running in-place build (log: $LOG)"
+set +e
 docker run --rm --platform linux/arm64 \
     -v "$PWD":/src \
-    "$IMAGE" 2>&1 | tee "$LOG"
+    "$IMAGE" >"$LOG" 2>&1
+rc=$?
+set -e
+cat "$LOG"
+if [ "$rc" -ne 0 ]; then
+    echo "error: in-container build failed (exit $rc); see $LOG" >&2
+    exit "$rc"
+fi

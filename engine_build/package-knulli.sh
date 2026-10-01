@@ -31,7 +31,7 @@ WANT_ID=$(build_id "$ENGINE")
 
 install_template() {
   local tpl_dir
-  tpl_dir=$(ls -1d "$HOME/Library/Application Support/Godot/export_templates/"*"/linux_release.arm64" 2>/dev/null | head -1 | xargs -I{} dirname {})
+  tpl_dir=$(ls -1d "$HOME/Library/Application Support/Godot/export_templates/"*"/linux_release.arm64" 2>/dev/null | head -1 | xargs -r -I{} dirname {})
   [ -n "$tpl_dir" ] || { echo "error: no Godot export template dir found (set TPL=/path/to/template/dir)" >&2; return 1; }
   cp "$ENGINE" "$tpl_dir/linux_release.arm64"
   echo "installed custom template: $tpl_dir/linux_release.arm64"

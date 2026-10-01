@@ -1,6 +1,6 @@
 #!/bin/sh
 # In-container build (repo root mounted at /src). Produces, in place:
-#   1. Godot 4.6 linux-arm64 RELEASE engine -> /src/bin/godot.linuxbsd.arm64
+#   1. Godot 4.6 linux-arm64 RELEASE engine -> /src/bin/godot.linuxbsd.template_release.arm64
 #   2. godot-libpd extension (linux arm64)   -> /src/extension/build/linux/libgodot_libpd.so
 #
 # The repo must be on the 4.6 line (branch gdext-libpd, based on the

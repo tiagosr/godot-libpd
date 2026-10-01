@@ -65,7 +65,10 @@
 namespace {
 
 // Debug aid: SIGUSR1 dumps the receiving thread's native backtrace to
-// /tmp/godot_bt.log (async-signal-safe path) and keeps running.
+// /tmp/godot_bt.log and keeps running. NOTE: backtrace()/
+// backtrace_symbols_fd() are NOT POSIX async-signal-safe (glibc may
+// allocate / call dlsym inside the handler); acceptable for a
+// deliberately-installed diagnostic aid, not for arbitrary signals.
 // Install with GODOT_FBDEV_BT=1.
 void fbdev_bt_handler(int) {
 	void *bt[128];
