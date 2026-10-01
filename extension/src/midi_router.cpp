@@ -27,22 +27,9 @@ constexpr const char *kVirtualOutName = "libpd test app out 0";
 #endif
 
 #ifdef PORTMIDI_ENABLED
-// Data bytes expected after a status byte in a raw [midiout] stream
-// (total message bytes - 1).
-int raw_data_need(uint8_t p_status) {
-	if (p_status >= 0xF8) {
-		return 0; // realtime: complete one-byte messages
-	}
-	const uint8_t type = p_status & 0xF0;
-	if (type == 0xC0 || type == 0xD0) {
-		return 1;
-	}
-	if (type == 0xF0) {
-		return p_status == 0xF2 ? 2 : 1;
-	}
-	return 2;
-}
-#endif // PORTMIDI_ENABLED
+// (raw_data_need moved to MidiReadStage in midi_router.h — pure and
+// unit-tested there; it must mirror the vendored pm_midi_length table.)
+#endif
 
 } // namespace
 
@@ -855,7 +842,7 @@ bool MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 		// new message; any incomplete previous message is dropped.
 		st.status = b;
 		st.have_status = true;
-		st.data_need = raw_data_need(b);
+		st.data_need = MidiReadStage::raw_data_need(b);
 		st.data_have = 0;
 		return true;
 	}

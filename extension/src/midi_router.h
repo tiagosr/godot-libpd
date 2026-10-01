@@ -152,6 +152,21 @@ struct MidiReadStage {
 		return 3; // 0x80..0xBF (channel), 0xE0 (pitch bend)
 	}
 
+	/**
+	 * Data bytes expected after a status byte in a raw [midiout] stream
+	 * (total message bytes - 1). Must EXACTLY mirror the vendored
+	 * pm_midi_length() table for round-trip consistency with PM's own
+	 * input parser — note upstream counts F1 as a 2-byte message and
+	 * F2 as 3 bytes (not the strict MIDI-spec counts). F0 never
+	 * reaches this: the caller enters the sysex drop path first.
+	 */
+	static int raw_data_need(uint8_t p_status) {
+		if (p_status < 0x80) {
+			return 0; // not a status byte
+		}
+		return pm_short_bytes(p_status) - 1;
+	}
+
 private:
 	// Sysex word (start or continuation): push stream bytes up to and
 	// including the F7. If the F7 lands at byte k < 3, bytes k+1..3 are

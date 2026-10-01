@@ -146,6 +146,24 @@ static void test_f4_f7_single_byte() {
 	CHECK(MidiReadStage::pm_short_bytes(0xF8) == 1);
 	CHECK(MidiReadStage::pm_short_bytes(0xF9) == 1);
 	CHECK(MidiReadStage::pm_short_bytes(0xFF) == 1);
+
+	// raw_data_need (output [midiout] path) must mirror pm_midi_length - 1
+	// EXACTLY (round-trip consistency with the vendored input parser —
+	// upstream counts F1 as 2 bytes and F2 as 3, not the spec values):
+	CHECK(MidiReadStage::raw_data_need(0x90) == 2);
+	CHECK(MidiReadStage::raw_data_need(0xB0) == 2);
+	CHECK(MidiReadStage::raw_data_need(0xC0) == 1);
+	CHECK(MidiReadStage::raw_data_need(0xD0) == 1);
+	CHECK(MidiReadStage::raw_data_need(0xE0) == 2);
+	CHECK(MidiReadStage::raw_data_need(0xF1) == 1);
+	CHECK(MidiReadStage::raw_data_need(0xF2) == 2);
+	CHECK(MidiReadStage::raw_data_need(0xF3) == 1);
+	CHECK(MidiReadStage::raw_data_need(0xF4) == 0);
+	CHECK(MidiReadStage::raw_data_need(0xF5) == 0);
+	CHECK(MidiReadStage::raw_data_need(0xF6) == 0);
+	CHECK(MidiReadStage::raw_data_need(0xF7) == 0);
+	CHECK(MidiReadStage::raw_data_need(0xF8) == 0);
+	CHECK(MidiReadStage::raw_data_need(0xFF) == 0);
 	CHECK(MidiReadStage::pm_short_bytes(0xC0) == 2);
 	CHECK(MidiReadStage::pm_short_bytes(0xD0) == 2);
 	CHECK(MidiReadStage::pm_short_bytes(0x90) == 3);
