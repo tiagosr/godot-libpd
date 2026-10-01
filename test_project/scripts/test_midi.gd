@@ -115,7 +115,7 @@ func _process(_delta: float) -> void:
 func _run_smoke() -> void:
 	print("MIDI_SMOKE | start instance_ready=%s" % str(_instance_ready))
 	if not _instance_ready:
-		_smoke_fail("instance not ready")
+		await _smoke_fail("instance not ready")
 		return
 	if not Libpd.server.midi_available():
 		print("MIDI_SMOKE_SKIP no IAC bus")
@@ -139,7 +139,7 @@ func _run_smoke() -> void:
 	_in_port = Libpd.server.midi_open_input(in_idx)
 	_out_port = Libpd.server.midi_open_output(out_idx)
 	if _in_port < 0 or _out_port < 0:
-		_smoke_fail("open failed (iac in_idx=%d out_idx=%d in_port=%d out_port=%d)" % [
+		await _smoke_fail("open failed (iac in_idx=%d out_idx=%d in_port=%d out_port=%d)" % [
 				in_idx, out_idx, _in_port, _out_port])
 		return
 	Libpd.server.midi_route_input(_in_port, _instance)
@@ -160,7 +160,7 @@ func _run_smoke() -> void:
 		print("MIDI_SMOKE_OK print=1 note=1 (iac in_idx=%d out_idx=%d)" % [in_idx, out_idx])
 		await _finish_smoke(0)
 		return
-	_smoke_fail("timeout print=%s note=%s (iac in_idx=%d out_idx=%d)" % [
+	await _smoke_fail("timeout print=%s note=%s (iac in_idx=%d out_idx=%d)" % [
 			str(_smoke_got_print), str(_smoke_got_note), in_idx, out_idx])
 
 
