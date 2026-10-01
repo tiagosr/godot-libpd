@@ -102,6 +102,8 @@ void LibpdServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("midi_list_outputs"), &LibpdServer::midi_list_outputs);
 	ClassDB::bind_method(D_METHOD("midi_open_input", "index"), &LibpdServer::midi_open_input);
 	ClassDB::bind_method(D_METHOD("midi_open_output", "index"), &LibpdServer::midi_open_output);
+	ClassDB::bind_method(D_METHOD("midi_open_virtual_input"), &LibpdServer::midi_open_virtual_input);
+	ClassDB::bind_method(D_METHOD("midi_open_virtual_output"), &LibpdServer::midi_open_virtual_output);
 	ClassDB::bind_method(D_METHOD("midi_close_input", "port_id"), &LibpdServer::midi_close_input);
 	ClassDB::bind_method(D_METHOD("midi_close_output", "port_id"), &LibpdServer::midi_close_output);
 	ClassDB::bind_method(D_METHOD("midi_route_input", "port_id", "instance", "add"), &LibpdServer::midi_route_input, DEFVAL(true));
@@ -201,6 +203,32 @@ int LibpdServer::midi_open_output(int p_pm_index) {
 	const int port = midi_router.open_output(p_pm_index);
 	if (port < 0) {
 		UtilityFunctions::push_error("Failed to open MIDI output port (see the midi_port_error signal)");
+	}
+	return port;
+}
+
+int LibpdServer::midi_open_virtual_input() {
+	if (!midi_available()) {
+		UtilityFunctions::push_error("MIDI not available on this platform");
+		return -1;
+	}
+	const int port = midi_router.open_virtual_input();
+	if (port < 0) {
+		UtilityFunctions::push_error(
+				"Failed to open virtual MIDI input port (see the midi_port_error signal)");
+	}
+	return port;
+}
+
+int LibpdServer::midi_open_virtual_output() {
+	if (!midi_available()) {
+		UtilityFunctions::push_error("MIDI not available on this platform");
+		return -1;
+	}
+	const int port = midi_router.open_virtual_output();
+	if (port < 0) {
+		UtilityFunctions::push_error(
+				"Failed to open virtual MIDI output port (see the midi_port_error signal)");
 	}
 	return port;
 }

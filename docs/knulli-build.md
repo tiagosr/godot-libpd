@@ -106,6 +106,70 @@ spec); on the Brick playback is verified through the 3.5 mm jack.
 Native ALSA/PipeWire backends are v2 (the `PdAudioSink` interface
 already isolates the swap).
 
+### MIDI I/O (PortMIDI — ALSA sequencer; verified on the A133)
+
+v2: MIDI I/O (PortMIDI, ALSA sequencer on A133 — `aconnect` loopback
+verified on-device 2026-10-01).
+
+The A133's ALSA sequencer exposes **no SUBS-capable ports**
+(`aconnect -l` shows nothing else, `Pm_CountDevices()` == 0 for the
+app), so the `test_midi` scene creates the app's own snd_seq virtual
+ports — `Libpd.server.midi_open_virtual_input()` /
+`midi_open_virtual_output()` (PM names them `"libpd test app in 0"` /
+`"libpd test app out 0"`) — and loopback is wired with `aconnect`
+between the app's own ports:
+
+1. Stage + launch `test_midi` (tmpfs staging per
+   `engine_build/README.md`; ES suspended). The Brick has no
+   touchscreen — drive the scene's buttons with the D-pad focus
+   (down/right + Enter) or the uinput key-injection helper (`uikeys`;
+   extended source kept on the device at `/tmp/uikeys.c`).
+2. In the app: **Open Virtual In**, then **Open Virtual Out**. Two seq
+   ports appear on the app's PM client; the ALSA port numbers are
+   assigned in creation order (first open = port 0), so read them from
+   `aconnect -l` (or `/proc/asound/seq/clients`).
+3. From a second adb shell, check and wire out → in:
+   ```sh
+   aconnect -l            # client + port names
+   aconnect 128:1 128:0   # out port 1 -> in port 0 (client number per boot)
+   ```
+4. In the app: **Route In → instance**, **Route instance → Out**, then
+   **Send test note** → the looped note appears in the event log and
+   on stdout: `[MIDI] note_on port=0 ch=0 pitch=60 vel=100`.
+5. Negative test: `aconnect -d 128:1 128:0`, send again → the note is
+   written to the output port but nothing is wired back, so **no new
+   `note_on`** appears.
+
+Caveats:
+
+- **The loopback patch must have `[noteout]`.** `smoke_patch.pd`
+  (notein → print + noteout) is loaded by both `test_midi` modes; the
+  audio demo `test_patch.pd` has no `[noteout]`, so with it the app
+  output is empty and nothing can loop (this was the first on-device
+  "loopback broken" repro — delivery was fine all along).
+- **Echo loopback is a feedback loop.** `smoke_patch.pd` wires
+  notein → noteout, so while `aconnect` is wired, every sent note
+  feeds back indefinitely (observed on-device: sustained note_on
+  re-emission, hundreds of thousands of events per minute). Unwire
+  (`aconnect -d`) as soon as verification is done.
+- **Timestamp-queue guard (vendored PortMIDI fix).** The ALSA backend
+  stamps each port with a shared seq queue that is lazy-allocated at
+  the first `Pm_Open`; ports created before that carry queue 0, which
+  on the A133 is owned by another client (PipeWire) and Stopped — the
+  kernel never delivers tick-timestamped events on a queue the port's
+  client does not own. All virtual ports are created at open time
+  (before the first open), so the vendored PM now keeps the kernel
+  default (real-time) timestamping unless the shared queue already
+  exists. `aconnect -l` / `/proc/asound/seq/queues` show the queue
+  ownership; `/proc/asound/seq/ports` does not exist on this kernel
+  (4.9), so per-port timestamp flags are not directly observable.
+- **Zero devices is normal here.** Opening a PM index while the
+  device list is empty fails cleanly (`pmInvalidDeviceId` +
+  `midi_port_error` signal, no freeze) — router-side index validation
+  plus the vendored `Pm_OpenInput` bounds check (the A133 freeze fix;
+  `Pm_CountDevices()` == 0 made index 0 an out-of-bounds descriptor
+  read on the I/O thread).
+
 ## v1 status (all verified on the Brick)
 
 - [x] Engine load + extension load (SMOKE_OK headless, 10/10)

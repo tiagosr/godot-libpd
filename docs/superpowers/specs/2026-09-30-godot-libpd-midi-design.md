@@ -1,6 +1,6 @@
 # godot-libpd v2 (M1): MIDI I/O via PortMIDI — Design
 
-Status: approved in conversation 2026-09-30
+Status: implemented (M1 delivered; A133 ALSA-sequencer loopback verified on-device 2026-10-01 — see `docs/knulli-build.md` "MIDI I/O")
 Supersedes nothing; extends `2026-09-27-godot-libpd-gdextension-design.md`
 (the v1 spec listed "MIDI I/O via PortMIDI" as the first v2 item).
 

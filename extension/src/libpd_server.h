@@ -67,7 +67,8 @@ public:
 	// -1/no-op; the signals stay declared but never fire.
 	// ------------------------------------------------------------------
 
-	/// True when PortMIDI is available and at least one device exists.
+	/// True when PortMIDI is initialized (the device list may be empty;
+	/// virtual ports can still be created — see midi_open_virtual_*).
 	bool midi_available();
 	/// PM device indices + names of devices with an input side.
 	Array midi_list_inputs();
@@ -79,6 +80,15 @@ public:
 	/// Open PM device p_pm_index as an output port.
 	/// Returns the new port id (>= 0) or -1 on failure.
 	int midi_open_output(int p_pm_index);
+	/// Create + open an app-owned virtual input port ("libpd test app
+	/// in 0"; on ALSA an snd_seq virtual port visible in aconnect -l).
+	/// Returns the new port id (>= 0) or -1 on failure. The virtual
+	/// device is removed when the port closes (or at server deinit).
+	int midi_open_virtual_input();
+	/// Create + open an app-owned virtual output port ("libpd test app
+	/// out 0"; on ALSA an snd_seq virtual port visible in aconnect -l).
+	/// Returns the new port id (>= 0) or -1 on failure.
+	int midi_open_virtual_output();
 	/// Close an open input port (errors surface via the midi_port_error signal).
 	void midi_close_input(int p_port_id);
 	/// Close an open output port.

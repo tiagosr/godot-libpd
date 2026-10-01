@@ -138,7 +138,13 @@ public:
 	MidiRouter(const MidiRouter &) = delete;
 	MidiRouter &operator=(const MidiRouter &) = delete;
 
-	/** True when PortMIDI initialized and at least one device exists. */
+	/**
+	 * True when PortMIDI initialized. The device list may legitimately
+	 * be empty (A133: the ALSA sequencer exists but exposes no
+	 * SUBS-capable ports) — open_virtual_input()/open_virtual_output()
+	 * still work, so "available" means "PM backend usable", not
+	 * "at least one device exists".
+	 */
 	bool available() const;
 
 	/**
@@ -160,6 +166,19 @@ public:
 	 */
 	int open_input(int p_pm_index);
 	int open_output(int p_pm_index);
+
+	/**
+	 * Create an app-owned PM virtual device (ALSA: an snd_seq virtual
+	 * port on the PM client, visible to aconnect; CoreMIDI: a virtual
+	 * endpoint) and open it as a router input (resp. output) port.
+	 * Returns the new router port id (>= 0) or -1 on failure (create
+	 * error, PM error, open timeout, PortMIDI unavailable). The virtual
+	 * device is removed (Pm_DeleteVirtualDevice) when the port closes
+	 * (close_port) or at shutdown. Same I/O-thread + 500 ms timeout
+	 * semantics as open_input/open_output.
+	 */
+	int open_virtual_input();
+	int open_virtual_output();
 
 	/**
 	 * Close router port p_port_id (runs on the I/O thread via the
@@ -250,6 +269,11 @@ private:
 	enum class ControlOpType {
 		OPEN_INPUT,
 		OPEN_OUTPUT,
+		// I/O thread creates the PM virtual device first, then opens the
+		// returned device id (the id is only known after creation, so
+		// these ops cannot reuse OPEN_*'s pm_index parameter).
+		OPEN_VIRTUAL_INPUT,
+		OPEN_VIRTUAL_OUTPUT,
 		CLOSE_INPUT,
 		CLOSE_OUTPUT,
 		SHUTDOWN,
@@ -353,6 +377,12 @@ private:
 		bool in_use = false;
 		bool is_input = false;
 		int pm_index = -1;
+		// This port created its PM virtual device (open_virtual_*): the
+		// device must be Pm_DeleteVirtualDevice'd after the stream
+		// closes (close_port / io_loop exit). Pm_Close alone does not
+		// remove it (ALSA keeps virtual ports open on purpose — the
+		// port IS the device).
+		bool pm_device_owned = false;
 #ifdef PORTMIDI_ENABLED
 		PortMidiStream *pm_stream = nullptr;
 #endif
@@ -441,6 +471,7 @@ private:
 	void io_loop();
 	bool process_control_ops(); // true -> exit the loop (shutdown handled)
 	int open_port(bool p_is_input, int p_pm_index); // I/O thread
+	int open_virtual_port(bool p_is_input); // I/O thread
 	void close_port(int p_port_id); // I/O thread
 	void handle_read_error(int p_port_id, int p_err); // I/O thread
 	void output_stage(); // I/O thread

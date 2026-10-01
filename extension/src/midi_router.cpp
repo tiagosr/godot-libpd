@@ -18,6 +18,13 @@ constexpr int32_t kPmBufferEvents = 256; // Pm_Open* bufferSize (brief: "queue, 
 constexpr int32_t kPmReadBatch = 32; // Pm_Read events per poll (~1 ms loop)
 constexpr int kSignalRingCap = 1024; // input signal ring cap (drop-oldest)
 constexpr int kControlTimeoutMs = 500; // open/close wait budget (spec §3/§7)
+#ifdef PORTMIDI_ENABLED
+// App-created virtual port names (Task 7 on-device recipe: the A133 ALSA
+// sequencer exposes no SUBS-capable ports, so the app must create its own;
+// aconnect -l shows exactly these names on the PM client).
+constexpr const char *kVirtualInName = "libpd test app in 0";
+constexpr const char *kVirtualOutName = "libpd test app out 0";
+#endif
 
 #ifdef PORTMIDI_ENABLED
 // PmEvent.message layout (portmidi.h / PmMakeEvent): 1-4 bytes of MIDI
@@ -95,7 +102,12 @@ MidiRouter::~MidiRouter() {
 
 bool MidiRouter::available() const {
 #ifdef PORTMIDI_ENABLED
-	return pm_initialized_ && with_pm_mutex([] { return Pm_CountDevices(); }) > 0;
+	// "Available" = PM backend initialized, NOT "at least one device":
+	// the A133 enumerates zero devices (its ALSA ports carry no
+	// SUBS_READ/SUBS_WRITE capability bits) yet open_virtual_*/
+	// Pm_CreateVirtual* still work there — the virtual ports are the
+	// point.
+	return pm_initialized_;
 #else
 	return false;
 #endif
@@ -182,6 +194,36 @@ int MidiRouter::open_input(int p_pm_index) {
 
 int MidiRouter::open_output(int p_pm_index) {
 	ControlHandle handle = enqueue_control(ControlOpType::OPEN_OUTPUT, p_pm_index, -1);
+	if (!handle.result.valid()) {
+		return -1;
+	}
+	if (handle.result.wait_for(std::chrono::milliseconds(kControlTimeoutMs)) !=
+			std::future_status::ready) {
+		*handle.abandoned = true; // a late success self-closes the port
+		notify_port_error(-1, "midi open timed out");
+		return -1;
+	}
+	return handle.result.get();
+}
+
+int MidiRouter::open_virtual_input() {
+	ControlHandle handle =
+			enqueue_control(ControlOpType::OPEN_VIRTUAL_INPUT, -1, -1);
+	if (!handle.result.valid()) {
+		return -1;
+	}
+	if (handle.result.wait_for(std::chrono::milliseconds(kControlTimeoutMs)) !=
+			std::future_status::ready) {
+		*handle.abandoned = true; // a late success self-closes the port
+		notify_port_error(-1, "midi open timed out");
+		return -1;
+	}
+	return handle.result.get();
+}
+
+int MidiRouter::open_virtual_output() {
+	ControlHandle handle =
+			enqueue_control(ControlOpType::OPEN_VIRTUAL_OUTPUT, -1, -1);
 	if (!handle.result.valid()) {
 		return -1;
 	}
@@ -336,12 +378,16 @@ void MidiRouter::io_loop() {
 	}
 	// Exit: close every remaining stream on this thread, then release PM.
 	std::vector<PortMidiStream *> streams;
+	std::vector<int> owned_devices;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto &kv : ports_) {
 			Port &p = *kv.second;
 			if (p.in_use && p.pm_stream != nullptr) {
 				streams.push_back(p.pm_stream);
+				if (p.pm_device_owned) {
+					owned_devices.push_back(p.pm_index);
+				}
 				p.in_use = false;
 				p.pm_stream = nullptr;
 			}
@@ -350,6 +396,11 @@ void MidiRouter::io_loop() {
 	with_pm_mutex([&] {
 		for (PortMidiStream *s : streams) {
 			Pm_Close(s); // best effort
+		}
+		// Virtual devices the app created: delete after their streams are
+		// closed (Pm_DeleteVirtualDevice refuses an open device).
+		for (int d : owned_devices) {
+			Pm_DeleteVirtualDevice(d); // best effort
 		}
 	});
 	{
@@ -402,6 +453,16 @@ bool MidiRouter::process_control_ops() {
 					// The API side's 500 ms wait expired before this op
 					// finished: close the port we just opened so no
 					// orphaned stream leaks.
+					close_port(result);
+					result = -1;
+				}
+				break;
+			case ControlOpType::OPEN_VIRTUAL_INPUT:
+			case ControlOpType::OPEN_VIRTUAL_OUTPUT:
+				result = open_virtual_port(op.op == ControlOpType::OPEN_VIRTUAL_INPUT);
+				if (result >= 0 && op.abandoned != nullptr && op.abandoned->load()) {
+					// Same late-success cleanup as OPEN_*; close_port also
+					// deletes the owned virtual device.
 					close_port(result);
 					result = -1;
 				}
@@ -481,10 +542,78 @@ int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
 #endif
 }
 
+int MidiRouter::open_virtual_port(bool p_is_input) {
+#ifdef PORTMIDI_ENABLED
+	// Create the virtual device first, then open the returned device id
+	// through the same open path as index-based opens (sysDepInfo null,
+	// latency 0, same kPmBufferEvents). The device id is only known
+	// after creation, which is why this runs on the I/O thread as its
+	// own control op. On success the port owns the device: close_port /
+	// the io_loop exit delete it after the stream closes.
+	const int device_id = with_pm_mutex([&] {
+		return p_is_input
+				? Pm_CreateVirtualInput(kVirtualInName, nullptr, nullptr)
+				: Pm_CreateVirtualOutput(kVirtualOutName, nullptr, nullptr);
+	});
+	if (device_id < 0) {
+		// Error text gathered under the PM lock; the user callback fires
+		// after it is released.
+		const std::string text = with_pm_mutex(
+				[&] { return std::string(Pm_GetErrorText(static_cast<PmError>(
+							device_id))); });
+		notify_port_error(-1, text.c_str());
+		return -1;
+	}
+	PortMidiStream *stream = nullptr;
+	PmError err;
+	if (p_is_input) {
+		err = with_pm_mutex([&] {
+			return Pm_OpenInput(&stream, device_id, nullptr, kPmBufferEvents,
+					nullptr, nullptr);
+		});
+	} else {
+		err = with_pm_mutex([&] {
+			return Pm_OpenOutput(&stream, device_id, nullptr, kPmBufferEvents,
+					nullptr, nullptr, 0);
+		});
+	}
+	if (err != pmNoError) {
+		// Do not leak the just-created device.
+		with_pm_mutex([&] {
+			Pm_DeleteVirtualDevice(device_id);
+		});
+		const std::string text = with_pm_mutex(
+				[&] { return std::string(Pm_GetErrorText(err)); }) +
+				" (pm device " + std::to_string(device_id) + ")";
+		notify_port_error(-1, text.c_str());
+		return -1;
+	}
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		int port_id = next_port_id_++;
+		auto port = std::make_unique<Port>();
+		port->in_use = true;
+		port->is_input = p_is_input;
+		port->pm_index = device_id;
+		port->pm_stream = stream;
+		port->pm_device_owned = true;
+		if (p_is_input) {
+			port->input = new PortInput(this, port_id);
+		}
+		ports_[port_id] = std::move(port);
+		return port_id;
+	}
+#else
+	(void)p_is_input;
+	return -1;
+#endif
+}
+
 void MidiRouter::close_port(int p_port_id) {
 #ifdef PORTMIDI_ENABLED
 	PortMidiStream *stream = nullptr;
 	bool is_input = false;
+	int owned_device = -1;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto it = ports_.find(p_port_id);
@@ -493,11 +622,21 @@ void MidiRouter::close_port(int p_port_id) {
 		}
 		stream = it->second->pm_stream;
 		is_input = it->second->is_input;
+		owned_device = it->second->pm_device_owned ? it->second->pm_index : -1;
 	}
 	if (stream != nullptr) {
 		// Best effort; the stream is ours (I/O thread).
 		with_pm_mutex([&] {
 			Pm_Close(stream);
+		});
+	}
+	// App-created virtual device: delete it now that the stream is
+	// closed. Pm_Close alone does not remove it (ALSA's alsa_in_close
+	// keeps virtual ports open on purpose — the port IS the device),
+	// and Pm_DeleteVirtualDevice refuses an open device.
+	if (owned_device >= 0) {
+		with_pm_mutex([&] {
+			Pm_DeleteVirtualDevice(owned_device);
 		});
 	}
 	// Auto-unroute the port (spec §7: close stops the port, unroutes it).

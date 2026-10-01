@@ -129,6 +129,16 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     add_test(NAME midi_writer_tests COMMAND $<TARGET_FILE:midi_writer_tests>)
 
     if(BUILD_PORTMIDI)
+        # Task 7: PortMIDI virtual device lifecycle (create -> open ->
+        # write -> close -> delete). Host API only; delivery is proven
+        # on-device (A133 aconnect loopback, docs/knulli-build.md).
+        add_executable(midi_virtual_port_tests
+            tests/midi_virtual_port_tests.cpp
+        )
+        target_include_directories(midi_virtual_port_tests PRIVATE src)
+        target_link_libraries(midi_virtual_port_tests PRIVATE portmidi)
+        add_test(NAME midi_virtual_port_tests COMMAND $<TARGET_FILE:midi_virtual_port_tests>)
+
         # A133 freeze regression (out-of-range PM index on open):
         # fails fast with the port_error signal; the in-test watchdog
         # turns a hang regression into a ctest failure instead of

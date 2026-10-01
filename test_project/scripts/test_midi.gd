@@ -3,8 +3,11 @@ extends Control
 ##
 ## GUI mode (default; also the on-device UI for Task 7): port-list Labels
 ## (inputs/outputs — plain Text Labels, NOT RichTextLabel), Open In /
-## Open Out (PM device index from the SpinBox), Route In -> instance /
-## Route Out <- instance buttons, "Send test note"
+## Open Out (PM device index from the SpinBox), Open Virtual In / Open
+## Virtual Out (app-created PortMIDI virtual ports — the A133 ALSA
+## sequencer exposes no SUBS-capable ports, so the app must create its
+## own; aconnect loopback recipe in docs/knulli-build.md), Route In ->
+## instance / Route Out <- instance buttons, "Send test note"
 ## (instance.send_midi(0, 60, 100)), a live event Label fed by all 8
 ## midi_* signals (20-line ring buffer, one label.text rewrite per event
 ## — the test_main.gd pattern; the A133 RichTextLabel lesson applies),
@@ -19,9 +22,11 @@ extends Control
 ## midi_note_on for pitch 60 (IAC loopback: our output -> IAC bus -> our
 ## input). Both: MIDI_SMOKE_OK, quit(0). Timeout: dump state, quit(1).
 
-const PATCH := "res://data/test_patch.pd"
-# Smoke mode needs a patch that echoes [notein] back out via [noteout] so the
-# IAC loopback is observable; test_patch.pd only prints (audio demo patch).
+# Both modes load the echo patch (notein -> print test_patch + noteout):
+# smoke mode needs [noteout] for the IAC loopback, GUI mode needs it for
+# the A133 aconnect loopback — the audio demo test_patch.pd has no
+# [noteout], so in GUI mode nothing ever left the app and the on-device
+# loopback was impossible (root cause, verified on-device 2026-10-01).
 const SMOKE_PATCH := "res://data/smoke_patch.pd"
 const MAX_LOG_LINES := 20
 const SMOKE_TIMEOUT_MS := 5000
@@ -33,6 +38,8 @@ const SMOKE_TEARDOWN_GRACE_S := 0.1
 @onready var in_index_spin: SpinBox = $VBox/OpenRow/InIndexSpin
 @onready var open_in_btn: Button = $VBox/OpenRow/OpenInBtn
 @onready var open_out_btn: Button = $VBox/OpenRow/OpenOutBtn
+@onready var open_vin_btn: Button = $VBox/VirtualRow/OpenVinBtn
+@onready var open_vout_btn: Button = $VBox/VirtualRow/OpenVoutBtn
 @onready var route_in_btn: Button = $VBox/RouteRow/RouteInBtn
 @onready var route_out_btn: Button = $VBox/RouteRow/RouteOutBtn
 @onready var note_btn: Button = $VBox/SendNoteBtn
@@ -47,6 +54,10 @@ var _in_port := -1
 var _out_port := -1
 var _log_lines: Array = []
 var _learn_armed := false
+# On-device focus observability (A133 has no touch device — the UI is
+# driven with Tab/Enter key events, so the focus target is what an Enter
+# press activates; every focus change is mirrored to stdout).
+var _last_focus := ""
 
 # --midi-smoke state.
 var _smoke_active := false
@@ -71,7 +82,7 @@ func _ready() -> void:
 	var mix_rate := int(AudioServer.get_mix_rate())
 	var ok := _instance.init(mix_rate)
 	if ok:
-		ok = _instance.load_patch(SMOKE_PATCH if smoke else PATCH) == Error.OK
+		ok = _instance.load_patch(SMOKE_PATCH) == Error.OK
 	if ok:
 		ok = _instance.start_dsp() == Error.OK
 	_instance_ready = ok
@@ -84,6 +95,8 @@ func _ready() -> void:
 		return
 	open_in_btn.pressed.connect(_on_open_in_pressed)
 	open_out_btn.pressed.connect(_on_open_out_pressed)
+	open_vin_btn.pressed.connect(_on_open_vin_pressed)
+	open_vout_btn.pressed.connect(_on_open_vout_pressed)
 	route_in_btn.pressed.connect(_on_route_in_pressed)
 	route_out_btn.pressed.connect(_on_route_out_pressed)
 	note_btn.pressed.connect(_on_note_pressed)
@@ -100,6 +113,8 @@ func _ready() -> void:
 	_refresh_port_lists()
 	_event("test_midi ready (instance %s)" % ("ok" if _instance_ready else "FAILED"))
 	_event("IAC demo: Open In + Open Out at the same bus index, Route both, Send test note")
+	# Initial GUI focus so D-pad navigation has a starting point.
+	open_in_btn.grab_focus()
 
 
 func _process(_delta: float) -> void:
@@ -111,6 +126,13 @@ func _process(_delta: float) -> void:
 			_dump_smoke_state()
 			_smoke_done = true
 			get_tree().quit(2)
+	# Focus observability (GUI mode only; see _last_focus comment).
+	if not _smoke_active:
+		var fc = get_tree().root.gui_get_focus_owner()
+		var fn = fc.name if fc != null else "(none)"
+		if fn != _last_focus:
+			_last_focus = fn
+			print("[UI] focus: " + fn)
 
 
 # --------------------------------------------------------------------------
@@ -250,6 +272,34 @@ func _on_open_out_pressed() -> void:
 		_event("failed to open output (pm index %d)" % idx)
 	else:
 		_event("opened output port=%d (pm index %d)" % [_out_port, idx])
+
+
+func _on_open_vin_pressed() -> void:
+	# Re-opening closes the previous port first (port ids are never
+	# reused; a second open would leak the first one).
+	if _in_port >= 0:
+		Libpd.server.midi_close_input(_in_port)
+		_in_port = -1
+	_in_port = Libpd.server.midi_open_virtual_input()
+	if _in_port < 0:
+		_event("failed to open virtual input")
+	else:
+		# On the A133 this is the snd_seq port 'libpd test app in 0' on
+		# the PM client (aconnect -l) — the aconnect loopback target.
+		_event("opened virtual input port=%d" % _in_port)
+
+
+func _on_open_vout_pressed() -> void:
+	if _out_port >= 0:
+		Libpd.server.midi_close_output(_out_port)
+		_out_port = -1
+	_out_port = Libpd.server.midi_open_virtual_output()
+	if _out_port < 0:
+		_event("failed to open virtual output")
+	else:
+		# On the aconnect loopback this is the sender side (the
+		# 'libpd test app out 0' port is connected into the input).
+		_event("opened virtual output port=%d" % _out_port)
 
 
 func _on_route_in_pressed() -> void:
