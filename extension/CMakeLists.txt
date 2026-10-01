@@ -107,6 +107,13 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_include_directories(midi_framer_tests PRIVATE src)
     add_test(NAME midi_framer_tests COMMAND $<TARGET_FILE:midi_framer_tests>)
 
+    add_executable(midi_routing_tests
+        tests/midi_routing_tests.cpp
+    )
+    target_include_directories(midi_routing_tests PRIVATE src)
+    target_link_libraries(midi_routing_tests PRIVATE pthread)
+    add_test(NAME midi_routing_tests COMMAND $<TARGET_FILE:midi_routing_tests>)
+
     add_executable(libpd_worker_midi_tests
         tests/worker_midi_tests.cpp
         src/libpd_worker.cpp
