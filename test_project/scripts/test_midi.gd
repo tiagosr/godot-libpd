@@ -355,6 +355,10 @@ func _format_ports(ports: Array) -> String:
 
 
 func _event(text: String) -> void:
+	# Mirror every event to stdout with the [MIDI] prefix: on the A133 the
+	# on-screen Label is the only visible log, but adb-captured stdout is
+	# the debugging channel (Task 7 on-device loopback verification).
+	print("[MIDI] " + text)
 	# Plain Label log: keep a GDScript-side ring buffer and rewrite the whole
 	# label per event (test_main.gd pattern; RichTextLabel is banned on the
 	# A133 build).
