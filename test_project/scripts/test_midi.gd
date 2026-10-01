@@ -20,6 +20,9 @@ extends Control
 ## input). Both: MIDI_SMOKE_OK, quit(0). Timeout: dump state, quit(1).
 
 const PATCH := "res://data/test_patch.pd"
+# Smoke mode needs a patch that echoes [notein] back out via [noteout] so the
+# IAC loopback is observable; test_patch.pd only prints (audio demo patch).
+const SMOKE_PATCH := "res://data/smoke_patch.pd"
 const MAX_LOG_LINES := 20
 const SMOKE_TIMEOUT_MS := 5000
 const SMOKE_WATCHDOG_MS := 15000
@@ -54,26 +57,27 @@ var _smoke_done := false
 
 
 func _ready() -> void:
-	# The scene-owned instance (child node): init + load the existing
-	# [notein 0 60] -> print patch + start_dsp. Created at runtime (not as
-	# a .tscn node) to match the test_main.gd / test_instance.gd
-	# convention.
+	# The scene-owned instance (child node): init + load the patch +
+	# start_dsp. Created at runtime (not as a .tscn node) to match the
+	# test_main.gd / test_instance.gd convention. Smoke mode loads the
+	# echo patch (noteout); GUI mode keeps the audio demo patch.
+	# Arguments after the "--" separator land in get_cmdline_user_args()
+	# (Godot 4.6.2); the brief's documented command uses "--", so both
+	# sources are checked (the no-separator form is covered too).
+	var cmdline := OS.get_cmdline_args() + OS.get_cmdline_user_args()
+	var smoke := "--midi-smoke" in cmdline
 	_instance = LibpdInstance.new()
 	add_child(_instance)
 	var mix_rate := int(AudioServer.get_mix_rate())
 	var ok := _instance.init(mix_rate)
 	if ok:
-		ok = _instance.load_patch(PATCH) == Error.OK
+		ok = _instance.load_patch(SMOKE_PATCH if smoke else PATCH) == Error.OK
 	if ok:
 		ok = _instance.start_dsp() == Error.OK
 	_instance_ready = ok
 	if not _instance_ready:
 		push_warning("test_midi: instance init/load/start failed")
-	# Arguments after the "--" separator land in get_cmdline_user_args()
-	# (Godot 4.6.2); the brief's documented command uses "--", so both
-	# sources are checked (the no-separator form is covered too).
-	var cmdline := OS.get_cmdline_args() + OS.get_cmdline_user_args()
-	if "--midi-smoke" in cmdline:
+	if smoke:
 		_smoke_active = true
 		_smoke_start = Time.get_ticks_msec()
 		_run_smoke()

@@ -1,0 +1,7 @@
+#N canvas 100 100 450 300 12;
+#X obj 40 40 notein 0 60;
+#X obj 40 140 print test_patch;
+#X obj 160 40 noteout 0;
+#X connect 0 0 1 0;
+#X connect 0 0 2 0;
+#X connect 0 1 2 1;
