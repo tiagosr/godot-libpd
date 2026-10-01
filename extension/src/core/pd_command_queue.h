@@ -26,7 +26,7 @@ struct PdCommand {
 		MIDI_CC = 7,              // i32 = channel, i64 = controller*256+value
 		MIDI_PROGRAM_CHANGE = 8,  // i32 = channel, i64 = program
 		MIDI_PITCH_BEND = 9,      // i32 = channel, i64 = low*256+high (value = low+high*128)
-		MIDI_AFTERTOUCH = 10,     // i32 = channel, i64 = pressure
+		MIDI_AFTERTOUCH = 10,     // i32 = channel, i64 = pressure*256 (pressure = d1)
 		MIDI_POLY_AFTERTOUCH = 11, // i32 = channel, i64 = pitch*256+pressure
 		MIDI_BYTE = 12,           // i64 = byte (0-255)
 		MIDI_SYSEX = 13,          // midi_len bytes in midi[0..midi_len-1], F0..F7 inclusive

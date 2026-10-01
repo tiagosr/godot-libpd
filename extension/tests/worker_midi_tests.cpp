@@ -7,10 +7,12 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -33,21 +35,36 @@ static int failures = 0;
 	} while (0)
 
 // Test patch: [notein 1] -> [noteout 1] (pitch + velocity wired),
-// [ctlin 7 4] -> [ctlout 7 4] (1-based channel 4 = 0-based ch 3), and
-// [midiin] -> [print] to prove raw bytes reach pd. Raw bytes do NOT
+// [ctlin 7 4] -> [ctlout 7 4] (1-based channel 4 = 0-based ch 3),
+// [midiin] -> [print] to prove raw bytes reach pd, and
+// [bendin] -> [+ -8192] -> [bendout 1] for the pitch-bend
+// contract test. The bend path has mixed scales: the [bendin] OUTLET
+// is raw 0..16383 (libpd_pitchbend re-raws centered input before
+// pd_list: z_libpd.c inmidi_pitchbend(PORT, CHANNEL, value + 8192)),
+// while the [bendout] INLET is centered -8192..8191 (bendout_float
+// adds 8192 before outmidi_pitchbend); [+ -8192] bridges them
+// ([offset] is not available in this stripped pd build).
+// The pitchbend hook receives centered again (s_libpdmidi.c
+// outmidi_pitchbend does CLAMP14BIT(value) - 8192), so the worker
+// must store raw = hook_value + 8192 in midi_out. Raw bytes do NOT
 // cross-feed [notein] (plan Global Constraints: separate input paths).
 static const char *k_test_patch =
-		"#N canvas 0 0 300 200 12;\n"
+		"#N canvas 0 0 400 200 12;\n"
 		"#X obj 10 10 notein 1;\n"
 		"#X obj 10 50 noteout 1;\n"
 		"#X obj 100 10 ctlin 7 4;\n"
 		"#X obj 100 50 ctlout 7 4;\n"
 		"#X obj 200 10 midiin;\n"
 		"#X obj 200 50 print midiin_chk;\n"
+		"#X obj 300 10 bendin;\n"
+		"#X obj 300 50 + -8192;\n"
+		"#X obj 300 90 bendout 1;\n"
 		"#X connect 0 0 1 0;\n"
 		"#X connect 0 1 1 1;\n"
 		"#X connect 2 0 3 0;\n"
-		"#X connect 4 0 5 0;\n";
+		"#X connect 4 0 5 0;\n"
+		"#X connect 6 0 7 0;\n"
+		"#X connect 7 0 8 0;\n";
 
 struct PatchFile {
 	std::string path;
@@ -69,7 +86,13 @@ static PatchFile write_temp_patch() {
 	return p;
 }
 
-/** Push a command that reports its result via promise; return the code. */
+// Sentinel distinct from any genuine result code: push_and_wait timed
+// out waiting for the worker (hung worker). Callers must not treat a
+// timeout as a genuine nonzero result (post-review M-1).
+static const int k_command_timeout = std::numeric_limits<int>::min();
+
+/** Push a command that reports its result via promise; return the code
+ *  (k_command_timeout if the worker never fulfils it within p_timeout_ms). */
 static int push_and_wait(LibpdWorker &p_worker, const PdCommand &p_command, int p_timeout_ms = 5000) {
 	auto promise = std::make_shared<std::promise<int>>();
 	auto future = promise->get_future();
@@ -80,7 +103,7 @@ static int push_and_wait(LibpdWorker &p_worker, const PdCommand &p_command, int 
 	p_worker.push_command(command);
 	if (future.wait_for(std::chrono::milliseconds(p_timeout_ms)) != std::future_status::ready) {
 		CHECK(false && "command never fulfilled");
-		return -1;
+		return k_command_timeout;
 	}
 	return future.get();
 }
@@ -157,8 +180,16 @@ int main() {
 	init.opcode = PdCommand::INIT;
 	init.i32 = 44100;
 	init.i64 = 0; // n_ins * 1000 + n_out
-	if (push_and_wait(worker, init) != 0) {
-		std::printf("SKIP: no audio for worker midi test\n");
+	const int init_result = push_and_wait(worker, init);
+	if (init_result == k_command_timeout) {
+		// A hung worker must not be masked as SKIP (post-review M-1).
+		// join() would block forever on a dead worker thread, so report
+		// the failure and abort (failures >= 1 from the timeout CHECK).
+		std::printf("FAIL: INIT timed out (worker hung)\n%d FAILURES\n", failures);
+		std::exit(1);
+	}
+	if (init_result != 0) {
+		std::printf("SKIP: no audio for worker midi test (init result %d)\n", init_result);
 		worker.request_stop();
 		worker.join();
 		return 0;
@@ -168,7 +199,12 @@ int main() {
 	PdCommand load;
 	load.opcode = PdCommand::LOAD;
 	load.path = patch.path;
-	if (push_and_wait(worker, load) != 0) {
+	const int load_result = push_and_wait(worker, load);
+	if (load_result == k_command_timeout) {
+		std::printf("FAIL: LOAD timed out (worker hung)\n%d FAILURES\n", failures);
+		std::exit(1);
+	}
+	if (load_result != 0) {
 		std::printf("FAIL: patch load failed (%s)\n", patch.path.c_str());
 		failures++;
 		worker.request_stop();
@@ -216,7 +252,49 @@ int main() {
 		std::printf("case midi_cc done\n");
 	}
 
-	// Case 3: MIDI_BYTE 0x90 / 0x3C / 0x64. Raw bytes reach pd's [midiin]
+	// Case 3: MIDI_PITCH_BEND queue-contract identity, end-to-end through
+	// real [bendin] -> [+ -8192] -> [bendout] (see patch comment for
+	// the discovered scales). Contract: i64 = d1*256+d2 with d1 = low 7
+	// bits, d2 = high 7 bits of the raw 0..16383 value. The test asserts
+	// CONTRACT identity at the hook (raw in -> same raw out), not pd's
+	// internal centered representation.
+	{
+		// Center: d1 = 0, d2 = 64 -> raw 8192.
+		PdCommand bend_center;
+		bend_center.opcode = PdCommand::MIDI_PITCH_BEND;
+		bend_center.i32 = 0;
+		bend_center.i64 = 0 * 256 + 64;
+		worker.push_command(bend_center);
+		std::vector<MidiOutMsg> msgs;
+		CHECK(wait_for_msgs(worker, 1, 5000, msgs));
+		CHECK((int)msgs.size() == 1);
+		if (msgs.size() == 1) {
+			CHECK(msgs[0].kind == MidiOutMsg::PITCH_BEND);
+			CHECK(msgs[0].channel == 0);
+			CHECK(msgs[0].d1 == 0);
+			CHECK(msgs[0].d2 == 64); // raw 8192 = 0 + 64*128
+		}
+		std::printf("case midi_pitch_bend center done\n");
+
+		// Max: d1 = 127, d2 = 127 -> raw 16383.
+		PdCommand bend_max;
+		bend_max.opcode = PdCommand::MIDI_PITCH_BEND;
+		bend_max.i32 = 0;
+		bend_max.i64 = 127 * 256 + 127;
+		worker.push_command(bend_max);
+		std::vector<MidiOutMsg> msgs2;
+		CHECK(wait_for_msgs(worker, 1, 5000, msgs2));
+		CHECK((int)msgs2.size() == 1);
+		if (msgs2.size() == 1) {
+			CHECK(msgs2[0].kind == MidiOutMsg::PITCH_BEND);
+			CHECK(msgs2[0].channel == 0);
+			CHECK(msgs2[0].d1 == 127);
+			CHECK(msgs2[0].d2 == 127); // raw 16383 = 127 + 127*128
+		}
+		std::printf("case midi_pitch_bend max done\n");
+	}
+
+	// Case 4: MIDI_BYTE 0x90 / 0x3C / 0x64. Raw bytes reach pd's [midiin]
 	// only (no cross-feed to [notein] in this build) -> midi_out must stay
 	// unchanged; [print midiin_chk] proves the bytes actually arrived.
 	{
@@ -260,7 +338,7 @@ int main() {
 		std::printf("case midi_byte done\n");
 	}
 
-	// Case 4: MIDI_SYSEX (F0 7E 7F 09 F7) -> no crash, queue unchanged
+	// Case 5: MIDI_SYSEX (F0 7E 7F 09 F7) -> no crash, queue unchanged
 	// (the patch has no [sysexin]; libpd has no sysex output hook either).
 	{
 		PdCommand sysex;
@@ -276,10 +354,17 @@ int main() {
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		std::vector<MidiOutMsg> msgs;
 		CHECK(drain(worker, msgs) == 0);
+		// Liveness proof (post-review M-2): a promise-backed UNLOAD must be
+		// fulfilled before join() — a worker that crashed or hung inside the
+		// SYSEX handler would never fulfil it (and join() would hang). UNLOAD
+		// closes the patch, which no later case needs.
+		PdCommand unload;
+		unload.opcode = PdCommand::UNLOAD;
+		CHECK(push_and_wait(worker, unload, 2000) == 0);
 		std::printf("case midi_sysex done\n");
 	}
 
-	// Case 5: bounded queue overflow (drop-oldest, newest last).
+	// Case 6: bounded queue overflow (drop-oldest, newest last).
 	test_midi_output_queue_overflow();
 
 	// Teardown on the worker thread (spec §5).

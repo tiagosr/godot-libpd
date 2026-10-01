@@ -76,9 +76,13 @@ void c_pitchbendhook(int p_channel, int p_value) {
 		MidiOutMsg msg;
 		msg.kind = MidiOutMsg::PITCH_BEND;
 		msg.channel = (uint8_t)(p_channel & 15);
-		// p_value: 0-16383 (14-bit); d1 = low 7 bits, d2 = high 7 bits.
-		msg.d1 = (uint8_t)(p_value & 0x7F);
-		msg.d2 = (uint8_t)((p_value >> 7) & 0x7F);
+		// p_value is CENTERED -8192..8191: s_libpdmidi.c outmidi_pitchbend()
+		// re-centers pd's raw value for the hook (CLAMP14BIT(value) - 8192).
+		// The queue contract is raw 0..16383 (d1 = low 7 bits, d2 = high 7
+		// bits), so normalize back to raw before splitting.
+		const int raw = p_value + 8192;
+		msg.d1 = (uint8_t)(raw & 0x7F);
+		msg.d2 = (uint8_t)((raw >> 7) & 0x7F);
 		ctx->midi_out.push(msg);
 	}
 }
@@ -430,12 +434,16 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			const int channel = p_command.i32 & 0x0F;
 			const int d1 = (int)((p_command.i64 >> 8) & 0xFF);
 			const int d2 = (int)(p_command.i64 & 0xFF);
-			// d1 = low 7 bits, d2 = high 7 bits -> 14-bit value.
-			libpd_pitchbend(channel, d1 + d2 * 128);
+			// Queue contract is raw 0..16383 (value = d1 + d2*128); the libpd
+			// API takes centered -8192..8191 (z_libpd.c libpd_pitchbend rejects
+			// out-of-range values and re-raws them for pd via inmidi_pitchbend).
+			libpd_pitchbend(channel, (d1 + d2 * 128) - 8192);
 			return;
 		}
 		case PdCommand::MIDI_AFTERTOUCH: {
-			libpd_aftertouch(p_command.i32 & 0x0F, (int)(p_command.i64 & 0xFF));
+			// i64 = pressure*256 (pressure in d1, matching MidiShortMsg and the
+			// POLY_AFTERTOUCH first-data-byte convention).
+			libpd_aftertouch(p_command.i32 & 0x0F, (int)((p_command.i64 >> 8) & 0xFF));
 			return;
 		}
 		case PdCommand::MIDI_POLY_AFTERTOUCH: {
