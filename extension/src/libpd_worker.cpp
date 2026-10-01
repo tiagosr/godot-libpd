@@ -37,6 +37,83 @@ void c_noteonhook(int p_channel, int p_pitch, int p_velocity) {
 	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
 	if (ctx != nullptr) {
 		ctx->emit_note_on(p_channel, p_pitch, p_velocity);
+		// Task 2: also feed the bounded MIDI output queue (spec §4).
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::NOTE;
+		msg.channel = (uint8_t)(p_channel & 15);
+		msg.d1 = (uint8_t)(p_pitch & 0x7F);
+		msg.d2 = (uint8_t)(p_velocity & 0x7F);
+		ctx->midi_out.push(msg);
+	}
+}
+
+void c_controlchangehook(int p_channel, int p_control, int p_value) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::CC;
+		msg.channel = (uint8_t)(p_channel & 15);
+		msg.d1 = (uint8_t)(p_control & 0x7F);
+		msg.d2 = (uint8_t)(p_value & 0x7F);
+		ctx->midi_out.push(msg);
+	}
+}
+
+void c_programchangehook(int p_channel, int p_program) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::PROGRAM_CHANGE;
+		msg.channel = (uint8_t)(p_channel & 15);
+		msg.d1 = (uint8_t)(p_program & 0x7F);
+		ctx->midi_out.push(msg);
+	}
+}
+
+void c_pitchbendhook(int p_channel, int p_value) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::PITCH_BEND;
+		msg.channel = (uint8_t)(p_channel & 15);
+		// p_value: 0-16383 (14-bit); d1 = low 7 bits, d2 = high 7 bits.
+		msg.d1 = (uint8_t)(p_value & 0x7F);
+		msg.d2 = (uint8_t)((p_value >> 7) & 0x7F);
+		ctx->midi_out.push(msg);
+	}
+}
+
+void c_aftertouchhook(int p_channel, int p_pressure) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::AFTERTOUCH;
+		msg.channel = (uint8_t)(p_channel & 15);
+		msg.d1 = (uint8_t)(p_pressure & 0x7F);
+		ctx->midi_out.push(msg);
+	}
+}
+
+void c_polyaftertouchhook(int p_channel, int p_pitch, int p_pressure) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::POLY_AFTERTOUCH;
+		msg.channel = (uint8_t)(p_channel & 15);
+		msg.d1 = (uint8_t)(p_pitch & 0x7F);
+		msg.d2 = (uint8_t)(p_pressure & 0x7F);
+		ctx->midi_out.push(msg);
+	}
+}
+
+void c_midibytehook(int p_port, int p_byte) {
+	(void)p_port;
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr) {
+		MidiOutMsg msg;
+		msg.kind = MidiOutMsg::RAW_BYTE;
+		msg.byte = (uint8_t)(p_byte & 0xFF);
+		ctx->midi_out.push(msg);
 	}
 }
 
@@ -114,6 +191,17 @@ void LibpdWorker::emit_note_on(int p_channel, int p_pitch, int p_velocity) {
 	e.data[1] = static_cast<char>(p_pitch & 0x7F);
 	e.data[2] = static_cast<char>(p_velocity & 0x7F);
 	config.on_event(e);
+}
+
+void LibpdWorker::install_midi_output_hooks(void *p_worker_ptr) {
+	libpd_set_noteonhook(c_noteonhook);
+	libpd_set_controlchangehook(c_controlchangehook);
+	libpd_set_programchangehook(c_programchangehook);
+	libpd_set_pitchbendhook(c_pitchbendhook);
+	libpd_set_aftertouchhook(c_aftertouchhook);
+	libpd_set_polyaftertouchhook(c_polyaftertouchhook);
+	libpd_set_midibytehook(c_midibytehook);
+	libpd_set_instancedata(p_worker_ptr, nullptr);
 }
 
 void LibpdWorker::run() {
@@ -249,8 +337,7 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			blocksize = libpd_blocksize();
 			out_buffer.resize((size_t)blocksize * n_out);
 			libpd_set_printhook(c_printhook);
-			libpd_set_noteonhook(c_noteonhook);
-			libpd_set_instancedata(this, nullptr);
+			install_midi_output_hooks(this);
 			wlog(config.instance_id, "INIT: done (blocksize=%d)", blocksize);
 			fulfill(0);
 			return;
@@ -319,6 +406,58 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			// High-level API: reaches [notein] (raw libpd_midibyte only feeds [midiin]).
 			// velocity == 0 acts as note-off.
 			libpd_noteon(channel & 0x0F, pitch & 0x7F, velocity & 0x7F);
+			return;
+		}
+		case PdCommand::MIDI_NOTE: {
+			const int channel = p_command.i32 & 0x0F;
+			const int d1 = (int)((p_command.i64 >> 8) & 0xFF);
+			const int d2 = (int)(p_command.i64 & 0xFF);
+			libpd_noteon(channel, d1, d2);
+			return;
+		}
+		case PdCommand::MIDI_CC: {
+			const int channel = p_command.i32 & 0x0F;
+			const int d1 = (int)((p_command.i64 >> 8) & 0xFF);
+			const int d2 = (int)(p_command.i64 & 0xFF);
+			libpd_controlchange(channel, d1, d2);
+			return;
+		}
+		case PdCommand::MIDI_PROGRAM_CHANGE: {
+			libpd_programchange(p_command.i32 & 0x0F, (int)(p_command.i64 & 0x7F));
+			return;
+		}
+		case PdCommand::MIDI_PITCH_BEND: {
+			const int channel = p_command.i32 & 0x0F;
+			const int d1 = (int)((p_command.i64 >> 8) & 0xFF);
+			const int d2 = (int)(p_command.i64 & 0xFF);
+			// d1 = low 7 bits, d2 = high 7 bits -> 14-bit value.
+			libpd_pitchbend(channel, d1 + d2 * 128);
+			return;
+		}
+		case PdCommand::MIDI_AFTERTOUCH: {
+			libpd_aftertouch(p_command.i32 & 0x0F, (int)(p_command.i64 & 0xFF));
+			return;
+		}
+		case PdCommand::MIDI_POLY_AFTERTOUCH: {
+			const int channel = p_command.i32 & 0x0F;
+			const int d1 = (int)((p_command.i64 >> 8) & 0xFF);
+			const int d2 = (int)(p_command.i64 & 0xFF);
+			libpd_polyaftertouch(channel, d1, d2);
+			return;
+		}
+		case PdCommand::MIDI_BYTE: {
+			// Raw byte: feeds [midiin] only (no cross-feed to [notein] etc.).
+			libpd_midibyte(0, (int)(p_command.i64 & 0xFF));
+			return;
+		}
+		case PdCommand::MIDI_SYSEX: {
+			// Per-byte libpd_sysex; clamp to the payload array for safety.
+			const uint32_t len = p_command.midi_len < (uint32_t)sizeof(p_command.midi)
+					? p_command.midi_len
+					: (uint32_t)sizeof(p_command.midi);
+			for (uint32_t i = 0; i < len; i++) {
+				libpd_sysex(0, p_command.midi[i]);
+			}
 			return;
 		}
 		case PdCommand::STOP_THREAD: {

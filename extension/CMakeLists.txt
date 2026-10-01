@@ -106,4 +106,19 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     )
     target_include_directories(midi_framer_tests PRIVATE src)
     add_test(NAME midi_framer_tests COMMAND $<TARGET_FILE:midi_framer_tests>)
+
+    add_executable(libpd_worker_midi_tests
+        tests/worker_midi_tests.cpp
+        src/libpd_worker.cpp
+        src/core/pd_command_queue.cpp
+        src/core/pd_debug.cpp
+        src/core/pd_audio_sink_generator.cpp
+    )
+    target_include_directories(libpd_worker_midi_tests PRIVATE
+        src
+        thirdparty/libpd/libpd_wrapper
+        thirdparty/libpd/libpd_wrapper/util
+    )
+    target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp pthread)
+    add_test(NAME worker_midi_tests COMMAND $<TARGET_FILE:libpd_worker_midi_tests>)
 endif()

@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/midi_output_queue.h"
 #include "core/pd_audio_sink.h"
 #include "core/pd_command_queue.h"
 #include "core/pd_event_ring.h"
@@ -69,6 +70,22 @@ public:
 	void emit_print(const char *p_text);
 	/// Called by the C noteonhook (worker thread context).
 	void emit_note_on(int p_channel, int p_pitch, int p_velocity);
+
+	/**
+	 * Install the pd output hooks that feed midi_out (noteon, controlchange,
+	 * programchange, pitchbend, aftertouch, polyaftertouch, midibyte) and
+	 * set the instance data pointer used by the hook trampolines.
+	 * Must run on the thread that owns the pd instance, once, before DSP
+	 * can run (called from the INIT command path; libpd requires hook
+	 * (un)setting while DSP is stopped).
+	 */
+	static void install_midi_output_hooks(void *p_worker_ptr);
+
+	/**
+	 * Bounded MIDI output queue (spec §4). Worker thread pushes from pd
+	 * hooks; the MIDI I/O thread (Task 4) drains it for PortMIDI output.
+	 */
+	MidiOutputQueue midi_out;
 
 private:
 	void run();

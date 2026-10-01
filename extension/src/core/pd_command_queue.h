@@ -22,6 +22,14 @@ struct PdCommand {
 		MESSAGE = 3,   // path = receiver, args = space-joined args string
 		MIDI = 4,      // i32 = channel, i64 = pitch*1000+velocity (packed)
 		STOP_THREAD = 5,
+		MIDI_NOTE = 6,            // i32 = channel(0-15), i64 = pitch*256+velocity
+		MIDI_CC = 7,              // i32 = channel, i64 = controller*256+value
+		MIDI_PROGRAM_CHANGE = 8,  // i32 = channel, i64 = program
+		MIDI_PITCH_BEND = 9,      // i32 = channel, i64 = low*256+high (value = low+high*128)
+		MIDI_AFTERTOUCH = 10,     // i32 = channel, i64 = pressure
+		MIDI_POLY_AFTERTOUCH = 11, // i32 = channel, i64 = pitch*256+pressure
+		MIDI_BYTE = 12,           // i64 = byte (0-255)
+		MIDI_SYSEX = 13,          // midi_len bytes in midi[0..midi_len-1], F0..F7 inclusive
 	};
 
 	uint32_t opcode = 0;
@@ -33,6 +41,10 @@ struct PdCommand {
 	// Optional: pointer to a std::shared_ptr<std::promise<int>> owned by the
 	// main thread; the worker fulfils it with the call's result code.
 	void *result = nullptr;
+	// MIDI_SYSEX payload: up to 128 bytes, F0..F7 inclusive (zero-init keeps
+	// the growth bounded; the queue is an unbounded std::deque).
+	uint8_t midi[128] = {};
+	uint32_t midi_len = 0;
 };
 
 /**
