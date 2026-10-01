@@ -128,6 +128,22 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_include_directories(midi_writer_tests PRIVATE src)
     add_test(NAME midi_writer_tests COMMAND $<TARGET_FILE:midi_writer_tests>)
 
+    if(BUILD_PORTMIDI)
+        # A133 freeze regression (out-of-range PM index on open):
+        # fails fast with the port_error signal; the in-test watchdog
+        # turns a hang regression into a ctest failure instead of
+        # hanging ctest. Links the router itself (the validated layer).
+        add_executable(midi_open_bounds_tests
+            tests/midi_open_bounds_tests.cpp
+            src/midi_router.cpp
+            src/core/pd_midi_framer.cpp
+        )
+        target_include_directories(midi_open_bounds_tests PRIVATE src)
+        target_compile_definitions(midi_open_bounds_tests PRIVATE PORTMIDI_ENABLED)
+        target_link_libraries(midi_open_bounds_tests PRIVATE portmidi pthread)
+        add_test(NAME midi_open_bounds_tests COMMAND $<TARGET_FILE:midi_open_bounds_tests>)
+    endif()
+
     add_executable(libpd_worker_midi_tests
         tests/worker_midi_tests.cpp
         src/libpd_worker.cpp

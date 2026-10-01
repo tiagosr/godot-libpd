@@ -422,20 +422,34 @@ bool MidiRouter::process_control_ops() {
 int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
 #ifdef PORTMIDI_ENABLED
 	PortMidiStream *stream = nullptr;
+	// Validate the index AND open under the same pm_api_mutex_ scope
+	// (A133 freeze repro): the device list can shrink between the
+	// caller's list_*() and this open, and the vendored Pm_OpenInput
+	// (unlike Pm_OpenOutput) has no bounds check — an out-of-range
+	// index read pm_descriptors OOB (UB: the A133 freeze). The 2.0.7
+	// index space is 0..Pm_CountDevices()-1 (there is no
+	// Pm_CountInput/OutputDevices); the side check keeps the existing
+	// pmInvalidDeviceId rejection for a device without the requested
+	// side. Out-of-range falls into the open-failure path below
+	// (error text + port_error signal + clean -1 return).
 	// latency 0: deliver output immediately, no timestamp handling
 	// (time_proc null -> PM's own time source; irrelevant at latency 0).
-	PmError err;
-	if (p_is_input) {
-		err = with_pm_mutex([&] {
+	PmError err = with_pm_mutex([&] {
+		if (p_pm_index < 0 || p_pm_index >= Pm_CountDevices()) {
+			return pmInvalidDeviceId;
+		}
+		const PmDeviceInfo *info = Pm_GetDeviceInfo(p_pm_index);
+		if (info == nullptr ||
+				(p_is_input ? info->input == 0 : info->output == 0)) {
+			return pmInvalidDeviceId;
+		}
+		if (p_is_input) {
 			return Pm_OpenInput(&stream, p_pm_index, nullptr, kPmBufferEvents,
 					nullptr, nullptr);
-		});
-	} else {
-		err = with_pm_mutex([&] {
-			return Pm_OpenOutput(&stream, p_pm_index, nullptr, kPmBufferEvents,
+		}
+		return Pm_OpenOutput(&stream, p_pm_index, nullptr, kPmBufferEvents,
 					nullptr, nullptr, 0);
-		});
-	}
+	});
 	if (err == pmNoError) {
 		int port_id = -1;
 		{
