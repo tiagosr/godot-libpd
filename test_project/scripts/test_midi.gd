@@ -23,6 +23,7 @@ const PATCH := "res://data/test_patch.pd"
 const MAX_LOG_LINES := 20
 const SMOKE_TIMEOUT_MS := 5000
 const SMOKE_WATCHDOG_MS := 15000
+const SMOKE_TEARDOWN_GRACE_S := 0.1
 
 @onready var inputs_label: Label = $VBox/InputsLabel
 @onready var outputs_label: Label = $VBox/OutputsLabel
@@ -118,20 +119,22 @@ func _run_smoke() -> void:
 		return
 	if not Libpd.server.midi_available():
 		print("MIDI_SMOKE_SKIP no IAC bus")
-		get_tree().quit(0)
+		await _finish_smoke(0)
 		return
 	var in_idx: int
 	var out_idx: int
-	var pair := _find_iac_pair(Libpd.server.midi_list_inputs(),
-			Libpd.server.midi_list_outputs())
+	# Fetch the device lists once: _find_iac_pair and the diagnostic print
+	# share them instead of re-enumerating the PM devices.
+	var in_list := Libpd.server.midi_list_inputs()
+	var out_list := Libpd.server.midi_list_outputs()
+	var pair := _find_iac_pair(in_list, out_list)
 	in_idx = pair[0]
 	out_idx = pair[1]
 	print("MIDI_SMOKE | inputs=%s outputs=%s iac=(%d,%d)" % [
-			str(Libpd.server.midi_list_inputs()), str(Libpd.server.midi_list_outputs()),
-			in_idx, out_idx])
+			str(in_list), str(out_list), in_idx, out_idx])
 	if in_idx < 0 or out_idx < 0:
 		print("MIDI_SMOKE_SKIP no IAC bus")
-		get_tree().quit(0)
+		await _finish_smoke(0)
 		return
 	_in_port = Libpd.server.midi_open_input(in_idx)
 	_out_port = Libpd.server.midi_open_output(out_idx)
@@ -155,7 +158,7 @@ func _run_smoke() -> void:
 		await get_tree().process_frame
 	if _smoke_got_print and _smoke_got_note:
 		print("MIDI_SMOKE_OK print=1 note=1 (iac in_idx=%d out_idx=%d)" % [in_idx, out_idx])
-		_finish_smoke(0)
+		await _finish_smoke(0)
 		return
 	_smoke_fail("timeout print=%s note=%s (iac in_idx=%d out_idx=%d)" % [
 			str(_smoke_got_print), str(_smoke_got_note), in_idx, out_idx])
@@ -164,7 +167,7 @@ func _run_smoke() -> void:
 func _smoke_fail(reason: String) -> void:
 	print("MIDI_SMOKE_FAIL %s" % reason)
 	_dump_smoke_state()
-	_finish_smoke(1)
+	await _finish_smoke(1)
 
 
 func _finish_smoke(code: int) -> void:
@@ -176,6 +179,13 @@ func _finish_smoke(code: int) -> void:
 	if _instance != null and _instance_ready:
 		_instance.stop_dsp()
 		_instance.queue_free()
+		# Grace period before quit: the AudioServer holds a Ref to the
+		# instance's AudioStreamGeneratorPlayback in its playback_list until
+		# its (dummy in --headless) audio thread processes the FADE_OUT and
+		# unrefs it. One frame is sub-millisecond in headless and can quit
+		# before that, leaving "ObjectDB instances leaked at exit".
+		# test_main.gd's timed awaits give the same grace implicitly.
+		await get_tree().create_timer(SMOKE_TEARDOWN_GRACE_S).timeout
 	get_tree().quit(code)
 
 
