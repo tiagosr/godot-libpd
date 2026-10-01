@@ -226,8 +226,10 @@ void MidiRouter::shutdown() {
 	ControlOp op;
 	op.op = ControlOpType::SHUTDOWN;
 	control_queue_.push_back(std::move(op));
-	lock.unlock();
 	// Wait up to 500 ms for the I/O thread to close the ports and exit.
+	// The wait must hold control_mutex_: the I/O thread sets thread_done_
+	// under that mutex before notifying control_cv_ (unlocking first
+	// makes wait_for throw std::system_error and abort the process).
 	control_cv_.wait_for(lock, std::chrono::milliseconds(kControlTimeoutMs),
 			[this] { return thread_done_; });
 	if (!thread_done_) {
