@@ -50,6 +50,20 @@ public:
 	/// Send a MIDI note to the patch's notein objects.
 	void send_midi(int p_channel, int p_pitch, int p_velocity);
 
+	/// Push a MIDI command onto the worker's command queue (thread-safe).
+	/// Called from the LibpdServer's MIDI I/O thread via the router's
+	/// on_midi_command callback, or from the main thread. The worker picks
+	/// it up on its next command-poll and executes it on the worker thread
+	/// (spec §5: input MIDI runs as worker-thread commands).
+	void push_midi_command(const godot_libpd::PdCommand &p_command);
+
+	/// The worker's bounded MIDI output queue. The server registers it with
+	/// the router on _enter_tree (MIDI I/O thread drains it for PortMIDI
+	/// output); the worker's pd output hooks feed it.
+	godot_libpd::MidiOutputQueue *midi_output_queue() {
+		return &worker.midi_out;
+	}
+
 	int64_t instance_id() const;
 	int samplerate() const;
 	bool patch_loaded() const;

@@ -111,10 +111,11 @@ void LibpdInstance::_bind_methods() {
 }
 
 void LibpdInstance::_enter_tree() {
+	// Registers with the server (instance map) and with the router
+	// (output queue registration) — see LibpdServer::register_instance.
+	instance_id_value = worker.instance_id();
 	if (LibpdServer::get_singleton() != nullptr) {
-		LibpdServer::get_singleton()->register_instance(instance_id_value = worker.instance_id());
-	} else {
-		instance_id_value = worker.instance_id();
+		LibpdServer::get_singleton()->register_instance(this);
 	}
 }
 
@@ -136,7 +137,10 @@ void LibpdInstance::_exit_tree() {
 		player = nullptr; // avoid dangling after the tree frees it
 	}
 	if (LibpdServer::get_singleton() != nullptr) {
-		LibpdServer::get_singleton()->unregister_instance(worker.instance_id());
+		// Forgets the instance in the router (unroute + drop the output
+		// queue registration) before the worker and its queue are
+		// destroyed (the worker was joined above).
+		LibpdServer::get_singleton()->unregister_instance(this);
 	}
 }
 
@@ -384,6 +388,15 @@ void LibpdInstance::send_midi(int p_channel, int p_pitch, int p_velocity) {
 	cmd.i32 = p_channel;
 	cmd.i64 = ((int64_t)p_pitch << 32) | (int64_t)(p_velocity & 0x7F);
 	worker.push_command(cmd);
+}
+
+void LibpdInstance::push_midi_command(const godot_libpd::PdCommand &p_command) {
+	// Thread-safe by contract (PdCommandQueue): the caller is either the
+	// MIDI I/O thread (router on_midi_command, under the server's instance
+	// map lock so this instance is still alive) or the main thread. If the
+	// worker is not (yet) running, the command simply waits in the queue;
+	// an already-stopped worker drops the queue on destruction.
+	worker.push_command(p_command);
 }
 
 int64_t LibpdInstance::instance_id() const {

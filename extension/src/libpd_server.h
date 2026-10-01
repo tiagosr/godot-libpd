@@ -3,11 +3,17 @@
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/godot.hpp>
 
-#include <unordered_set>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "core/pd_event_ring.h"
+#include "midi_router.h"
 
 namespace godot {
+
+class LibpdInstance;
 
 /**
  * Project-level singleton (used via the `Libpd` autoload wrapper in the test
@@ -17,6 +23,11 @@ namespace godot {
  * drains the ring in _process() (main thread only) and emits Godot signals.
  * No worker thread ever calls into Godot — this is the only thread-crossing
  * mechanism, which keeps the design deadlock-free (spec §4/§5).
+ *
+ * Also owns the process-wide MidiRouter (MIDI I/O thread, PortMIDI ports,
+ * input routing to registered LibpdInstances). The I/O thread only enqueues
+ * (pull: drain_signal_events() + a pending port-error list); the typed
+ * midi_* signals are emitted from _process() like the instance_* signals.
  */
 class LibpdServer : public Node {
 	GDCLASS(LibpdServer, Node)
@@ -40,8 +51,44 @@ public:
 	/// Push an arbitrary event (called from worker threads via the libpd hooks).
 	void push_event(const godot_libpd::PdEvent &p_event);
 
-	void register_instance(int64_t p_instance_id);
-	void unregister_instance(int64_t p_instance_id);
+	/// Register an instance: it becomes the router's MIDI command target
+	/// (I/O thread -> push_midi_command) and its worker output queue is
+	/// registered with the router. Called from LibpdInstance::_enter_tree.
+	void register_instance(LibpdInstance *p_instance);
+	/// Unregister an instance: drop it from the command-target map and call
+	/// router.forget_instance() (unroute + drop the output queue). Called
+	/// from LibpdInstance::_exit_tree.
+	void unregister_instance(LibpdInstance *p_instance);
+
+	// ------------------------------------------------------------------
+	// MIDI I/O API (spec §3; main thread only).
+	// Stub builds (no PortMIDI / BUILD_PORTMIDI=OFF): midi_available()
+	// is false and every other method push_error()s and returns
+	// -1/no-op; the signals stay declared but never fire.
+	// ------------------------------------------------------------------
+
+	/// True when PortMIDI is available and at least one device exists.
+	bool midi_available();
+	/// PM device indices + names of devices with an input side.
+	Array midi_list_inputs();
+	/// PM device indices + names of devices with an output side.
+	Array midi_list_outputs();
+	/// Open PM device p_pm_index as an input port.
+	/// Returns the new port id (>= 0) or -1 on failure.
+	int midi_open_input(int p_pm_index);
+	/// Open PM device p_pm_index as an output port.
+	/// Returns the new port id (>= 0) or -1 on failure.
+	int midi_open_output(int p_pm_index);
+	/// Close an open input port (errors surface via the midi_port_error signal).
+	void midi_close_input(int p_port_id);
+	/// Close an open output port.
+	void midi_close_output(int p_port_id);
+	/// Route input port p_port_id to p_instance (p_add = false unroutes).
+	/// Routing is allowed even while the port is closed; it becomes
+	/// effective when the port opens.
+	void midi_route_input(int p_port_id, LibpdInstance *p_instance, bool p_add);
+	/// Route p_instance's MIDI output to output port p_port_id.
+	void midi_route_output(LibpdInstance *p_instance, int p_port_id, bool p_add);
 
 	void _process(double p_delta) override;
 
@@ -49,10 +96,38 @@ protected:
 	static void _bind_methods();
 
 private:
+	/// One midi_port_error signal waiting for emission on the main thread.
+	struct PortErrorEvent {
+		int port_id = -1;
+		String what;
+	};
+
 	void _drain_ring();
+	void _drain_midi_events();
 
 	godot_libpd::PdEventRing ring;
-	std::unordered_set<int64_t> instances;
+	// Process-wide MIDI router (Task 4). Its constructor starts the MIDI I/O
+	// thread (PortMIDI-enabled builds); its destructor joins it. Callbacks
+	// are wired in the server constructor; the main-thread side is
+	// _drain_midi_events().
+	godot_libpd::MidiRouter midi_router;
+	// Guards midi_instances_ and pending_port_errors_.
+	//
+	// Lock discipline: the MIDI I/O thread holds it only while copying a map
+	// entry and pushing one command (non-blocking, unbounded queue), so an
+	// instance can never be freed while its pointer is being used —
+	// unregister_instance() takes the same lock to erase the entry. The
+	// router never calls back into the server while one of its locks is held
+	// (midi_router.h contract), so there is no lock-order cycle.
+	mutable std::mutex midi_mutex;
+	// Registered instances, keyed by instance id (extends the former id-only
+	// set). Values are used only on the I/O-thread callback path while
+	// midi_mutex is held.
+	std::unordered_map<int64_t, LibpdInstance *> midi_instances_;
+	// Port errors enqueued by the router's on_port_error callback (I/O thread,
+	// or the main-thread open/close timeout path); emitted in
+	// _drain_midi_events().
+	std::vector<PortErrorEvent> pending_port_errors_;
 };
 
 } // namespace godot
