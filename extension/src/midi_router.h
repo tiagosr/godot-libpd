@@ -207,12 +207,21 @@ public:
 	 * Per-route command delivery (called on the MIDI I/O thread; Task 5
 	 * binds the main-thread consumer). One call per (routed instance,
 	 * command). Dual delivery per spec §5: for a decoded short message
-	 * the high-level command first, plus one MIDI_BYTE command per raw
-	 * stream byte (running status preserved, sysex excluded); sysex
+	 * the raw MIDI_BYTE commands (one per stream byte, running status
+	 * preserved, sysex excluded) precede the high-level command for the
+	 * message (the framer emits on_byte per byte before on_short); sysex
 	 * arrives as a single MIDI_SYSEX command (F0..F7 inclusive) with no
 	 * MIDI_BYTE commands for its bytes. Realtime/system-common bytes
 	 * arrive as MIDI_BYTE commands only. Consume (copy) the PdCommand
 	 * within the call.
+	 *
+	 * Re-entrancy contract (enforced by Task 5 binding discipline, not
+	 * by this code): fires on the MIDI I/O thread; the bound function
+	 * MUST NOT call any MidiRouter method (open_input/open_output/
+	 * close_input/close_output/shutdown/route_input/route_output) —
+	 * control ops wait for the I/O thread, so calling from the I/O
+	 * thread stalls until the 500 ms timeout. Enqueue to the main thread
+	 * instead.
 	 */
 	std::function<void(int64_t p_instance_id, const PdCommand &p_command)> on_midi_command;
 
@@ -224,6 +233,11 @@ public:
 	 * open/close timeout paths fire it from the calling thread. Task 5
 	 * binds this to the midi_port_error(port_id, what) signal.
 	 * port_id is -1 for router-level errors (failed open, timeout).
+	 *
+	 * Re-entrancy contract (enforced by Task 5 binding discipline, not
+	 * by this code): the bound function MUST NOT call any MidiRouter
+	 * method (open_input/open_output/close_input/close_output/shutdown/
+	 * route_input/route_output); enqueue to the main thread instead.
 	 */
 	std::function<void(int p_port_id, const char *p_what)> on_port_error;
 
@@ -400,8 +414,25 @@ private:
 
 #ifdef PORTMIDI_ENABLED
 	bool pm_initialized_ = false; // Pm_Initialize result (constructor)
+	// PortMIDI is NOT thread-safe (portmidi.h: "you cannot allow threads
+	// to call PortMidi functions concurrently"). Held around EVERY Pm_*
+	// call on both the API thread and the I/O thread; the ~1 ms poll
+	// makes contention negligible. notify_port_error (user callback) is
+	// never invoked while this lock is held.
+	mutable std::mutex pm_api_mutex_;
 #endif
 	std::thread io_thread_;
+
+#ifdef PORTMIDI_ENABLED
+	// Runs p_fn holding pm_api_mutex_ (see above). Every Pm_* call on
+	// both threads goes through this; user callbacks are invoked only
+	// after the lock is released.
+	template <typename Fn>
+	auto with_pm_mutex(Fn &&p_fn) const -> decltype(p_fn()) {
+		std::lock_guard<std::mutex> lock(pm_api_mutex_);
+		return p_fn();
+	}
+#endif
 
 	// ------------------------------------------------------------------
 	// I/O thread
@@ -414,13 +445,17 @@ private:
 	void handle_read_error(int p_port_id, int p_err); // I/O thread
 	void output_stage(); // I/O thread
 #ifdef PORTMIDI_ENABLED
-	void deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
+	// Return value: false after a failed Pm_WriteShort — the port is
+	// already closed and unrouted (write_short ran close_port); the
+	// caller must stop writing to that stream and drop the rest of the
+	// batch (writing to a closed stream is UB).
+	bool deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
 			std::unordered_map<int, RawRouteState> &p_writers,
 			const MidiOutMsg &p_msg); // I/O thread
-	void raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
+	bool raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 			std::unordered_map<int, RawRouteState> &p_writers,
 			uint8_t p_byte); // I/O thread
-	void write_short(PortMidiStream *p_stream, int p_port_id, PmMessage p_msg); // I/O thread
+	bool write_short(PortMidiStream *p_stream, int p_port_id, PmMessage p_msg); // I/O thread
 #endif
 
 	Port *port_ptr(int p_port_id);

@@ -78,7 +78,7 @@ MidiRouter::MidiRouter() {
 	// bounds all PM use (macOS same-thread requirement). If
 	// Pm_Initialize fails: no I/O thread; available() stays false and
 	// open_* fail cleanly.
-	pm_initialized_ = Pm_Initialize() == pmNoError;
+	pm_initialized_ = with_pm_mutex([] { return Pm_Initialize(); }) == pmNoError;
 	if (pm_initialized_) {
 		{
 			std::lock_guard<std::mutex> lock(control_mutex_);
@@ -95,7 +95,7 @@ MidiRouter::~MidiRouter() {
 
 bool MidiRouter::available() const {
 #ifdef PORTMIDI_ENABLED
-	return pm_initialized_ && Pm_CountDevices() > 0;
+	return pm_initialized_ && with_pm_mutex([] { return Pm_CountDevices(); }) > 0;
 #else
 	return false;
 #endif
@@ -107,12 +107,14 @@ std::vector<std::pair<int, std::string>> MidiRouter::list_inputs() const {
 	if (pm_initialized_) {
 		// No Pm_CountInputDevices in 2.0.7: enumerate all devices and
 		// filter by the input side of PmDeviceInfo.
-		for (int id = 0; id < Pm_CountDevices(); ++id) {
-			const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
-			if (info != nullptr && info->input != 0) {
-				out.emplace_back(id, info->name != nullptr ? info->name : "");
+		with_pm_mutex([&] {
+			for (int id = 0; id < Pm_CountDevices(); ++id) {
+				const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
+				if (info != nullptr && info->input != 0) {
+					out.emplace_back(id, info->name != nullptr ? info->name : "");
+				}
 			}
-		}
+		});
 	}
 #else
 	(void)this;
@@ -124,12 +126,14 @@ std::vector<std::pair<int, std::string>> MidiRouter::list_outputs() const {
 	std::vector<std::pair<int, std::string>> out;
 #ifdef PORTMIDI_ENABLED
 	if (pm_initialized_) {
-		for (int id = 0; id < Pm_CountDevices(); ++id) {
-			const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
-			if (info != nullptr && info->output != 0) {
-				out.emplace_back(id, info->name != nullptr ? info->name : "");
+		with_pm_mutex([&] {
+			for (int id = 0; id < Pm_CountDevices(); ++id) {
+				const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
+				if (info != nullptr && info->output != 0) {
+					out.emplace_back(id, info->name != nullptr ? info->name : "");
+				}
 			}
-		}
+		});
 	}
 #else
 	(void)this;
@@ -272,7 +276,9 @@ void MidiRouter::io_loop() {
 				continue;
 			}
 			PortMidiStream *stream = port->pm_stream;
-			const int n = Pm_Read(stream, events, kPmReadBatch);
+			const int n = with_pm_mutex([&] {
+				return Pm_Read(stream, events, kPmReadBatch);
+			});
 			if (n < 0) {
 				handle_read_error(pid, n);
 				continue;
@@ -295,14 +301,21 @@ void MidiRouter::io_loop() {
 				}
 			}
 			// Asynchronous host-error check (same loop, per stream).
-			const int host_err = Pm_HasHostError(stream);
+			const int host_err = with_pm_mutex([&] {
+				return Pm_HasHostError(stream);
+			});
 			if (host_err != 0) {
 				// Pm_GetHostErrorText fills the caller's buffer (void);
 				// the message is best-effort when a host error is set.
 				char buf[256] = "";
-				Pm_GetHostErrorText(buf, sizeof(buf));
-				notify_port_error(pid, buf[0] != '\0' ? buf
-						: Pm_GetErrorText(static_cast<PmError>(host_err)));
+				// Text gathered under the PM lock; notify_port_error
+				// (user callback) fires after the lock is released.
+				const char *text = with_pm_mutex([&] {
+					Pm_GetHostErrorText(buf, sizeof(buf));
+					return buf[0] != '\0' ? buf
+							: Pm_GetErrorText(static_cast<PmError>(host_err));
+				});
+				notify_port_error(pid, text);
 			}
 		}
 		// Stage 2 — frame + fan out (same thread, same iteration as the
@@ -332,9 +345,11 @@ void MidiRouter::io_loop() {
 			}
 		}
 	}
-	for (PortMidiStream *s : streams) {
-		Pm_Close(s); // best effort
-	}
+	with_pm_mutex([&] {
+		for (PortMidiStream *s : streams) {
+			Pm_Close(s); // best effort
+		}
+	});
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto &kv : ports_) {
@@ -346,8 +361,9 @@ void MidiRouter::io_loop() {
 		}
 	}
 	if (pm_initialized_) {
-		Pm_Terminate(); // exactly once; this router is the process's only
-		// PortMIDI user, so its lifetime bounds PM use.
+		with_pm_mutex([] { Pm_Terminate(); }); // exactly once; this router
+		// is the process's only PortMIDI user, so its lifetime bounds
+		// PM use.
 	}
 #else
 	// Stub build: the I/O thread never starts (no PM), nothing to do.
@@ -406,9 +422,18 @@ int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
 	PortMidiStream *stream = nullptr;
 	// latency 0: deliver output immediately, no timestamp handling
 	// (time_proc null -> PM's own time source; irrelevant at latency 0).
-	const PmError err = p_is_input
-			? Pm_OpenInput(&stream, p_pm_index, nullptr, kPmBufferEvents, nullptr, nullptr)
-			: Pm_OpenOutput(&stream, p_pm_index, nullptr, kPmBufferEvents, nullptr, nullptr, 0);
+	PmError err;
+	if (p_is_input) {
+		err = with_pm_mutex([&] {
+			return Pm_OpenInput(&stream, p_pm_index, nullptr, kPmBufferEvents,
+					nullptr, nullptr);
+		});
+	} else {
+		err = with_pm_mutex([&] {
+			return Pm_OpenOutput(&stream, p_pm_index, nullptr, kPmBufferEvents,
+					nullptr, nullptr, 0);
+		});
+	}
 	if (err == pmNoError) {
 		int port_id = -1;
 		{
@@ -426,10 +451,12 @@ int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
 		}
 		return port_id;
 	}
-	notify_port_error(-1,
-			(std::string(Pm_GetErrorText(err)) + " (pm device " +
-					std::to_string(p_pm_index) + ")")
-					.c_str());
+	// Error text gathered under the PM lock; the user callback fires
+	// after it is released.
+	const std::string text = with_pm_mutex(
+			[&] { return std::string(Pm_GetErrorText(err)); }) + " (pm device " +
+		std::to_string(p_pm_index) + ")";
+	notify_port_error(-1, text.c_str());
 	return -1;
 #else
 	(void)p_is_input;
@@ -452,7 +479,10 @@ void MidiRouter::close_port(int p_port_id) {
 		is_input = it->second->is_input;
 	}
 	if (stream != nullptr) {
-		Pm_Close(stream); // best effort; the stream is ours (I/O thread)
+		// Best effort; the stream is ours (I/O thread).
+		with_pm_mutex([&] {
+			Pm_Close(stream);
+		});
 	}
 	// Auto-unroute the port (spec §7: close stops the port, unroutes it).
 	if (is_input) {
@@ -515,12 +545,14 @@ void MidiRouter::handle_read_error(int p_port_id, int p_err) {
 				}
 			}
 		}
-		notify_port_error(p_port_id, Pm_GetErrorText(pmBufferOverflow));
+		notify_port_error(p_port_id,
+			with_pm_mutex([] { return Pm_GetErrorText(pmBufferOverflow); }));
 		return;
 	}
 	// pmDeviceRemoved / pmHostError / anything else: the port is dead —
 	// drop the handle, unroute, and notify.
-	const std::string text(Pm_GetErrorText(static_cast<PmError>(p_err)));
+	const std::string text = with_pm_mutex(
+			[&] { return std::string(Pm_GetErrorText(static_cast<PmError>(p_err))); });
 	close_port(p_port_id);
 	notify_port_error(p_port_id, text.c_str());
 #else
@@ -599,7 +631,14 @@ void MidiRouter::output_stage() {
 			// router lock (see the lock discipline in midi_router.h).
 			auto &writers = raw_writers_[instance];
 			for (const MidiOutMsg &msg : msgs) {
-				deliver_out_msg(stream, port_id, writers, msg);
+				if (!deliver_out_msg(stream, port_id, writers, msg)) {
+					// Write failed: write_short already closed and
+					// unrouted the port (its stream and raw-byte
+					// framing state are gone) — drop the rest of this
+					// port's batch; writing to the closed stream would
+					// be UB.
+					break;
+				}
 			}
 		}
 	}
@@ -609,12 +648,11 @@ void MidiRouter::output_stage() {
 }
 
 #ifdef PORTMIDI_ENABLED
-void MidiRouter::deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
+bool MidiRouter::deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
 		std::unordered_map<int, RawRouteState> &p_writers,
 		const MidiOutMsg &p_msg) {
 	if (p_msg.kind == MidiOutMsg::RAW_BYTE) {
-		raw_byte_to_stream(p_stream, p_port_id, p_writers, p_msg.byte);
-		return;
+		return raw_byte_to_stream(p_stream, p_port_id, p_writers, p_msg.byte);
 	}
 	// Channels are masked to the low nibble: output hooks may carry
 	// pd_channel + 16*pd_port; the port nibble is dropped (v1
@@ -653,12 +691,12 @@ void MidiRouter::deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
 			d2 = p_msg.d2;
 			break;
 		case MidiOutMsg::RAW_BYTE:
-			return; // handled above
+			return true; // handled above
 	}
-	write_short(p_stream, p_port_id, Pm_Message(status, d1, d2));
+	return write_short(p_stream, p_port_id, Pm_Message(status, d1, d2));
 }
 
-void MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
+bool MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 		std::unordered_map<int, RawRouteState> &p_writers,
 		uint8_t p_byte) {
 	RawRouteState &st = p_writers[p_port_id]; // default-constructed per route
@@ -673,24 +711,23 @@ void MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 	if (st.in_sysex) {
 		if (b == 0xF7) {
 			st.in_sysex = false; // EOX: dropped, no status change
-			return;
+			return true;
 		}
 		if (b >= 0x80 && b != 0xF0) {
 			st.in_sysex = false; // truncated sysex: fall through, status is real
 		} else {
-			return; // sysex data (incl. nested F0): dropped whole
+			return true; // sysex data (incl. nested F0): dropped whole
 		}
 	}
 	if (b >= 0x80) {
 		if (b == 0xF0) {
 			st.in_sysex = true; // raw F0..F7 dropped (no sysex output path)
-			return;
+			return true;
 		}
 		if (b >= 0xF8) {
 			// Realtime: complete one-byte message, always sent (never
 			// subject to running status).
-			write_short(p_stream, p_port_id, Pm_Message(b, 0, 0));
-			return;
+			return write_short(p_stream, p_port_id, Pm_Message(b, 0, 0));
 		}
 		// Status byte (emitted, or running-suppressed — the wire status
 		// is st.status, which equals b in the suppressed case) starts a
@@ -699,35 +736,44 @@ void MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 		st.have_status = true;
 		st.data_need = raw_data_need(b);
 		st.data_have = 0;
-		return;
+		return true;
 	}
 	// Data byte.
 	if (!st.have_status || st.in_sysex) {
-		return; // stray data before any status: dropped by framing
+		return true; // stray data before any status: dropped by framing
 	}
 	if (st.data_have >= st.data_need) {
-		return; // previous message already complete: drop the extra byte
+		return true; // previous message already complete: drop the extra byte
 	}
 	st.data[st.data_have++] = b;
 	if (st.data_have < st.data_need) {
-		return;
+		return true;
 	}
 	// Message complete: send the full-form word.
 	const uint8_t d2 = (st.data_need == 2) ? st.data[1] : 0;
-	write_short(p_stream, p_port_id, Pm_Message(st.status, st.data[0], d2));
+	return write_short(p_stream, p_port_id, Pm_Message(st.status, st.data[0], d2));
 }
 
-void MidiRouter::write_short(PortMidiStream *p_stream, int p_port_id, PmMessage p_msg) {
-	const PmError err = Pm_WriteShort(p_stream, 0, p_msg);
+bool MidiRouter::write_short(PortMidiStream *p_stream, int p_port_id, PmMessage p_msg) {
+	const PmError err = with_pm_mutex(
+			[&] { return Pm_WriteShort(p_stream, 0, p_msg); });
 	if (err != pmNoError) {
 		// Spec §7 (approved mapping: any nonzero PM error, notably
 		// pmDeviceRemoved/pmHostError): drop the handle, unroute the
 		// port, and notify. Pm_* calls are never made under a router
 		// lock; close_port takes the locks it needs on its own.
-		const std::string text(Pm_GetErrorText(err));
+		//
+		// The port is dead now: returning false makes output_stage drop
+		// the rest of the batch (writing to the closed stream would be
+		// UB). Error text is gathered under the PM lock; the user
+		// callback fires after it is released.
+		const std::string text = with_pm_mutex(
+				[&] { return std::string(Pm_GetErrorText(err)); });
 		close_port(p_port_id);
 		notify_port_error(p_port_id, text.c_str());
+		return false;
 	}
+	return true;
 }
 #endif // PORTMIDI_ENABLED
 
