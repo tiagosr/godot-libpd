@@ -54,8 +54,10 @@ add_library(godot_libpd SHARED
     src/libpd_server.cpp
     src/libpd_instance.cpp
     src/libpd_worker.cpp
+    src/midi_router.cpp
     src/core/pd_event_ring.cpp
     src/core/pd_command_queue.cpp
+    src/core/pd_midi_framer.cpp
     src/core/pd_debug.cpp
     src/core/pd_audio_sink_generator.cpp
 )
@@ -79,6 +81,9 @@ target_include_directories(godot_libpd PRIVATE
 target_link_libraries(godot_libpd PRIVATE godot-cpp libpd_static)
 if(BUILD_PORTMIDI)
     target_link_libraries(godot_libpd PRIVATE portmidi)
+    # MidiRouter compiles against the vendored PortMIDI 2.0.7 only when
+    # the backend is built in; otherwise it degrades to inert stubs.
+    target_compile_definitions(godot_libpd PRIVATE PORTMIDI_ENABLED)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -113,6 +118,15 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_include_directories(midi_routing_tests PRIVATE src)
     target_link_libraries(midi_routing_tests PRIVATE pthread)
     add_test(NAME midi_routing_tests COMMAND $<TARGET_FILE:midi_routing_tests>)
+
+    # Task 4: MidiOutWriter is pure (no PortMIDI, no threads) and lives
+    # inline in midi_router.h, so this target needs no portmidi include
+    # path and no .cpp to link.
+    add_executable(midi_writer_tests
+        tests/midi_writer_tests.cpp
+    )
+    target_include_directories(midi_writer_tests PRIVATE src)
+    add_test(NAME midi_writer_tests COMMAND $<TARGET_FILE:midi_writer_tests>)
 
     add_executable(libpd_worker_midi_tests
         tests/worker_midi_tests.cpp
