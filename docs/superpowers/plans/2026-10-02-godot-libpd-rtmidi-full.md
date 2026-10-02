@@ -62,7 +62,7 @@ selects `RtMidiBackend` for non-Android hosts; Android keeps
 - Negative: with IAC absent, `midi_open_input(0)` → `midi_port_error`, no
   freeze.
 
-## Task 2 — Linux (A133) + Android regression
+## Task 2 — Linux (A133) + Android regression (COMPLETE)
 
 **Status:** PENDING (blocked by Task 1)
 
@@ -87,7 +87,7 @@ selects `RtMidiBackend` for non-Android hosts; Android keeps
 ### 2.3 Baseline
 - `SMOKE_OK` (audio) unaffected on macOS + A133.
 
-## Task 3 — Docs
+## Task 3 — Docs (COMPLETE)
 
 **Status:** PENDING (blocked by Task 1, 2)
 

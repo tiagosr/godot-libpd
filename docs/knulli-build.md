@@ -106,16 +106,18 @@ spec); on the Brick playback is verified through the 3.5 mm jack.
 Native ALSA/PipeWire backends are v2 (the `PdAudioSink` interface
 already isolates the swap).
 
-### MIDI I/O (PortMIDI — ALSA sequencer; verified on the A133)
+### MIDI I/O (RtMidi — ALSA sequencer; verified on the A133)
 
-v2: MIDI I/O (PortMIDI, ALSA sequencer on A133 — `aconnect` loopback
-verified on-device 2026-10-01).
+v2: MIDI I/O (RtMidi ALSA backend on A133 — `aconnect` loopback
+verified on-device 2026-10-02 with the M3 `RtMidiHostBackend`;
+PortMIDI was the backend until M3, verified 2026-10-01, and remains
+available via `MIDI_BACKEND=portmidi`).
 
 The A133's ALSA sequencer exposes **no SUBS-capable ports**
-(`aconnect -l` shows nothing else, `Pm_CountDevices()` == 0 for the
+(`aconnect -l` shows nothing else, `getPortCount()` == 0 for the
 app), so the `test_midi` scene creates the app's own snd_seq virtual
 ports — `Libpd.server.midi_open_virtual_input()` /
-`midi_open_virtual_output()` (PM names them `"libpd test app in 0"` /
+`midi_open_virtual_output()` (named `"libpd test app in 0"` /
 `"libpd test app out 0"`) — and loopback is wired with `aconnect`
 between the app's own ports:
 
@@ -124,21 +126,33 @@ between the app's own ports:
    touchscreen — drive the scene's buttons with the D-pad focus
    (down/right + Enter) or the uinput key-injection helper (`uikeys`;
    extended source kept on the device at `/tmp/uikeys.c`).
-2. In the app: **Open Virtual In**, then **Open Virtual Out**. Two seq
-   ports appear on the app's PM client; the ALSA port numbers are
-   assigned in creation order (first open = port 0), so read them from
-   `aconnect -l` (or `/proc/asound/seq/clients`).
+2. In the app: **Open Virtual In**, then **Open Virtual Out**. RtMidi
+   registers the two ports on **two separate snd_seq clients** (both
+   named `godot-libpd`) — unlike the old PortMIDI single client with
+   two ports. Read the client numbers from `aconnect -l` each run.
 3. From a second adb shell, check and wire out → in:
    ```sh
-   aconnect -l            # client + port names
-   aconnect 128:1 128:0   # out port 1 -> in port 0 (client number per boot)
+   aconnect -l            # two 'godot-libpd' clients, one port each
+   aconnect 129:0 128:0   # out client port 0 -> in client port 0 (per boot)
    ```
 4. In the app: **Route In → instance**, **Route instance → Out**, then
    **Send test note** → the looped note appears in the event log and
    on stdout: `[MIDI] note_on port=0 ch=0 pitch=60 vel=100`.
-5. Negative test: `aconnect -d 128:1 128:0`, send again → the note is
+5. Negative test: `aconnect -d 129:0 128:0`, send again → the note is
    written to the output port but nothing is wired back, so **no new
    `note_on`** appears.
+
+On-device stdout gotchas (both verified):
+
+- **Launch line-buffered** — redirecting the app's stdout to a file
+  makes it block-buffered and hides every `[MIDI]`/`[UI]` line until
+  4 KB accumulates. Run
+  `stdbuf -oL -eL ./test ... > /tmp/app.log 2>&1`.
+- **The engine loads `test.pck` by basename** — the knulli engine binary
+  is named `test`, so it loads `test.pck` next to it and **ignores the
+  positional PCK argument**. Stage the scene you want as `test.pck`.
+- **`uikeys` must exist before the app starts** — the app's evdev thread
+  scans `/dev/input` at startup only.
 
 Caveats:
 
@@ -152,23 +166,28 @@ Caveats:
   feeds back indefinitely (observed on-device: sustained note_on
   re-emission, hundreds of thousands of events per minute). Unwire
   (`aconnect -d`) as soon as verification is done.
-- **Timestamp-queue guard (vendored PortMIDI fix).** The ALSA backend
-  stamps each port with a shared seq queue that is lazy-allocated at
-  the first `Pm_Open`; ports created before that carry queue 0, which
-  on the A133 is owned by another client (PipeWire) and Stopped — the
-  kernel never delivers tick-timestamped events on a queue the port's
-  client does not own. All virtual ports are created at open time
-  (before the first open), so the vendored PM now keeps the kernel
-  default (real-time) timestamping unless the shared queue already
-  exists. `aconnect -l` / `/proc/asound/seq/queues` show the queue
-  ownership; `/proc/asound/seq/ports` does not exist on this kernel
-  (4.9), so per-port timestamp flags are not directly observable.
-- **Zero devices is normal here.** Opening a PM index while the
-  device list is empty fails cleanly (`pmInvalidDeviceId` +
-  `midi_port_error` signal, no freeze) — router-side index validation
-  plus the vendored `Pm_OpenInput` bounds check (the A133 freeze fix;
-  `Pm_CountDevices()` == 0 made index 0 an out-of-bounds descriptor
-  read on the I/O thread).
+- **Timestamp-queue guard (vendored PortMIDI fix — fallback backend
+  only).** The old PortMIDI ALSA backend stamped each port with a shared
+  seq queue that is lazy-allocated at the first `Pm_Open`; ports created
+  before that carry queue 0, which on the A133 is owned by another
+  client (PipeWire) and Stopped — the kernel never delivers
+tick-timestamped events on a queue the port's client does not own. All
+  virtual ports are created at open time (before the first open), so the
+  vendored PM now keeps the kernel default (real-time) timestamping
+  unless the shared queue already exists. This applies only to the
+  `MIDI_BACKEND=portmidi` build; the default RtMidi backend creates the
+  ports directly and does not use that shared-queue path. `aconnect -l`
+  / `/proc/asound/seq/queues` show the queue ownership;
+  `/proc/asound/seq/ports` does not exist on this kernel (4.9), so
+  per-port timestamp flags are not directly observable.
+- **Zero devices is normal here.** Opening an index while the device
+  list is empty fails cleanly (a `midi_port_error` signal, no freeze) —
+  router-side index validation plus a backend-side bounds check (for the
+  PortMIDI build this was the vendored `Pm_OpenInput` check; the RtMidi
+  build validates the index against its own enumeration and returns
+  `InvalidParameter`). `Pm_CountDevices()` == 0 made index 0 an
+  out-of-bounds descriptor read on the I/O thread — the original A133
+  freeze.
 
 ## v1 status (all verified on the Brick)
 

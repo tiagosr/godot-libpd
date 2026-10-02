@@ -1,6 +1,6 @@
 # v2 M3 — Full RtMidi Integration (CoreMIDI + ALSA behind MidiBackend)
 
-**Status:** proposed (2026-10-02)
+**Status:** implemented (2026-10-02)
 **Supersedes:** nothing — extends M1 (PortMIDI) + M2 (RtMidi Android) by making
 RtMidi the default MIDI backend on **all** platforms.
 **Task 0 recon:** COMPLETE (2026-10-02), both platforms GO — see §7.

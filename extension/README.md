@@ -10,8 +10,8 @@ with Godot-native audio (AudioStreamGenerator). See
 |---|---|
 | `thirdparty/godot-cpp` | branch `4.5`, commit `27d9dd2` (godot-4.5-stable-30-g27d9dd2) |
 | `thirdparty/libpd` | `ba0dc63` (libpd 0.16.1, pd vanilla 0.56-5; pure-data submodule @ f009fd8) |
-| `thirdparty/portmidi` | `6be63b7` (v2.0.8-4-g6be63b7; compiled in on macOS/Linux, see `../patches/portmidi-upstream/`) |
-| `thirdparty/rtmidi` | `b8b2720` (upstream master `23b8cd5` + 3 local Android fixes, see below) |
+| `thirdparty/portmidi` | `6be63b7` (v2.0.8-4-g6be63b7; macOS/Linux **fallback** backend behind `MIDI_BACKEND=portmidi`, see `../patches/portmidi-upstream/`) |
+| `thirdparty/rtmidi` | `748eb75` (upstream master `23b8cd5` + 4 local fixes: Android sysex + JavaVM host hook + hotplug-test guard, see below) |
 
 ## Building
 
@@ -65,27 +65,37 @@ last called `libpd_set_instancedata`. Do not turn `PD_MULTI` off.
 > appears only in that worker's queue, and a routed A -> port -> B
 > fan-out reaches only B.
 
-## MIDI backends (v2 M1 + M2)
+## MIDI backends (v2 M1 + M2 + M3)
 
 MIDI I/O is owned **server-wide** by `LibpdServer` (not per instance) and
 runs on a single dedicated **MIDI I/O thread** (`MidiRouter`). All `libpd_*`
 calls stay on each instance's worker thread; all device writes
-(`PmWrite*` / RtMidi `sendMessage`) happen on the MIDI I/O thread; input
+(RtMidi `sendMessage` / `PmWrite*`) happen on the MIDI I/O thread; input
 callbacks only copy bytes into per-port rings and are drained on the I/O
 thread. Godot-facing events cross to the main thread as typed signals.
 
 The concrete backend is selected at build time by `src/midi_backend_factory.cpp`:
 
-| Platform | Backend | Source |
+| Platform | Backend (default) | Source |
 |---|---|---|
-| macOS / Linux | `PortMidiBackend` | vendored PortMIDI (`thirdparty/portmidi`) |
+| macOS | `RtMidiHostBackend` (CoreMIDI) | vendored RtMidi (`thirdparty/rtmidi`) |
+| Linux | `RtMidiHostBackend` (ALSA) | vendored RtMidi (`thirdparty/rtmidi`) |
 | Android | `RtMidiAndroidBackend` | vendored RtMidi, `ANDROID_AMIDI` API |
 
-Both implement the same godot-free `MidiBackend` interface
-(`src/midi_backend.h`), so the router and the GDScript API are identical
-across platforms. `tests/midi_backend_fake_tests.cpp` pins the interface
-contract (dual note+CC delivery, full-sysex command, raw framing,
-virtual-loopback round-trip).
+RtMidi is the default on **all** platforms (M3). PortMIDI remains
+buildable as a fallback for the macOS/Linux hosts via the CMake option
+`MIDI_BACKEND=portmidi` (restores the M1/M2 `PortMidiBackend`;
+`PortMidiBackend` is still the backend for that build). The router logs
+`[MIDI] backend=<name>` once at startup so a smoke run shows which backend
+is active.
+
+Both RtMidi backends (and PortMIDI) implement the same godot-free
+`MidiBackend` interface (`src/midi_backend.h`), so the router and the
+GDScript API are identical across platforms. `tests/midi_backend_fake_tests.cpp`
+pins the interface contract (dual note+CC delivery, full-sysex command,
+raw framing, virtual-loopback round-trip) and
+`tests/midi_rtmidi_host_backend_tests.cpp` covers the host backend's
+device-free surface (in-process loopback round-trip, sysex shape guards).
 
 ### Delivery model (option C)
 
@@ -97,12 +107,36 @@ instance is routed to.
 
 ### Sysex
 
-**Input-only.** Sysex arrives whole-message (the read stage reassembles
-`F0..F7` runs) and is surfaced as the typed `midi_sysex(port, data)`
-signal; there is **no** `[sysexout]`/sysex send in this libpd build, so the
-backend exposes a `write_sysex()` only for completeness (PortMidi hosts
-write it to the port; the GDScript API does not expose sysex send). A
-127-data-byte cap applies per message.
+**Input-only.** Sysex arrives whole-message — RtMidi reassembles `F0..F7`
+runs on every platform (recon-verified: a full 7-byte `F0..F7` round-trips
+on macOS IAC and on the A133 ALSA loopback) — and the read stage re-slices
+it into the `<=4`-byte words the raw path expects. It is surfaced as the
+typed `midi_sysex(port, data)` signal; there is **no** `[sysexout]`/sysex
+send in this libpd build, so the backend exposes a `write_sysex()` only for
+completeness (it writes the whole `F0..F7` to the port; the GDScript API
+does not expose sysex send). A 127-data-byte cap applies per message.
+
+### Host specifics (M3 — CoreMIDI / ALSA)
+
+- **Virtual ports are real.** `create_virtual_input/output` reserve an
+  internal index (300+) and `open` calls RtMidi's `openVirtualPort()`
+  (verified both directions on macOS and the A133 kernel 4.9). This is the
+  A133 loopback path: the app creates its own in+out ports, then an
+  external `aconnect` wires them.
+- **ALSA separate clients** — unlike PortMIDI (one client, two ports),
+  RtMidi registers the input and output virtual ports on **two separate**
+  snd_seq clients (both named `godot-libpd`). Read the actual client
+  numbers from `aconnect -l` each run and wire
+  `aconnect <out-client>:0 <in-client>:0`.
+- **Synchronous open** — `openPort()`/`openVirtualPort()` return with the
+  port live (no Android settle-wait).
+- **In-process loopback** — the host backend also implements the
+  device-free loopback pair (indices **200** in / **201** out, `WordRing`
+  backed) used by the host unit test; macOS uses IAC and the A133 uses
+  `aconnect` for real loopback.
+- **Fallback** — `MIDI_BACKEND=portmidi` (CMake) restores PortMIDI on
+  macOS/Linux; the default is RtMidi. The A133 `MIDI_SMOKE_OK` and macOS
+  IAC `MIDI_SMOKE_OK` gates pass on the RtMidi backend.
 
 ### Android specifics (M2)
 
@@ -116,11 +150,10 @@ write it to the port; the GDScript API does not expose sysex send). A
   backed by a `WordRing`. `LibpdServer.midi_create_loopback(name)`
   activates it; it then appears in `midi_list_inputs()`/`midi_list_outputs()`
   as `"<name> in"` / `"<name> out"` and is opened with the ordinary
-  `midi_open_input()`/`midi_open_output()`. On PortMidi hosts this is
-  unavailable (use IAC on macOS / `aconnect` on Linux).
-- **One RtMidi object per open port** — RtMidi's Android backend supports
-  exactly one open port per `RtMidiIn`/`RtMidiOut`; the backend keeps a
-  `unique_ptr` per handle so the input-callback pointer stays stable.
+  `midi_open_input()`/`midi_open_output()`.
+- **One RtMidi object per open port** — RtMidi supports exactly one open
+  port per `RtMidiIn`/`RtMidiOut` on every API; every RtMidi backend keeps
+  a `unique_ptr` per handle so the input-callback pointer stays stable.
 - **Async open** — `MidiManager.openDevice` is async with **no failure
   callback**, so an open is followed by a bounded settle-wait (300 ms) on
   the I/O thread; a failed open surfaces as silent non-delivery (documented
@@ -133,23 +166,38 @@ write it to the port; the GDScript API does not expose sysex send). A
   outside an `r-x` libart mapping). RtMidi's own `androidGetThreadEnv` reuses
   the result via the `gdpd_rtmidi_host_java_vm()` host hook. Full details:
   `../docs/android-build.md` → "How the extension gets a `JavaVM*`".
-- **Local RtMidi fixes** (submodule `b8b2720`, 3 commits on upstream
+- **Local RtMidi fixes** (submodule `748eb75`, 4 commits on upstream
   `23b8cd5`, to be folded into a future upstream PR alongside the PortMIDI
   patchset): multi-chunk sysex accumulation across `pollMidi` iterations
-  (`759d4e6`), and Android `JavaVM` resolution via the host resolver
-  (`9727ab6` superseded by `b8b2720`).
+  (`759d4e6`), Android `JavaVM` resolution via the host resolver
+  (`9727ab6` superseded by `b8b2720`), and guarding the ALSA hotplug
+  regression test behind `RTMIDI_BUILD_HOTPLUG_TEST` so embedders can skip
+  its build-time check (`748eb75`).
 
-### On-device verification status (M2)
+### On-device verification status (M2 + M3)
 
-Verified on an Android 14 arm64 device (Anbernic RK3568; the plan targeted
-the Retroid RG DS — same OS-level constraints): `MIDI_SMOKE_OK
-print=1 note=1 fanout=1` over the in-process loopback, including a
-second-instance (A -> loopback -> B) fan-out with per-instance print
-attribution; clean exit, zero crashes. **Sysex input and CC capture are not
-exercisable on a device with no MIDI hardware** (input-only sysex by
-design; CC needs a real controller) — the sysex reassembly logic is covered
-by the host read-stage tests and the CC path by the macOS IAC + MIDI-Learn
-flow (M1). Real-hardware I/O is a deferred milestone.
+- **Android (M2, Anbernic RK3568; M3 regression on Retroid RG DS):**
+  `MIDI_SMOKE_OK print=1 note=1 fanout=1` over the in-process loopback,
+  including a second-instance (A -> loopback -> B) fan-out with
+  per-instance print attribution; clean exit, zero crashes.
+- **macOS (M3, CoreMIDI):** `MIDI_SMOKE_OK print=1 note=1` over the IAC
+  bus, now driven by `RtMidiHostBackend` (`[MIDI] backend=RtMidi(CoreMIDI)`
+  in the smoke output).
+- **A133 (M3, ALSA kernel 4.9):** `note_on port=0 ch=0 pitch=60 vel=100`
+  looped through the app's own `openVirtualPort` in/out pair +
+  `aconnect <out>:0 <in>:0` (two separate `godot-libpd` clients);
+  negative test clean (unwired re-send produces no new `note_on`);
+  baseline `SMOKE_OK`. Full recipe: `../docs/knulli-build.md` →
+  "MIDI I/O (RtMidi — ALSA sequencer)".
+- **PortMIDI fallback (M3):** `MIDI_BACKEND=portmidi` builds and its macOS
+  IAC smoke reports `[MIDI] backend=PortMIDI` + `MIDI_SMOKE_OK`.
+
+**Sysex input and CC capture are not exercisable on a device with no MIDI
+hardware** (input-only sysex by design; CC needs a real controller) — the
+sysex reassembly logic is covered by the host read-stage tests and the CC
+path by the macOS IAC + MIDI-Learn flow (M1). Real-hardware I/O is a
+deferred milestone.
 
 See `../docs/superpowers/specs/2026-10-01-godot-libpd-android-midi-design.md`
-(status: implemented) and `../docs/superpowers/plans/2026-10-01-godot-libpd-android-midi.md`.
+(status: implemented), `../docs/superpowers/specs/2026-10-02-godot-libpd-rtmidi-full-design.md`
+(status: implemented), and their plans.
