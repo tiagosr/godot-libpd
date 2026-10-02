@@ -120,11 +120,13 @@ public:
 	explicit WordRing(int p_capacity) : cap_(p_capacity > 0 ? p_capacity : 1) {}
 
 	// The ring moves (InPort is stored by value in a map); copies
-	// are meaningless (mutex).
+	// are meaningless (mutex). Move ctor/assignment are implicitly
+	// deleted by the mutex member — mark them explicitly so the
+	// compiler does not warn (clang -Wdefaulted-function-deleted).
 	WordRing(const WordRing &) = delete;
 	WordRing &operator=(const WordRing &) = delete;
-	WordRing(WordRing &&) = default;
-	WordRing &operator=(WordRing &&) = default;
+	WordRing(WordRing &&) = delete;
+	WordRing &operator=(WordRing &&) = delete;
 
 	void push(uint32_t p_word) {
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -168,6 +170,11 @@ private:
 
 class RtMidiAndroidBackend : public MidiBackend {
 public:
+	// MidiBackend.
+	const char *backend_name() const override {
+		return "RtMidi(AMIDI)";
+	}
+
 	// Unified device indices for the in-process loopback pair
 	// (200 in / 201 out; real devices enumerate 0..N).
 	static constexpr int kLoopbackInputIndex = 200;

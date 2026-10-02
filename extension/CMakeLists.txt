@@ -40,10 +40,17 @@ set(PD_BUILD_C_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/libpd EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
-# PortMidi static (macOS/Linux; no Android — the RtMidi backend there)
+# PortMidi static (macOS/Linux fallback; no Android — the RtMidi backend
+# there). M3: OFF by default on hosts — the RtMidi host backend is the
+# default; set MIDI_BACKEND=portmidi to restore the M1/M2 build.
 # ---------------------------------------------------------------------------
+set(MIDI_BACKEND "rtmidi" CACHE STRING "Host MIDI backend: rtmidi | portmidi")
+set_property(CACHE MIDI_BACKEND PROPERTY STRINGS rtmidi portmidi)
 option(BUILD_PORTMIDI "Compile PortMIDI into the extension" ON)
 if(ANDROID)
+    set(BUILD_PORTMIDI OFF)
+endif()
+if(NOT ANDROID AND MIDI_BACKEND STREQUAL "rtmidi")
     set(BUILD_PORTMIDI OFF)
 endif()
 if(BUILD_PORTMIDI)
@@ -53,12 +60,35 @@ if(BUILD_PORTMIDI)
 endif()
 
 # ---------------------------------------------------------------------------
-# RtMidi static (Android only — the RtMidiAndroidBackend; the local
-# sysex fix is pinned at submodule commit 759d4e6)
+# RtMidi static. Android: the RtMidiAndroidBackend (AMIDI; the local
+# fixes are pinned at the submodule commit). Hosts (macOS/Linux): the
+# RtMidiHostBackend (M3 Task 1) — CoreMIDI on Apple, ALSA on Linux.
 # ---------------------------------------------------------------------------
+set(RTMIDI_HOST OFF)
 if(ANDROID)
     set(RTMIDI_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
     add_subdirectory(thirdparty/rtmidi EXCLUDE_FROM_ALL)
+elseif(NOT ANDROID AND MIDI_BACKEND STREQUAL "rtmidi")
+    set(RTMIDI_HOST ON)
+    set(RTMIDI_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    # Keep the RtMidi sub-tree quiet: no RtMidi demo/test programs, no
+    # install rules, no ALSA hotplug build-time check (those belong to
+    # RtMidi's own test suite, not to the extension build).
+    set(RTMIDI_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(RTMIDI_BUILD_HOTPLUG_TEST OFF CACHE BOOL "" FORCE)
+    set(RTMIDI_API_JACK OFF CACHE BOOL "" FORCE)
+    set(RTMIDI_API_WINMM OFF CACHE BOOL "" FORCE)
+    set(RTMIDI_API_AMIDI OFF CACHE BOOL "" FORCE)
+    if(APPLE)
+        set(RTMIDI_API_CORE ON CACHE BOOL "" FORCE)
+    else()
+        set(RTMIDI_API_ALSA ON CACHE BOOL "" FORCE)
+    endif()
+    add_subdirectory(thirdparty/rtmidi EXCLUDE_FROM_ALL)
+    # The static rtmidi archive must be position-independent: it links
+    # into the shared GDExtension. arm64 is strict about non-PIC input
+    # ("dangerous relocation" at link); force -fPIC on the target.
+    target_compile_options(rtmidi PRIVATE -fPIC)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -72,6 +102,7 @@ add_library(godot_libpd SHARED
     src/midi_router.cpp
     src/midi_backend_portmidi.cpp
     src/midi_backend_rtmidi.cpp
+    src/midi_backend_rtmidi_host.cpp
     src/midi_backend_factory.cpp
     src/core/pd_event_ring.cpp
     src/core/pd_command_queue.cpp
@@ -105,6 +136,21 @@ if(BUILD_PORTMIDI)
 endif()
 if(ANDROID)
     target_link_libraries(godot_libpd PRIVATE rtmidi)
+endif()
+if(RTMIDI_HOST)
+    target_link_libraries(godot_libpd PRIVATE rtmidi)
+    # The static rtmidi archive does not propagate its platform link
+    # requirements; the shared extension must carry them:
+    #   macOS : the CoreMIDI stack frameworks
+    #   Linux : libasound (ALSA sequencer)
+    if(APPLE)
+        target_link_libraries(godot_libpd PRIVATE
+            "-framework CoreMIDI" "-framework CoreAudio"
+            "-framework CoreFoundation" "-framework CoreServices")
+    else()
+        target_link_libraries(godot_libpd PRIVATE asound)
+    endif()
+    target_compile_definitions(godot_libpd PRIVATE RTMIDI_HOST_ENABLED)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -185,6 +231,33 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_include_directories(midi_rtmidi_seam_tests PRIVATE src)
     target_link_libraries(midi_rtmidi_seam_tests PRIVATE pthread)
     add_test(NAME midi_rtmidi_seam_tests COMMAND $<TARGET_FILE:midi_rtmidi_seam_tests>)
+
+    if(RTMIDI_HOST)
+        # v2 M3 Task 1: the RtMidi host backend (CoreMIDI/ALSA) — the
+        # in-process loopback round-trip (create_virtual_loopback ->
+        # open 200/201 -> write note + sysex -> poll words) is fully
+        # device-free; a host with no usable MIDI server (initialize()
+        # -> Unavailable) reports skip (exit 0) so headless CI stays
+        # green. Real-device legs: macOS IAC smoke + A133 aconnect
+        # (M3 Task 2).
+        add_executable(midi_rtmidi_host_backend_tests
+            tests/midi_rtmidi_host_backend_tests.cpp
+            src/midi_backend_rtmidi_host.cpp
+        )
+        target_include_directories(midi_rtmidi_host_backend_tests PRIVATE
+            src thirdparty/rtmidi)
+        target_link_libraries(midi_rtmidi_host_backend_tests PRIVATE
+            rtmidi pthread)
+        if(APPLE)
+            target_link_libraries(midi_rtmidi_host_backend_tests PRIVATE
+                "-framework CoreMIDI" "-framework CoreAudio"
+                "-framework CoreFoundation" "-framework CoreServices")
+        else()
+            target_link_libraries(midi_rtmidi_host_backend_tests PRIVATE asound)
+        endif()
+        add_test(NAME midi_rtmidi_host_backend_tests
+            COMMAND $<TARGET_FILE:midi_rtmidi_host_backend_tests>)
+    endif()
 
     if(BUILD_PORTMIDI)
         # Task 7: PortMIDI virtual device lifecycle (create -> open ->

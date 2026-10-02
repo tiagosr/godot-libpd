@@ -75,6 +75,11 @@ public:
 
 	virtual ~MidiBackend() = default;
 
+	// Human-readable backend identity ("RtMidi(CoreMIDI)", "PortMIDI",
+	// "RtMidi(AMIDI)") for the router's one-time startup log; not part
+	// of the I/O contract.
+	virtual const char *backend_name() const { return "unknown"; }
+
 	// True once the backend is initialized.
 	virtual bool available() const = 0;
 

@@ -26,6 +26,11 @@ public:
 	~PortMidiBackend() override = default;
 
 	// MidiBackend.
+	const char *backend_name() const override {
+		return "PortMIDI";
+	}
+
+	// MidiBackend.
 	bool available() const override;
 	MidiError initialize() override;
 	std::vector<MidiBackendPort> list_ports() const override;

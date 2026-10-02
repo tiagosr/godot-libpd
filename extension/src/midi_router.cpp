@@ -51,6 +51,11 @@ MidiRouter::MidiRouter(std::unique_ptr<MidiBackend> p_backend) :
 	if (backend_ == nullptr || backend_->initialize() != MidiError::OK) {
 		return;
 	}
+	// One-time identity log: the [MIDI] channel on stdout is the debug
+	// channel for headless smokes and the A133 adb console (M3 Task 1
+	// verification uses it to prove the smoke ran on RtMidi, not
+	// PortMIDI).
+	std::printf("[MIDI] backend=%s\n", backend_->backend_name());
 	{
 		std::lock_guard<std::mutex> lock(control_mutex_);
 		thread_running_ = true;
