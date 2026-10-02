@@ -43,6 +43,7 @@
 #include <deque>
 #include <future>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -316,6 +317,14 @@ public:
 	bool available() const;
 
 	/**
+	 * Set the hotplug re-enumeration cadence in seconds (M4; default 0.5).
+	 * Thread-safe: the I/O loop reads the atomic each tick. A smaller
+	 * value detects plug/unplug sooner at the cost of a more frequent
+	 * (cheap) list_ports() call.
+	 */
+	void set_poll_interval(double p_seconds);
+
+	/**
 	 * (backend device index, name) for every device with an input
 	 * (resp. output) side. Backend device indices are stable for the
 	 * process lifetime; the UI passes the chosen index to open_input/
@@ -443,6 +452,19 @@ public:
 	 */
 	std::function<void(int p_port_id, const char *p_what)> on_port_error;
 
+	/**
+	 * Hotplug port-change notification (M4). Fires on the MIDI I/O thread
+	 * when the periodic (or forced) re-enumeration detects a device
+	 * appearing (p_added == true) or disappearing (p_added == false).
+	 * p_kind is "input" or "output"; p_index is the current index (add)
+	 * or the last remembered index (remove); p_name is the port name
+	 * (valid during the call only — copy it).
+	 *
+	 * Re-entrancy contract (same as on_port_error): the bound function
+	 * MUST NOT call any MidiRouter method; enqueue to the main thread.
+	 */
+	std::function<void(bool p_added, const char *p_kind, int p_index, const char *p_name)> on_port_changed;
+
 private:
 	// ------------------------------------------------------------------
 	// Control queue (API thread -> I/O thread): open/close/shutdown ops
@@ -561,6 +583,19 @@ private:
 		MidiFramer framer;
 	};
 
+	// Hotplug diff key: (direction, name). Indices are volatile across
+	// device changes, so the diff keys by name, not index.
+	struct PortKey {
+		bool is_input = false;
+		std::string name;
+		bool operator<(const PortKey &o) const {
+			if (is_input != o.is_input) {
+				return is_input < o.is_input;
+			}
+			return name < o.name;
+		}
+	};
+
 	struct Port {
 		bool in_use = false;
 		bool is_input = false;
@@ -569,6 +604,14 @@ private:
 		// close_port/shutdown release it through MidiBackend::close /
 		// MidiBackend::shutdown (I/O thread only).
 		MidiBackend::PortHandle backend_handle = MidiBackend::NO_HANDLE;
+		// Hotplug (M4): true only for ports backed by an OS/device endpoint
+		// that can hot-plug (set in open_port from non_real_indices_). Only
+		// real_device ports are auto-closed by the diff; virtual/loopback
+		// are app-owned and never closed by it.
+		bool real_device = false;
+		// Backend port name captured at open time; used to match a removed
+		// (direction, name) key to this port (index is NOT used — volatile).
+		std::string device_name;
 		ByteRing ring; // input only: read stage -> framer stage
 		MidiReadStage read_stage; // input only: backend word -> stream bytes (sysex state)
 		PortInput *input = nullptr; // input only: owns framer + sink
@@ -625,6 +668,21 @@ private:
 	std::vector<MidiSignalEvent> signal_events_; // bounded, drop-oldest
 	int next_port_id_ = 0; // port ids are never reused (monotonic)
 
+	// Hotplug (M4) diff state — mutated ONLY on the I/O thread (except the
+	// atomic poll_interval_, which the API thread writes).
+	std::chrono::steady_clock::time_point last_reeum_;
+	// NOTE: last_reeum_ is set to the construction time in the constructor
+	// (before the I/O thread starts) so the FIRST re-enumeration tick is
+	// deferred by one poll interval — this gives the consumer time to bind
+	// on_port_changed before the startup (annotated) baseline fires. The
+	// default member init (time_point::min()) would otherwise fire the
+	// first tick immediately into an unbound callback.
+	std::atomic<double> poll_interval_ {0.5};
+	std::set<PortKey> seen_; // last-enumerated (direction, name) set
+	std::map<PortKey, int> last_index_; // remembered index per key (volatile)
+	bool pending_empty_ = false; // transient-empty debounce (2-consecutive-empty)
+	std::set<int> non_real_indices_; // virtual/loopback indices (never auto-closed)
+
 	// Raw-byte output framing per (instance, port): I/O thread only.
 	std::unordered_map<int64_t, std::unordered_map<int, RawRouteState>> raw_writers_;
 
@@ -646,6 +704,13 @@ private:
 	int open_virtual_port(bool p_is_input); // I/O thread
 	void close_port(int p_port_id); // I/O thread
 	void handle_poll_error(int p_port_id, MidiBackend::PollResult p_result); // I/O thread
+	// Hotplug (M4): re-enumerate + diff (I/O thread; called by io_loop and
+	// by the REFRESH control op). Returns the number of changed ports
+	// (added + removed).
+	int reenum_and_diff(); // I/O thread
+	// Close every open real_device port matching (direction, name), firing
+	// notify_port_error(pid, "device removed") for each (I/O thread).
+	void close_real_device_ports(bool p_is_input, const std::string &p_name); // I/O thread
 	void output_stage(); // I/O thread
 	// Return value: false after a failed backend write — for stream
 	// failures the port is already closed and unrouted (write_short /

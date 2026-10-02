@@ -70,20 +70,38 @@ uint32_t word(uint8_t b0, uint8_t b1 = 0, uint8_t b2 = 0, uint8_t b3 = 0) {
 
 class FakeBackend : public MidiBackend {
 public:
-	bool available() const override { return true; }
-	MidiError initialize() override { return MidiError::OK; }
-
-	std::vector<MidiBackendPort> list_ports() const override {
-		std::lock_guard<std::mutex> lock(mutex_);
-		std::vector<MidiBackendPort> out;
+	// Seeds the system device set with the default fake device (index 0,
+	// in+out) so the pre-existing tests that open kFakeDevice keep working.
+	// Hotplug tests override this with set_devices() before constructing
+	// their router.
+	FakeBackend() {
 		MidiBackendPort dev;
 		dev.index = kFakeDevice;
 		dev.name = "Fake Device";
 		dev.is_input = true;
 		dev.is_output = true;
-		out.push_back(dev);
-		for (int i = 0; i < (int)loopback_ports_.size(); ++i) {
-			out.push_back(loopback_ports_[i]);
+		devices_.push_back(dev);
+	}
+
+	bool available() const override { return true; }
+	MidiError initialize() override { return MidiError::OK; }
+
+	std::vector<MidiBackendPort> list_ports() const override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		// The system device set is mutable so the hotplug tests can simulate
+		// plug/unplug. empty_for_ simulates a transient empty enumeration
+		// (a bad probe tick) for a bounded number of consecutive calls.
+		if (empty_for_ > 0) {
+			--empty_for_;
+			return {};
+		}
+		std::vector<MidiBackendPort> out;
+		out.reserve(devices_.size() + loopback_ports_.size());
+		for (const auto &d : devices_) {
+			out.push_back(d);
+		}
+		for (const auto &d : loopback_ports_) {
+			out.push_back(d);
 		}
 		return out;
 	}
@@ -92,38 +110,47 @@ public:
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (p_index == kLoopbackIn) {
 			r_handle = loopback_in_handle_;
-			inputs_.insert(r_handle);
-			input_handles_in_order_.push_back(r_handle);
-			input_queues_[r_handle];
-			return MidiError::OK;
-		}
-		if (p_index == kFakeDevice) {
+		} else {
+			bool ok = false;
+			for (const auto &d : devices_) {
+				if (d.index == p_index && d.is_input) {
+					ok = true;
+					break;
+				}
+			}
+			if (!ok) {
+				last_error_ = "no such input port";
+				return MidiError::Failed;
+			}
 			r_handle = next_handle_++;
-			inputs_.insert(r_handle);
-			input_handles_in_order_.push_back(r_handle);
-			input_queues_[r_handle];
-			return MidiError::OK;
 		}
-		last_error_ = "no such input port";
-		return MidiError::Failed;
+		inputs_.insert(r_handle);
+		input_handles_in_order_.push_back(r_handle);
+		input_queues_[r_handle];
+		return MidiError::OK;
 	}
 
 	MidiError open_output(int p_index, int p_buffer, PortHandle &r_handle) override {
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (p_index == kLoopbackOut) {
 			r_handle = loopback_out_handle_;
-			outputs_.insert(r_handle);
-			output_handles_in_order_.push_back(r_handle);
-			return MidiError::OK;
-		}
-		if (p_index == kFakeDevice) {
+		} else {
+			bool ok = false;
+			for (const auto &d : devices_) {
+				if (d.index == p_index && d.is_output) {
+					ok = true;
+					break;
+				}
+			}
+			if (!ok) {
+				last_error_ = "no such output port";
+				return MidiError::Failed;
+			}
 			r_handle = next_handle_++;
-			outputs_.insert(r_handle);
-			output_handles_in_order_.push_back(r_handle);
-			return MidiError::OK;
 		}
-		last_error_ = "no such output port";
-		return MidiError::Failed;
+		outputs_.insert(r_handle);
+		output_handles_in_order_.push_back(r_handle);
+		return MidiError::OK;
 	}
 
 	PollResult poll_input(PortHandle p_handle, const WordPush &p_push) override {
@@ -182,6 +209,7 @@ public:
 
 	MidiError close(PortHandle p_handle) override {
 		std::lock_guard<std::mutex> lock(mutex_);
+		++close_calls_;
 		inputs_.erase(p_handle);
 		outputs_.erase(p_handle);
 		input_queues_.erase(p_handle);
@@ -240,6 +268,35 @@ public:
 	const std::vector<PortHandle> &open_inputs() const { return input_handles_in_order_; }
 	const std::vector<PortHandle> &open_outputs() const { return output_handles_in_order_; }
 
+	// Hotplug test helpers (M4). Replace / grow the system device set the
+	// way a USB plug/unplug would; set_empty_list_for simulates a
+	// transient empty enumeration (a bad probe tick) for the next n
+	// consecutive list_ports() calls.
+	void set_devices(std::vector<MidiBackendPort> p_devs) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		devices_ = std::move(p_devs);
+	}
+	void add_device(int p_index, const std::string &p_name, bool p_in, bool p_out) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		MidiBackendPort d;
+		std::vector<MidiBackendPort> nd = devices_;
+		d.index = p_index;
+		d.name = p_name;
+		d.is_input = p_in;
+		d.is_output = p_out;
+		nd.push_back(d);
+		devices_ = std::move(nd);
+	}
+	void set_empty_list_for(int p_n) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		empty_for_ = p_n;
+	}
+	// Count of close() calls — proves a router auto-close reached the backend.
+	int close_calls() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return close_calls_;
+	}
+
 private:
 	mutable std::mutex mutex_;
 	bool initialized_ = true;
@@ -252,6 +309,10 @@ private:
 	std::vector<std::vector<uint8_t>> writes_;
 	std::vector<std::vector<uint8_t>> sysex_writes_;
 	std::vector<MidiBackendPort> loopback_ports_;
+	// The mutable system device set (hotplug tests). Seeded in the ctor.
+	std::vector<MidiBackendPort> devices_;
+	int close_calls_ = 0;
+	mutable int empty_for_ = 0; // mutable: decremented in const list_ports()
 	// Loopback handles are fixed (assigned in create_virtual_loopback),
 	// so the test can address them directly.
 	PortHandle loopback_in_handle_ = -1;
@@ -271,6 +332,72 @@ bool wait_for(std::function<bool()> p_pred, int p_timeout_ms) {
 	}
 	return p_pred();
 }
+
+// Builds a MidiBackendPort for set_devices()/add_device().
+MidiBackendPort mport(int p_index, const char *p_name, bool p_in, bool p_out) {
+	MidiBackendPort p;
+	p.index = p_index;
+	p.name = p_name;
+	p.is_input = p_in;
+	p.is_output = p_out;
+	return p;
+}
+
+// Captures a router's on_port_changed + on_port_error for hotplug assertions.
+struct HotplugProbe {
+	mutable std::mutex m;
+	struct Ev {
+		bool added;
+		std::string kind;
+		int index;
+		std::string name;
+	};
+	struct Err {
+		int port_id;
+		std::string what;
+	};
+	std::vector<Ev> events;
+	std::vector<Err> errors;
+	void bind(MidiRouter &r) {
+		r.on_port_changed = [this](bool added, const char *kind, int index, const char *name) {
+			std::lock_guard<std::mutex> l(m);
+			events.push_back(Ev{added, kind, index, name});
+		};
+		r.on_port_error = [this](int port_id, const char *what) {
+			std::lock_guard<std::mutex> l(m);
+			errors.push_back(Err{port_id, what});
+		};
+	}
+	int count_added(const std::string &p_name) const {
+		std::lock_guard<std::mutex> l(m);
+		int n = 0;
+		for (const Ev &e : events) {
+			if (e.added && e.name == p_name) {
+				++n;
+			}
+		}
+		return n;
+	}
+	int count_removed(const std::string &p_name) const {
+		std::lock_guard<std::mutex> l(m);
+		int n = 0;
+		for (const Ev &e : events) {
+			if (!e.added && e.name == p_name) {
+				++n;
+			}
+		}
+		return n;
+	}
+	bool has_error(int p_port_id, const std::string &p_what) const {
+		std::lock_guard<std::mutex> l(m);
+		for (const Err &e : errors) {
+			if (e.port_id == p_port_id && e.what == p_what) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
 
 } // namespace
 
@@ -530,6 +657,157 @@ int main() {
 			router.forget_instance(3);
 			router.forget_instance(4);
 		}
+	}
+
+	// ------------------------------------------------------------------
+	// 7. Hotplug: I/O-thread re-enumeration + diff (M4 Task 1).
+	//    Each test uses its own fresh FakeBackend + MidiRouter so state
+	//    does not leak between them.
+	// ------------------------------------------------------------------
+
+	// 7.1 Startup annotation: everything present at init fires port_added.
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		owned->set_devices({mport(0, "A", true, false), mport(1, "B", false, true)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		bool ok = wait_for([&] { return probe.count_added("A") == 1 && probe.count_added("B") == 1; }, 500);
+		CHECK(ok);
+		CHECK(probe.count_added("A") == 1);
+		CHECK(probe.count_added("B") == 1);
+		r.shutdown();
+	}
+
+	// 7.2 Add diff: a port appearing mid-run fires exactly one port_added.
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, false)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		wait_for([&] { return probe.count_added("A") == 1; }, 500);
+		hp->add_device(2, "C", true, false);
+		bool ok = wait_for([&] { return probe.count_added("C") == 1; }, 500);
+		CHECK(ok);
+		CHECK(probe.count_added("C") == 1);
+		CHECK(probe.count_removed("A") == 0); // A still present
+		r.shutdown();
+	}
+
+	// 7.3 Remove diff + auto-close (non-empty list: some removed).
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, false), mport(1, "B", true, false)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		wait_for([&] { return probe.count_added("A") == 1 && probe.count_added("B") == 1; }, 500);
+		const int a_port = r.open_input(0); // open A (real device)
+		CHECK(a_port >= 0);
+		const int cc_before = hp->close_calls();
+		hp->set_devices({mport(1, "B", true, false)}); // remove A, keep B
+		bool ok = wait_for([&] { return probe.count_removed("A") == 1 && probe.has_error(a_port, "device removed"); }, 500);
+		CHECK(ok);
+		CHECK(probe.count_removed("A") == 1);
+		CHECK(probe.count_removed("B") == 0); // B survives
+		CHECK(probe.has_error(a_port, "device removed"));
+		CHECK(hp->close_calls() > cc_before); // backend stream closed
+		r.shutdown();
+	}
+
+	// 7.4 Index shift: a removal re-indexes a survivor; name-keyed diff must
+	//     NOT spuriously remove the survivor or close its port.
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, false), mport(1, "C", true, false)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		wait_for([&] { return probe.count_added("A") == 1 && probe.count_added("C") == 1; }, 500);
+		const int c_port = r.open_input(1); // open C (index 1)
+		CHECK(c_port >= 0);
+		hp->set_devices({mport(0, "C", true, false)}); // A gone; C shifts to 0
+		bool a_removed = wait_for([&] { return probe.count_removed("A") == 1; }, 500);
+		CHECK(a_removed);
+		CHECK(probe.count_removed("C") == 0); // C NOT removed (name-keyed)
+		CHECK(!probe.has_error(c_port, "device removed")); // C port not closed
+		r.shutdown();
+	}
+
+	// 7.5 Transient-empty blip: one empty enumeration then recovery is ignored
+	//     (no removal, no auto-close).
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, true)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		wait_for([&] { return probe.count_added("A") == 1; }, 500);
+		const int in_port = r.open_input(0);
+		CHECK(in_port >= 0);
+		const int cc_before = hp->close_calls();
+		hp->set_empty_list_for(1); // exactly one bad (empty) tick
+		std::this_thread::sleep_for(std::chrono::milliseconds(120)); // let it resolve
+		CHECK(probe.count_removed("A") == 0); // blip ignored
+		CHECK(!probe.has_error(in_port, "device removed"));
+		CHECK(hp->close_calls() == cc_before); // port not closed
+		r.shutdown();
+	}
+
+	// 7.6 Confirm empty (only device unplugged, stays gone): the debounce
+	//     confirms on the 2nd consecutive empty tick -> removed + auto-close.
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, false)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		wait_for([&] { return probe.count_added("A") == 1; }, 500);
+		const int in_port = r.open_input(0);
+		const int cc_before = hp->close_calls();
+		hp->set_devices({}); // A unplugged and stays gone
+		bool ok = wait_for([&] { return probe.count_removed("A") == 1 && probe.has_error(in_port, "device removed"); }, 500);
+		CHECK(ok);
+		CHECK(probe.count_removed("A") == 1);
+		CHECK(probe.has_error(in_port, "device removed"));
+		CHECK(hp->close_calls() > cc_before);
+		r.shutdown();
+	}
+
+	// 7.7 Virtual/loopback not auto-closed: a real device is removed while the
+	//     in-process loopback (non-real) stays listed; only the real port closes.
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, false)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(0.02);
+		wait_for([&] { return probe.count_added("A") == 1; }, 500);
+		r.create_virtual_loopback("LB");
+		const int lb_in = r.open_input(kLoopbackIn);
+		CHECK(lb_in >= 0);
+		const int a_port = r.open_input(0); // open the real device A
+		CHECK(a_port >= 0);
+		hp->set_devices({}); // A gone; the loopback stays in list_ports
+		bool ok = wait_for([&] { return probe.count_removed("A") == 1; }, 500);
+		CHECK(ok);
+		CHECK(probe.has_error(a_port, "device removed")); // real device auto-closed
+		CHECK(!probe.has_error(lb_in, "device removed")); // loopback NOT auto-closed
+		r.shutdown();
 	}
 
 	router.shutdown();

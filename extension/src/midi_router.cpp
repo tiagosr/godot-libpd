@@ -56,6 +56,12 @@ MidiRouter::MidiRouter(std::unique_ptr<MidiBackend> p_backend) :
 	// verification uses it to prove the smoke ran on RtMidi, not
 	// PortMIDI).
 	std::printf("[MIDI] backend=%s\n", backend_->backend_name());
+	// Hotplug (M4): defer the first re-enumeration tick by one poll
+	// interval so the consumer (the server, or a test) has time to bind
+	// on_port_changed before the startup annotation fires. Set this before
+	// the thread starts so the first io_loop tick does not use the header's
+	// time_point::min() initializer (which would fire immediately).
+	last_reeum_ = std::chrono::steady_clock::now();
 	{
 		std::lock_guard<std::mutex> lock(control_mutex_);
 		thread_running_ = true;
@@ -316,6 +322,19 @@ void MidiRouter::io_loop() {
 		}
 		// Stage 3 — output: drain instance queues into routed ports.
 		output_stage();
+		// Stage 4 — hotplug re-enumeration + diff (M4): time-gated by the
+		// poll interval. The first tick is immediate (last_reeum_ starts at
+		// time_point_min), which is what makes the startup baseline
+		// annotated. All backend port ops + the diff run on this thread.
+		{
+			const auto now = std::chrono::steady_clock::now();
+			const double interval = poll_interval_.load();
+			if (now - last_reeum_ >=
+					std::chrono::milliseconds((long)(interval * 1000.0))) {
+				reenum_and_diff();
+				last_reeum_ = now;
+			}
+		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 	// Exit: close every remaining backend stream on this thread, then
@@ -393,13 +412,33 @@ bool MidiRouter::process_control_ops() {
 					result = -1;
 				}
 				break;
-			case ControlOpType::CREATE_LOOPBACK:
-				result = (backend_->create_virtual_loopback(op.name) ==
-							MidiError::OK)
-						? 0
-						: -1;
-				if (result != 0) {
-					notify_port_error(-1, backend_->last_error().c_str());
+			case ControlOpType::CREATE_LOOPBACK: {
+				// Hotplug (M4): the loopback ports are in-process (non-real).
+				// Snapshot the index set before/after creation and mark any
+				// newly-appearing indices non-real so the diff never auto-closes
+				// them (they stay listed until shutdown).
+				auto index_set = [this] {
+					std::set<int> s;
+					for (const auto &p : backend_->list_ports()) {
+						s.insert(p.index);
+					}
+					return s;
+				};
+				const std::set<int> before = index_set();
+				const bool ok =
+						backend_->create_virtual_loopback(op.name) == MidiError::OK;
+					if (ok) {
+						for (int idx : index_set()) {
+							if (!before.count(idx)) {
+								non_real_indices_.insert(idx);
+							}
+						}
+						result = 0;
+					} else {
+						notify_port_error(-1, backend_->last_error().c_str());
+						result = -1;
+					}
+					break;
 				}
 				break;
 			case ControlOpType::CLOSE_INPUT:
@@ -432,6 +471,17 @@ int MidiRouter::open_port(bool p_is_input, int p_device_index) {
 			port->in_use = true;
 			port->is_input = p_is_input;
 			port->backend_handle = handle;
+			// Hotplug (M4): capture the device name (for the (direction,name)
+			// diff match) and the real_device flag (false for indices the
+			// router knows are virtual/loopback, so they are never auto-closed).
+			port->real_device = non_real_indices_.count(p_device_index) == 0;
+			for (const auto &d : backend_->list_ports()) {
+				if (d.index == p_device_index &&
+						(p_is_input ? d.is_input : d.is_output)) {
+					port->device_name = d.name;
+					break;
+				}
+			}
 			if (p_is_input) {
 				port->input = new PortInput(this, port_id);
 			}
@@ -461,6 +511,9 @@ int MidiRouter::open_virtual_port(bool p_is_input) {
 		notify_port_error(-1, backend_->last_error().c_str());
 		return -1;
 	}
+	// Hotplug (M4): the created virtual device is app-owned, not an OS
+	// endpoint — mark its index non-real so the diff never auto-closes it.
+	non_real_indices_.insert(device_index);
 	return open_port(p_is_input, device_index);
 }
 
@@ -525,6 +578,82 @@ void MidiRouter::close_port(int p_port_id) {
 	// Drop this port's raw-byte framing state (I/O-thread-only map).
 	for (auto &kv : raw_writers_) {
 		kv.second.erase(p_port_id);
+	}
+}
+
+void MidiRouter::set_poll_interval(double p_seconds) {
+	poll_interval_.store(p_seconds);
+}
+
+int MidiRouter::reenum_and_diff() {
+	const std::vector<MidiBackendPort> ports = backend_->list_ports();
+	// Build the current (direction, name) -> index map. A device that has
+	// both sides yields two keys (one per direction).
+	std::map<PortKey, int> current;
+	for (const auto &p : ports) {
+		if (p.is_input) {
+			current[PortKey{true, p.name}] = p.index;
+		}
+		if (p.is_output) {
+			current[PortKey{false, p.name}] = p.index;
+		}
+	}
+	// Transient-empty debounce: an empty enumeration is only trusted after
+	// two consecutive empty ticks — a bad probe tick must not close live
+	// ports, yet a genuine "only device unplugged" must still be caught.
+	if (current.empty() && !seen_.empty() && !pending_empty_) {
+		pending_empty_ = true;
+		return 0;
+	}
+	pending_empty_ = false;
+	int changes = 0;
+	// Adds: in current, not in seen_. Fire with the current index.
+	for (const auto &kv : current) {
+		if (seen_.count(kv.first) == 0) {
+			const char *kind = kv.first.is_input ? "input" : "output";
+			if (on_port_changed) {
+				on_port_changed(true, kind, kv.second, kv.first.name.c_str());
+			}
+			++changes;
+		}
+	}
+	// Removals: in seen_, not in current (if current is empty, this is all).
+	for (const PortKey &key : seen_) {
+		if (current.count(key) == 0) {
+			const int remembered = last_index_.count(key) ? last_index_[key] : -1;
+			const char *kind = key.is_input ? "input" : "output";
+			if (on_port_changed) {
+				on_port_changed(false, kind, remembered, key.name.c_str());
+			}
+			++changes;
+			close_real_device_ports(key.is_input, key.name);
+		}
+	}
+	// Update state (I/O thread only).
+	seen_.clear();
+	last_index_.clear();
+	for (const auto &kv : current) {
+		seen_.insert(kv.first);
+		last_index_[kv.first] = kv.second;
+	}
+	return changes;
+}
+
+void MidiRouter::close_real_device_ports(bool p_is_input, const std::string &p_name) {
+	std::vector<int> pids;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (auto &kv : ports_) {
+			Port &p = *kv.second;
+			if (p.in_use && p.is_input == p_is_input && p.real_device &&
+					p.device_name == p_name) {
+				pids.push_back(kv.first);
+			}
+		}
+	}
+	for (int pid : pids) {
+		close_port(pid);
+		notify_port_error(pid, "device removed");
 	}
 }
 
