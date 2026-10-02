@@ -1,30 +1,39 @@
 #pragma once
 
-// Task 4 — MidiRouter: PortMIDI integration, the MIDI I/O thread, and the
-// running-status writer for raw [midiout] byte streams.
+// Task 4 — MidiRouter: the MIDI I/O thread, and the running-status
+// writer for raw [midiout] byte streams.
 //
 // Pinned interface: .superpowers/sdd/2026-09-30-godot-libpd-midi/
 // task-4-brief.md. Design: docs/superpowers/specs/
 // 2026-09-30-godot-libpd-midi-design.md (§1 sysex input-only, §3 threads,
 // §5 dual command delivery, §6 output mapping, §7 lifecycle).
 //
-// PortMIDI 2.0.7 API note (the vendored API differs from the brief's
-// illustrative names; full mapping in task-4-report.md):
-//   - input: poll Pm_Read(PmEvent*) on the MIDI I/O thread (~1 ms);
-//     PmEvent.message is a plain "up to 4 bytes, low byte first" word
-//     with NO long-event flag (the vendored backend never sets
-//     0xFF000000): short events start at byte 0; sysex arrives as an
-//     F0-first run of words terminated by an F7 that zero-pads the rest
-//     of its word — the per-port MidiReadStage re-assembles the words
-//     into raw stream bytes before the framer frames them;
-//   - output: full-form short messages as PmMessage words via
-//     Pm_WriteShort(stream, 0, Pm_Message(status, d1, d2));
-//   - errors: PmError codes, Pm_GetErrorText, and per-stream async host
-//     errors via Pm_HasHostError / Pm_GetHostErrorText.
-// The MIDI I/O thread is the only code that touches PortMidiStream
-// handles, so no Pm_* call ever leaves midi_router.cpp.
+// v2 M2 Task 1: all platform MIDI calls live behind the MidiBackend
+// interface (midi_backend.h) — PortMidiBackend on macOS/Linux (the
+// Pm_* logic extracted from this file), the Android RtMidi backend in
+// a later task. The router is backend-agnostic: it owns routing state,
+// the rings, the I/O thread, and the API, and talks to the backend
+// through the interface only. The platform backend is built by
+// create_midi_backend() (midi_backend_portmidi.cpp); tests inject a
+// fake backend through the constructor.
+//
+// Word layout (inherited from the vendored PortMIDI 2.0.7, now the
+// interface contract in midi_backend.h): PmEvent.message is a plain
+// "up to 4 bytes, low byte first" word with NO long-event flag (the
+// vendored backend never sets 0xFF000000): short events start at byte
+// 0; sysex arrives as an F0-first run of words terminated by an F7
+// that zero-pads the rest of its word — the per-port MidiReadStage
+// re-assembles the words into raw stream bytes before the framer
+// frames them. Output: full-form short messages as {status, d1, d2}
+// byte triples handed to MidiBackend::write (PortMidi maps them to
+// Pm_Message words).
+// The MIDI I/O thread is the only code that touches open backend
+// handles, so no backend port operation ever leaves the I/O thread.
 
 #ifdef PORTMIDI_ENABLED
+// Kept for midi_open_bounds_tests.cpp, which includes only this
+// header and calls Pm_CountDevices() directly. The router itself no
+// longer touches Pm_* (that is PortMidiBackend's job).
 #include <portmidi.h>
 #endif
 
@@ -46,6 +55,7 @@
 #include "core/midi_routing_table.h"
 #include "core/pd_command_queue.h"
 #include "core/pd_midi_framer.h"
+#include "midi_backend.h"
 
 namespace godot_libpd {
 
@@ -67,17 +77,16 @@ struct MidiSignalEvent {
 /**
  * Per-port sysex read-stage state machine (pinned Task 4 interface,
  * reworked for the vendored PortMIDI word layout — see file header).
- * Pure: no PortMIDI, no threads, fixed state, allocation-free —
+ * Pure: no platform MIDI, no threads, fixed state, allocation-free —
  * trivially testable (tests/midi_read_stage_tests.cpp).
  *
- * The vendored backend delivers PmEvent.message as a plain
- * little-endian "up to 4 bytes, low byte first" word — NO long-event
- * flag: short events start at byte 0 (status + 0-2 data bytes, zero
- * padding after); sysex arrives as a run of words where the first word
- * has F0 in byte 0, continuation words carry up to 4 data bytes, and
- * the final word carries F7 at byte k with zero padding after it (the
- * backend enqueues the word at F7 and resets, so the padding is always
- * zero in practice).
+ * The backend delivers words as plain little-endian "up to 4 bytes,
+ * low byte first" — NO long-event flag: short events start at byte 0
+ * (status + 0-2 data bytes, zero padding after); sysex arrives as a
+ * run of words where the first word has F0 in byte 0, continuation
+ * words carry up to 4 data bytes, and the final word carries F7 at
+ * byte k with zero padding after it (the backend enqueues the word at
+ * F7 and resets, so the padding is always zero in practice).
  *
  * feed() converts one word into raw stream bytes and pushes them via
  * p_push in wire order; the router wires p_push to the per-port
@@ -95,7 +104,7 @@ struct MidiReadStage {
 	bool in_sysex = false;
 
 	/**
-	 * Feed one PmEvent word (low byte first); the resulting stream bytes
+	 * Feed one backend word (low byte first); the resulting stream bytes
 	 * are pushed via p_push (e.g. ByteRing::push) in wire order.
 	 */
 	template <typename Fn>
@@ -206,8 +215,8 @@ private:
 
 /**
  * Running-status writer for raw [midiout] byte streams (pinned Task 4
- * behavior). Pure: no PortMIDI, no threads, no state beyond the writer —
- * trivially testable (tests/midi_writer_tests.cpp).
+ * behavior). Pure: no platform MIDI, no threads, no state beyond the
+ * writer — trivially testable (tests/midi_writer_tests.cpp).
  *
  * feed() takes one byte of the raw stream and returns the 0 or 1 wire
  * bytes produced for it:
@@ -218,12 +227,13 @@ private:
  *     (a repeated F8 is e.g. a MIDI clock tick — every tick goes out);
  *   - data bytes (0x00..0x7F) are always emitted;
  *   - F0 starts a (dropped) sysex sequence: F0..F7 are swallowed until
- *     the F7 (input-only sysex, spec §1 — there is no sysex output path);
+ *     the F7 (input-only sysex, spec §1 — there is no sysex output path
+ *     on the raw-byte route; full sysex goes out via MidiOutMsg::SYSEX);
  *   - a non-F0/F7 status byte inside a sysex terminates the truncated
  *     sequence and is then treated as an ordinary status byte.
  *
  * Message boundaries are NOT tracked here; the router (midi_router.cpp)
- * frames complete PmMessage words for Pm_WriteShort on top of this.
+ * frames complete messages for MidiBackend::write on top of this.
  */
 struct MidiOutWriter {
 	std::vector<uint8_t> feed(uint8_t p_byte) {
@@ -269,60 +279,86 @@ private:
 /**
  * The process-wide MIDI router (one instance per process, owned by the
  * Godot extension server — Task 5/6). A dedicated MIDI I/O thread owns
- * all PortMIDI streams; the main thread talks to it through the public
- * methods, all of which are thread-safe. Open/close requests run on the
- * I/O thread via a control queue; the calling thread waits at most 500
- * ms and a timeout is surfaced through on_port_error (spec §3/§7).
+ * all backend port handles; the main thread talks to it through the
+ * public methods, all of which are thread-safe. Open/close requests
+ * run on the I/O thread via a control queue; the calling thread waits
+ * at most 500 ms and a timeout is surfaced through on_port_error
+ * (spec §3/§7).
  */
 class MidiRouter {
 public:
+	/**
+	 * Default construction: the platform backend from
+	 * create_midi_backend() (PortMidi on macOS/Linux, nullptr on the
+	 * stub/Android hosts — see midi_backend_portmidi.cpp). If the
+	 * backend initializes, the I/O thread starts; otherwise the router
+	 * degrades to the inert stub (available() false, opens fail).
+	 */
 	MidiRouter();
+	/**
+	 * Construction with an injected backend (test seam — e.g. the
+	 * in-process fake backend in tests/midi_backend_fake.cpp). Same
+	 * init + I/O-thread semantics as the default constructor.
+	 */
+	explicit MidiRouter(std::unique_ptr<MidiBackend> p_backend);
 	~MidiRouter();
 
 	MidiRouter(const MidiRouter &) = delete;
 	MidiRouter &operator=(const MidiRouter &) = delete;
 
 	/**
-	 * True when PortMIDI initialized. The device list may legitimately
-	 * be empty (A133: the ALSA sequencer exists but exposes no
-	 * SUBS-capable ports) — open_virtual_input()/open_virtual_output()
-	 * still work, so "available" means "PM backend usable", not
-	 * "at least one device exists".
+	 * True when the MIDI backend initialized. The device list may
+	 * legitimately be empty (A133: the ALSA sequencer exists but
+	 * exposes no SUBS-capable ports) — open_virtual_input()/
+	 * open_virtual_output() still work, so "available" means "backend
+	 * usable", not "at least one device exists".
 	 */
 	bool available() const;
 
 	/**
-	 * (pm_device_index, name) for every device with an input (resp.
-	 * output) side. PM device indices are stable for the process
-	 * lifetime; the UI passes the chosen index to open_input/
+	 * (backend device index, name) for every device with an input
+	 * (resp. output) side. Backend device indices are stable for the
+	 * process lifetime; the UI passes the chosen index to open_input/
 	 * open_output.
 	 */
 	std::vector<std::pair<int, std::string>> list_inputs() const;
 	std::vector<std::pair<int, std::string>> list_outputs() const;
 
 	/**
-	 * Open PM device p_pm_index as a router input (resp. output) port.
-	 * Returns the new router port id (>= 0) or -1 on failure (unknown
-	 * device, PM error, open timeout, PortMIDI unavailable). The open
-	 * itself runs on the MIDI I/O thread — PM streams are touched there
-	 * exclusively; this call waits at most 500 ms and is safe from the
-	 * main thread.
+	 * Open backend device p_pm_index as a router input (resp. output)
+	 * port. Returns the new router port id (>= 0) or -1 on failure
+	 * (unknown device, backend error, open timeout, backend
+	 * unavailable). The open itself runs on the MIDI I/O thread —
+	 * backend streams are touched there exclusively; this call waits at
+	 * most 500 ms and is safe from the main thread.
 	 */
 	int open_input(int p_pm_index);
 	int open_output(int p_pm_index);
 
 	/**
-	 * Create an app-owned PM virtual device (ALSA: an snd_seq virtual
-	 * port on the PM client, visible to aconnect; CoreMIDI: a virtual
-	 * endpoint) and open it as a router input (resp. output) port.
-	 * Returns the new router port id (>= 0) or -1 on failure (create
-	 * error, PM error, open timeout, PortMIDI unavailable). The virtual
-	 * device is removed (Pm_DeleteVirtualDevice) when the port closes
+	 * Create an app-owned backend virtual device (ALSA: an snd_seq
+	 * virtual port on the backend client, visible to aconnect;
+	 * CoreMIDI: a virtual endpoint) and open it as a router input
+	 * (resp. output) port. Returns the new router port id (>= 0) or -1
+	 * on failure (create error, backend error, open timeout, backend
+	 * unavailable). The virtual device is removed when the port closes
 	 * (close_port) or at shutdown. Same I/O-thread + 500 ms timeout
 	 * semantics as open_input/open_output.
 	 */
 	int open_virtual_input();
 	int open_virtual_output();
+
+	/**
+	 * Create the backend's in-process virtual loopback (design spec
+	 * §3): one input port and one output port wired together, reported
+	 * by list_inputs()/list_outputs() under the given name (+" in" /
+	 * +" out"). Opens of the returned loopback then go through the
+	 * ordinary open_input()/open_output() with the listed device
+	 * indices. Returns 0 on success, -1 on failure (backend error /
+	 * timeout; the PortMidi backend always fails — use IAC/aconnect
+	 * there). Same I/O-thread + 500 ms timeout semantics.
+	 */
+	int create_virtual_loopback(const std::string &p_name);
 
 	/**
 	 * Close router port p_port_id (runs on the I/O thread via the
@@ -361,8 +397,9 @@ public:
 	void drain_signal_events(std::vector<MidiSignalEvent> &r_out);
 
 	/**
-	 * Close every open port, Pm_Terminate, and stop the I/O thread.
-	 * Idempotent; called from the destructor and from server deinit.
+	 * Close every open port, shut down the backend, and stop the I/O
+	 * thread. Idempotent; called from the destructor and from server
+	 * deinit.
 	 */
 	void shutdown();
 
@@ -390,11 +427,13 @@ public:
 
 	/**
 	 * Port-level errors (approved extra member beyond the pinned
-	 * interface): (port_id, what), where `what` is Pm_GetErrorText /
-	 * host-error text or a short router message, valid during the call
-	 * only (do not store the pointer). Fired on the MIDI I/O thread; the
-	 * open/close timeout paths fire it from the calling thread. Task 5
-	 * binds this to the midi_port_error(port_id, what) signal.
+	 * interface): (port_id, what), where `what` is backend error text
+	 * (PortMidi: Pm_GetErrorText / host-error text, composed by the
+	 * backend including the " (pm device N)" open suffix) or a short
+	 * router message, valid during the call only (do not store the
+	 * pointer). Fired on the MIDI I/O thread; the open/close timeout
+	 * paths fire it from the calling thread. Task 5 binds this to the
+	 * midi_port_error(port_id, what) signal.
 	 * port_id is -1 for router-level errors (failed open, timeout).
 	 *
 	 * Re-entrancy contract (enforced by Task 5 binding discipline, not
@@ -413,11 +452,14 @@ private:
 	enum class ControlOpType {
 		OPEN_INPUT,
 		OPEN_OUTPUT,
-		// I/O thread creates the PM virtual device first, then opens the
-		// returned device id (the id is only known after creation, so
-		// these ops cannot reuse OPEN_*'s pm_index parameter).
+		// I/O thread creates the backend virtual device first, then
+		// opens the returned device id (the id is only known after
+		// creation, so these ops cannot reuse OPEN_*'s pm_index
+		// parameter).
 		OPEN_VIRTUAL_INPUT,
 		OPEN_VIRTUAL_OUTPUT,
+		// Backend in-process loopback (name travels with the op).
+		CREATE_LOOPBACK,
 		CLOSE_INPUT,
 		CLOSE_OUTPUT,
 		SHUTDOWN,
@@ -425,8 +467,9 @@ private:
 
 	struct ControlOp {
 		ControlOpType op = ControlOpType::SHUTDOWN;
-		int pm_index = -1; // OPEN_*: PM device index
+		int pm_index = -1; // OPEN_*: backend device index
 		int port_id = -1; // CLOSE_*: router port id
+		std::string name; // CREATE_LOOPBACK: loopback port name
 		// Set by the API side when its 500 ms wait expired before the op
 		// finished; a late open success then self-closes the port.
 		std::shared_ptr<std::atomic<bool>> abandoned;
@@ -440,7 +483,8 @@ private:
 		std::future<int> result;
 	};
 
-	ControlHandle enqueue_control(ControlOpType p_op, int p_pm_index, int p_port_id);
+	ControlHandle enqueue_control(ControlOpType p_op, int p_pm_index, int p_port_id,
+				const std::string &p_name = "");
 
 	// ------------------------------------------------------------------
 	// Per-port state. Port records live in ports_ for the router's
@@ -450,10 +494,10 @@ private:
 
 	/**
 	 * Bounded raw-byte ring for one input port (spec §3 "bounded
-	 * everywhere"). The Pm_Read stage pushes; the framer stage drains
+	 * everywhere"). The poll stage pushes; the framer stage drains
 	 * fully within the same I/O loop iteration (same thread). On
 	 * overflow the OLDEST byte is dropped (cannot happen in practice:
-	 * one Pm_Read batch is <= 128 bytes against a 4096 cap).
+	 * one poll batch is <= 128 bytes against a 4096 cap).
 	 */
 	struct ByteRing {
 		static constexpr int CAP = 4096;
@@ -520,18 +564,13 @@ private:
 	struct Port {
 		bool in_use = false;
 		bool is_input = false;
-		int pm_index = -1;
-		// This port created its PM virtual device (open_virtual_*): the
-		// device must be Pm_DeleteVirtualDevice'd after the stream
-		// closes (close_port / io_loop exit). Pm_Close alone does not
-		// remove it (ALSA keeps virtual ports open on purpose — the
-		// port IS the device).
-		bool pm_device_owned = false;
-#ifdef PORTMIDI_ENABLED
-		PortMidiStream *pm_stream = nullptr;
-#endif
+		// Open backend stream (MidiBackend::open_*). The backend owns
+		// the stream and any virtual device it created for this port;
+		// close_port/shutdown release it through MidiBackend::close /
+		// MidiBackend::shutdown (I/O thread only).
+		MidiBackend::PortHandle backend_handle = MidiBackend::NO_HANDLE;
 		ByteRing ring; // input only: read stage -> framer stage
-		MidiReadStage read_stage; // input only: PmEvent word -> stream bytes (sysex state)
+		MidiReadStage read_stage; // input only: backend word -> stream bytes (sysex state)
 		PortInput *input = nullptr; // input only: owns framer + sink
 	};
 
@@ -539,8 +578,8 @@ private:
 	 * Raw-byte output framing state per (instance, port) route. I/O
 	 * thread only (raw_writers_ is touched exclusively there). Mirrors
 	 * the MidiOutWriter sysex state independently so message completion
-	 * can be tracked for Pm_WriteShort (which requires a full-form
-	 * status byte; running-status input is re-expanded here).
+	 * can be tracked for MidiBackend::write (which requires full-form
+	 * status bytes; running-status input is re-expanded here).
 	 */
 	struct RawRouteState {
 		MidiOutWriter writer;
@@ -556,11 +595,20 @@ private:
 	// Members
 	// ------------------------------------------------------------------
 
+	// The platform MIDI backend (PortMidi on macOS/Linux; nullptr in
+	// stub builds and on Android until the RtMidi backend lands). The
+	// router holds it for its lifetime; the I/O thread owns all port
+	// operations on it, the API thread calls only the const
+	// list_ports()/available() methods. backend_->last_error() is
+	// read on the I/O thread only (backend contract).
+	std::unique_ptr<MidiBackend> backend_;
+
 	// Guards: ports_, instances_, out_port_instances_, signal_events_,
-	// next_port_id_. No Pm_* call is ever made while a router lock is
-	// held (PM drivers never re-enter router code; keeping the critical
-	// sections tight also avoids API-thread stalls). Port records and
-	// raw_writers_ are mutated exclusively on the I/O thread.
+	// next_port_id_. No backend call is made while a router lock is
+	// held (backend calls take their own locks, which may block on the
+	// I/O thread; keeping the critical sections tight also avoids
+	// API-thread stalls). Port records and raw_writers_ are mutated
+	// exclusively on the I/O thread.
 	std::mutex mutex_;
 	std::unordered_map<int, std::unique_ptr<Port>> ports_;
 	struct InstanceOut {
@@ -586,28 +634,7 @@ private:
 	bool thread_running_ = false;
 	bool thread_done_ = false;
 	std::deque<ControlOp> control_queue_;
-
-#ifdef PORTMIDI_ENABLED
-	bool pm_initialized_ = false; // Pm_Initialize result (constructor)
-	// PortMIDI is NOT thread-safe (portmidi.h: "you cannot allow threads
-	// to call PortMidi functions concurrently"). Held around EVERY Pm_*
-	// call on both the API thread and the I/O thread; the ~1 ms poll
-	// makes contention negligible. notify_port_error (user callback) is
-	// never invoked while this lock is held.
-	mutable std::mutex pm_api_mutex_;
-#endif
 	std::thread io_thread_;
-
-#ifdef PORTMIDI_ENABLED
-	// Runs p_fn holding pm_api_mutex_ (see above). Every Pm_* call on
-	// both threads goes through this; user callbacks are invoked only
-	// after the lock is released.
-	template <typename Fn>
-	auto with_pm_mutex(Fn &&p_fn) const -> decltype(p_fn()) {
-		std::lock_guard<std::mutex> lock(pm_api_mutex_);
-		return p_fn();
-	}
-#endif
 
 	// ------------------------------------------------------------------
 	// I/O thread
@@ -615,24 +642,26 @@ private:
 
 	void io_loop();
 	bool process_control_ops(); // true -> exit the loop (shutdown handled)
-	int open_port(bool p_is_input, int p_pm_index); // I/O thread
+	int open_port(bool p_is_input, int p_device_index); // I/O thread
 	int open_virtual_port(bool p_is_input); // I/O thread
 	void close_port(int p_port_id); // I/O thread
-	void handle_read_error(int p_port_id, int p_err); // I/O thread
+	void handle_poll_error(int p_port_id, MidiBackend::PollResult p_result); // I/O thread
 	void output_stage(); // I/O thread
-#ifdef PORTMIDI_ENABLED
-	// Return value: false after a failed Pm_WriteShort — the port is
-	// already closed and unrouted (write_short ran close_port); the
-	// caller must stop writing to that stream and drop the rest of the
-	// batch (writing to a closed stream is UB).
-	bool deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
+	// Return value: false after a failed backend write — for stream
+	// failures the port is already closed and unrouted (write_short /
+	// write_sysex_msg ran close_port); the caller must stop writing to
+	// that port and drop the rest of the batch (writing to a closed
+	// stream would be UB).
+	bool deliver_out_msg(MidiBackend::PortHandle p_handle, int p_port_id,
 			std::unordered_map<int, RawRouteState> &p_writers,
 			const MidiOutMsg &p_msg); // I/O thread
-	bool raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
+	bool raw_byte_to_stream(MidiBackend::PortHandle p_handle, int p_port_id,
 			std::unordered_map<int, RawRouteState> &p_writers,
 			uint8_t p_byte); // I/O thread
-	bool write_short(PortMidiStream *p_stream, int p_port_id, PmMessage p_msg); // I/O thread
-#endif
+	bool write_short(MidiBackend::PortHandle p_handle, int p_port_id,
+			uint8_t p_status, uint8_t p_d1, uint8_t p_d2); // I/O thread
+	bool write_sysex_msg(MidiBackend::PortHandle p_handle, int p_port_id,
+			const std::vector<uint8_t> &p_sysex); // I/O thread
 
 	Port *port_ptr(int p_port_id);
 

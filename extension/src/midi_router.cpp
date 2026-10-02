@@ -1,8 +1,15 @@
-// Task 4 — MidiRouter implementation: PortMIDI integration, the MIDI I/O
-// thread, and the output path (MidiOutWriter-based raw-byte framing +
-// full-form Pm_WriteShort words). See midi_router.h for the pinned
-// interface and thread invariants; task-4-report.md for the mapping from
-// the brief's illustrative PortMIDI names to the vendored 2.0.7 API.
+// Task 4 — MidiRouter implementation: the MIDI I/O thread and the
+// output path (MidiOutWriter-based raw-byte framing + full-form short
+// messages, handed to the platform backend as byte triples). See
+// midi_router.h for the pinned interface and thread invariants;
+// task-4-report.md for the mapping from the brief's illustrative
+// PortMIDI names to the vendored 2.0.7 API.
+//
+// v2 M2 Task 1: this file no longer touches Pm_* — all platform MIDI
+// calls go through the MidiBackend interface (midi_backend.h),
+// implemented by PortMidiBackend on macOS/Linux and (later) the
+// Android RtMidi backend. The lock discipline carries over: no
+// backend call is ever made while a router lock is held.
 
 #include "midi_router.h"
 
@@ -14,22 +21,14 @@ namespace godot_libpd {
 
 namespace {
 
-constexpr int32_t kPmBufferEvents = 256; // Pm_Open* bufferSize (brief: "queue, 256")
-constexpr int32_t kPmReadBatch = 32; // Pm_Read events per poll (~1 ms loop)
+constexpr int kMidiBufferEvents = 256; // open_* buffer size (brief: "queue, 256")
 constexpr int kSignalRingCap = 1024; // input signal ring cap (drop-oldest)
 constexpr int kControlTimeoutMs = 500; // open/close wait budget (spec §3/§7)
-#ifdef PORTMIDI_ENABLED
 // App-created virtual port names (Task 7 on-device recipe: the A133 ALSA
 // sequencer exposes no SUBS-capable ports, so the app must create its own;
-// aconnect -l shows exactly these names on the PM client).
+// aconnect -l shows exactly these names on the backend client).
 constexpr const char *kVirtualInName = "libpd test app in 0";
 constexpr const char *kVirtualOutName = "libpd test app out 0";
-#endif
-
-#ifdef PORTMIDI_ENABLED
-// (raw_data_need moved to MidiReadStage in midi_router.h — pure and
-// unit-tested there; it must mirror the vendored pm_midi_length table.)
-#endif
 
 } // namespace
 
@@ -37,24 +36,26 @@ constexpr const char *kVirtualOutName = "libpd test app out 0";
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-MidiRouter::MidiRouter() {
-#ifdef PORTMIDI_ENABLED
-	// Pm_Initialize must run on one consistent thread, and this router is
-	// the process's only PortMIDI user, so initialization happens here
-	// (main thread, Godot startup) and Pm_Terminate runs exactly once at
-	// the I/O thread's exit (shutdown path) — the object's lifetime
-	// bounds all PM use (macOS same-thread requirement). If
-	// Pm_Initialize fails: no I/O thread; available() stays false and
-	// open_* fail cleanly.
-	pm_initialized_ = with_pm_mutex([] { return Pm_Initialize(); }) == pmNoError;
-	if (pm_initialized_) {
-		{
-			std::lock_guard<std::mutex> lock(control_mutex_);
-			thread_running_ = true;
-		}
-		io_thread_ = std::thread(&MidiRouter::io_loop, this);
+MidiRouter::MidiRouter() :
+	MidiRouter(create_midi_backend()) {
+}
+
+MidiRouter::MidiRouter(std::unique_ptr<MidiBackend> p_backend) :
+	backend_(std::move(p_backend)) {
+	// A nullptr backend (stub / pre-RtMidi Android) or a failed
+	// initialize() means no I/O thread: available() stays false and
+	// open_* fail cleanly — the same inert-stub behavior the pre-v2
+	// stub builds had. The backend initializes on the main thread
+	// (Godot startup); its shutdown runs exactly once at the I/O
+	// thread's exit (the io_loop exit path below).
+	if (backend_ == nullptr || backend_->initialize() != MidiError::OK) {
+		return;
 	}
-#endif
+	{
+		std::lock_guard<std::mutex> lock(control_mutex_);
+		thread_running_ = true;
+	}
+	io_thread_ = std::thread(&MidiRouter::io_loop, this);
 }
 
 MidiRouter::~MidiRouter() {
@@ -62,55 +63,39 @@ MidiRouter::~MidiRouter() {
 }
 
 bool MidiRouter::available() const {
-#ifdef PORTMIDI_ENABLED
-	// "Available" = PM backend initialized, NOT "at least one device":
+	// "Available" = backend initialized, NOT "at least one device":
 	// the A133 enumerates zero devices (its ALSA ports carry no
 	// SUBS_READ/SUBS_WRITE capability bits) yet open_virtual_*/
-	// Pm_CreateVirtual* still work there — the virtual ports are the
+	// create_virtual_* still work there — the virtual ports are the
 	// point.
-	return pm_initialized_;
-#else
-	return false;
-#endif
+	return backend_ != nullptr && backend_->available();
 }
 
 std::vector<std::pair<int, std::string>> MidiRouter::list_inputs() const {
 	std::vector<std::pair<int, std::string>> out;
-#ifdef PORTMIDI_ENABLED
-	if (pm_initialized_) {
-		// No Pm_CountInputDevices in 2.0.7: enumerate all devices and
-		// filter by the input side of PmDeviceInfo.
-		with_pm_mutex([&] {
-			for (int id = 0; id < Pm_CountDevices(); ++id) {
-				const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
-				if (info != nullptr && info->input != 0) {
-					out.emplace_back(id, info->name != nullptr ? info->name : "");
-				}
+	if (backend_ != nullptr) {
+		// No CountInputDevices on any platform backend: list all
+		// devices and filter by the input side.
+		const std::vector<MidiBackendPort> ports = backend_->list_ports();
+		for (const MidiBackendPort &port : ports) {
+			if (port.is_input) {
+				out.emplace_back(port.index, port.name);
 			}
-		});
+		}
 	}
-#else
-	(void)this;
-#endif
 	return out;
 }
 
 std::vector<std::pair<int, std::string>> MidiRouter::list_outputs() const {
 	std::vector<std::pair<int, std::string>> out;
-#ifdef PORTMIDI_ENABLED
-	if (pm_initialized_) {
-		with_pm_mutex([&] {
-			for (int id = 0; id < Pm_CountDevices(); ++id) {
-				const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
-				if (info != nullptr && info->output != 0) {
-					out.emplace_back(id, info->name != nullptr ? info->name : "");
-				}
+	if (backend_ != nullptr) {
+		const std::vector<MidiBackendPort> ports = backend_->list_ports();
+		for (const MidiBackendPort &port : ports) {
+			if (port.is_output) {
+				out.emplace_back(port.index, port.name);
 			}
-		});
+		}
 	}
-#else
-	(void)this;
-#endif
 	return out;
 }
 
@@ -119,10 +104,10 @@ std::vector<std::pair<int, std::string>> MidiRouter::list_outputs() const {
 // ---------------------------------------------------------------------------
 
 MidiRouter::ControlHandle MidiRouter::enqueue_control(ControlOpType p_op, int p_pm_index,
-		int p_port_id) {
+		int p_port_id, const std::string &p_name) {
 	std::lock_guard<std::mutex> lock(control_mutex_);
 	if (!thread_running_) {
-		return ControlHandle{}; // no I/O thread (stub build, or PM init failed)
+		return ControlHandle{}; // no I/O thread (stub build, or init failed)
 	}
 	auto abandoned = std::make_shared<std::atomic<bool>>(false);
 	auto done = std::make_shared<std::promise<int>>();
@@ -130,6 +115,7 @@ MidiRouter::ControlHandle MidiRouter::enqueue_control(ControlOpType p_op, int p_
 	op.op = p_op;
 	op.pm_index = p_pm_index;
 	op.port_id = p_port_id;
+	op.name = p_name;
 	op.abandoned = abandoned;
 	op.done = done;
 	control_queue_.push_back(std::move(op));
@@ -197,6 +183,23 @@ int MidiRouter::open_virtual_output() {
 	return handle.result.get();
 }
 
+int MidiRouter::create_virtual_loopback(const std::string &p_name) {
+	ControlHandle handle =
+			enqueue_control(ControlOpType::CREATE_LOOPBACK, -1, -1, p_name);
+	if (!handle.result.valid()) {
+		return -1; // no I/O thread (stub build, or init failed)
+	}
+	if (handle.result.wait_for(std::chrono::milliseconds(kControlTimeoutMs)) !=
+			std::future_status::ready) {
+		// A late creation is harmless (the loopback owns no system
+		// resource; it is listed until shutdown), but report the
+		// timeout like the other control ops.
+		notify_port_error(-1, "midi loopback create timed out");
+		return -1;
+	}
+	return handle.result.get();
+}
+
 void MidiRouter::close_input(int p_port_id) {
 	ControlHandle handle = enqueue_control(ControlOpType::CLOSE_INPUT, -1, p_port_id);
 	if (!handle.result.valid()) {
@@ -223,7 +226,7 @@ void MidiRouter::close_output(int p_port_id) {
 void MidiRouter::shutdown() {
 	std::unique_lock<std::mutex> lock(control_mutex_);
 	if (!thread_running_) {
-		return; // idempotent; no thread (stub build, or PM init failed)
+		return; // idempotent; no thread (stub build, or init failed)
 	}
 	thread_running_ = false;
 	ControlOp op;
@@ -236,9 +239,9 @@ void MidiRouter::shutdown() {
 	control_cv_.wait_for(lock, std::chrono::milliseconds(kControlTimeoutMs),
 			[this] { return thread_done_; });
 	if (!thread_done_) {
-		// A wedged PM driver can hold the thread; surface it per spec §3
-		// and join anyway (v1 platforms deliver output immediately, so
-		// this is a documented residual risk, not the expected path).
+		// A wedged MIDI driver can hold the thread; surface it per spec
+		// §3 and join anyway (v1 platforms deliver output immediately,
+		// so this is a documented residual risk, not the expected path).
 		std::fprintf(stderr,
 				"godot-libpd: MIDI I/O thread did not exit within %d ms; "
 				"joining anyway\n",
@@ -255,69 +258,52 @@ void MidiRouter::shutdown() {
 // ---------------------------------------------------------------------------
 
 void MidiRouter::io_loop() {
-#ifdef PORTMIDI_ENABLED
-	PmEvent events[kPmReadBatch];
+	// A live backend is guaranteed here: the thread is only started
+	// when backend_->initialize() succeeded (constructor).
 	for (;;) {
 		if (process_control_ops()) {
 			break; // SHUTDOWN handled: exit path closes everything
 		}
-		// Snapshot the open input ports (stream pointers are valid for
+		// Snapshot the open input ports (port records are valid for
 		// the whole loop: ports are only opened/closed on this thread).
-		std::vector<int> input_ports;
+		std::vector<std::pair<int, Port *>> input_ports;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			for (auto &kv : ports_) {
 				if (kv.second->in_use && kv.second->is_input &&
-						kv.second->pm_stream != nullptr) {
-					input_ports.push_back(kv.first);
+						kv.second->backend_handle != MidiBackend::NO_HANDLE) {
+					input_ports.emplace_back(kv.first, kv.second.get());
 				}
 			}
 		}
-		// Stage 1 — read: Pm_Read into the per-port rings. The per-port
-		// MidiReadStage converts each flagless 4-byte PmEvent word into
-		// raw stream bytes (sysex re-assembly); message framing stays in
-		// the framer stage below.
-		for (int pid : input_ports) {
-			Port *port = port_ptr(pid);
-			if (port == nullptr || port->pm_stream == nullptr) {
+		// Stage 1 — read: backend poll into the per-port rings. The
+		// per-port MidiReadStage converts each flagless 4-byte word
+		// into raw stream bytes (sysex re-assembly); message framing
+		// stays in the framer stage below.
+		for (const auto &entry : input_ports) {
+			const int pid = entry.first;
+			Port *port = entry.second;
+			const MidiBackend::PollResult result = backend_->poll_input(
+					port->backend_handle, [&](uint32_t word) {
+						port->read_stage.feed(word, [&](uint8_t byte) {
+							port->ring.push(byte);
+						});
+					});
+			if (result != MidiBackend::PollResult::OK) {
+				handle_poll_error(pid, result);
 				continue;
-			}
-			PortMidiStream *stream = port->pm_stream;
-			const int n = with_pm_mutex([&] {
-				return Pm_Read(stream, events, kPmReadBatch);
-			});
-			if (n < 0) {
-				handle_read_error(pid, n);
-				continue;
-			}
-			for (int i = 0; i < n; ++i) {
-				port->read_stage.feed(events[i].message, [&](uint8_t byte) {
-					port->ring.push(byte);
-				});
 			}
 			// Asynchronous host-error check (same loop, per stream).
-			const int host_err = with_pm_mutex([&] {
-				return Pm_HasHostError(stream);
-			});
-			if (host_err != 0) {
-				// Pm_GetHostErrorText fills the caller's buffer (void);
-				// the message is best-effort when a host error is set.
-				char buf[256] = "";
-				// Text gathered under the PM lock; notify_port_error
-				// (user callback) fires after the lock is released.
-				const char *text = with_pm_mutex([&] {
-					Pm_GetHostErrorText(buf, sizeof(buf));
-					return buf[0] != '\0' ? buf
-							: Pm_GetErrorText(static_cast<PmError>(host_err));
-				});
-				notify_port_error(pid, text);
+			std::string text;
+			if (backend_->has_host_error(port->backend_handle, text)) {
+				notify_port_error(pid, text.c_str());
 			}
 		}
 		// Stage 2 — frame + fan out (same thread, same iteration as the
 		// read above; no parsing ever happens off this thread).
-		for (int pid : input_ports) {
-			Port *port = port_ptr(pid);
-			if (port == nullptr || port->input == nullptr) {
+		for (const auto &entry : input_ports) {
+			Port *port = entry.second;
+			if (port->input == nullptr) {
 				continue;
 			}
 			MidiFramer &framer = port->input->framer;
@@ -327,33 +313,26 @@ void MidiRouter::io_loop() {
 		output_stage();
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
-	// Exit: close every remaining stream on this thread, then release PM.
-	std::vector<PortMidiStream *> streams;
-	std::vector<int> owned_devices;
+	// Exit: close every remaining backend stream on this thread, then
+	// release the backend (close streams -> delete owned virtual
+	// devices -> terminate, exactly once — the backend knows its own
+	// ordering).
+	std::vector<MidiBackend::PortHandle> handles;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto &kv : ports_) {
 			Port &p = *kv.second;
-			if (p.in_use && p.pm_stream != nullptr) {
-				streams.push_back(p.pm_stream);
-				if (p.pm_device_owned) {
-					owned_devices.push_back(p.pm_index);
-				}
+			if (p.in_use && p.backend_handle != MidiBackend::NO_HANDLE) {
+				handles.push_back(p.backend_handle);
 				p.in_use = false;
-				p.pm_stream = nullptr;
+				p.backend_handle = MidiBackend::NO_HANDLE;
 			}
 		}
 	}
-	with_pm_mutex([&] {
-		for (PortMidiStream *s : streams) {
-			Pm_Close(s); // best effort
-		}
-		// Virtual devices the app created: delete after their streams are
-		// closed (Pm_DeleteVirtualDevice refuses an open device).
-		for (int d : owned_devices) {
-			Pm_DeleteVirtualDevice(d); // best effort
-		}
-	});
+	for (const MidiBackend::PortHandle h : handles) {
+		backend_->close(h); // best effort
+	}
+	backend_->shutdown();
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto &kv : ports_) {
@@ -364,15 +343,6 @@ void MidiRouter::io_loop() {
 			}
 		}
 	}
-	if (pm_initialized_) {
-		with_pm_mutex([] { Pm_Terminate(); }); // exactly once; this router
-		// is the process's only PortMIDI user, so its lifetime bounds
-		// PM use.
-	}
-#else
-	// Stub build: the I/O thread never starts (no PM), nothing to do.
-	(void)0;
-#endif
 	{
 		std::lock_guard<std::mutex> lock(control_mutex_);
 		thread_done_ = true;
@@ -412,10 +382,19 @@ bool MidiRouter::process_control_ops() {
 			case ControlOpType::OPEN_VIRTUAL_OUTPUT:
 				result = open_virtual_port(op.op == ControlOpType::OPEN_VIRTUAL_INPUT);
 				if (result >= 0 && op.abandoned != nullptr && op.abandoned->load()) {
-					// Same late-success cleanup as OPEN_*; close_port also
-					// deletes the owned virtual device.
+					// Same late-success cleanup as OPEN_*; close_port
+					// also deletes the owned virtual device (backend).
 					close_port(result);
 					result = -1;
+				}
+				break;
+			case ControlOpType::CREATE_LOOPBACK:
+				result = (backend_->create_virtual_loopback(op.name) ==
+							MidiError::OK)
+						? 0
+						: -1;
+				if (result != 0) {
+					notify_port_error(-1, backend_->last_error().c_str());
 				}
 				break;
 			case ControlOpType::CLOSE_INPUT:
@@ -431,38 +410,15 @@ bool MidiRouter::process_control_ops() {
 	return false;
 }
 
-int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
-#ifdef PORTMIDI_ENABLED
-	PortMidiStream *stream = nullptr;
-	// Validate the index AND open under the same pm_api_mutex_ scope
-	// (A133 freeze repro): the device list can shrink between the
-	// caller's list_*() and this open, and the vendored Pm_OpenInput
-	// (unlike Pm_OpenOutput) has no bounds check — an out-of-range
-	// index read pm_descriptors OOB (UB: the A133 freeze). The 2.0.7
-	// index space is 0..Pm_CountDevices()-1 (there is no
-	// Pm_CountInput/OutputDevices); the side check keeps the existing
-	// pmInvalidDeviceId rejection for a device without the requested
-	// side. Out-of-range falls into the open-failure path below
-	// (error text + port_error signal + clean -1 return).
-	// latency 0: deliver output immediately, no timestamp handling
-	// (time_proc null -> PM's own time source; irrelevant at latency 0).
-	PmError err = with_pm_mutex([&] {
-		if (p_pm_index < 0 || p_pm_index >= Pm_CountDevices()) {
-			return pmInvalidDeviceId;
-		}
-		const PmDeviceInfo *info = Pm_GetDeviceInfo(p_pm_index);
-		if (info == nullptr ||
-				(p_is_input ? info->input == 0 : info->output == 0)) {
-			return pmInvalidDeviceId;
-		}
-		if (p_is_input) {
-			return Pm_OpenInput(&stream, p_pm_index, nullptr, kPmBufferEvents,
-					nullptr, nullptr);
-		}
-		return Pm_OpenOutput(&stream, p_pm_index, nullptr, kPmBufferEvents,
-					nullptr, nullptr, 0);
-	});
-	if (err == pmNoError) {
+int MidiRouter::open_port(bool p_is_input, int p_device_index) {
+	// The backend validates the index and opens under one lock scope
+	// (A133 freeze repro — see PortMidiBackend::open_stream); the
+	// router just maps the backend handle onto a new port record.
+	MidiBackend::PortHandle handle = MidiBackend::NO_HANDLE;
+	const MidiError err = p_is_input
+			? backend_->open_input(p_device_index, kMidiBufferEvents, handle)
+			: backend_->open_output(p_device_index, kMidiBufferEvents, handle);
+	if (err == MidiError::OK) {
 		int port_id = -1;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
@@ -470,8 +426,7 @@ int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
 			auto port = std::make_unique<Port>();
 			port->in_use = true;
 			port->is_input = p_is_input;
-			port->pm_index = p_pm_index;
-			port->pm_stream = stream;
+			port->backend_handle = handle;
 			if (p_is_input) {
 				port->input = new PortInput(this, port_id);
 			}
@@ -479,116 +434,52 @@ int MidiRouter::open_port(bool p_is_input, int p_pm_index) {
 		}
 		return port_id;
 	}
-	// Error text gathered under the PM lock; the user callback fires
-	// after it is released.
-	const std::string text = with_pm_mutex(
-			[&] { return std::string(Pm_GetErrorText(err)); }) + " (pm device " +
-		std::to_string(p_pm_index) + ")";
-	notify_port_error(-1, text.c_str());
+	// The backend composed the full error text (including the
+	// " (pm device N)" suffix on PortMidi); the user callback fires
+	// without any lock held.
+	notify_port_error(-1, backend_->last_error().c_str());
 	return -1;
-#else
-	(void)p_is_input;
-	(void)p_pm_index;
-	return -1;
-#endif
 }
 
 int MidiRouter::open_virtual_port(bool p_is_input) {
-#ifdef PORTMIDI_ENABLED
 	// Create the virtual device first, then open the returned device id
-	// through the same open path as index-based opens (sysDepInfo null,
-	// latency 0, same kPmBufferEvents). The device id is only known
-	// after creation, which is why this runs on the I/O thread as its
-	// own control op. On success the port owns the device: close_port /
-	// the io_loop exit delete it after the stream closes.
-	const int device_id = with_pm_mutex([&] {
-		return p_is_input
-				? Pm_CreateVirtualInput(kVirtualInName, nullptr, nullptr)
-				: Pm_CreateVirtualOutput(kVirtualOutName, nullptr, nullptr);
-	});
-	if (device_id < 0) {
-		// Error text gathered under the PM lock; the user callback fires
-		// after it is released.
-		const std::string text = with_pm_mutex(
-				[&] { return std::string(Pm_GetErrorText(static_cast<PmError>(
-							device_id))); });
-		notify_port_error(-1, text.c_str());
+	// through the same open path as index-based opens. The device id is
+	// only known after creation, which is why this runs on the I/O
+	// thread as its own control op. On success the backend tracks the
+	// device's ownership: close_port / the io_loop exit delete it
+	// after the stream closes; a failed open deletes it (no leak).
+	int device_index = -1;
+	const MidiError err = p_is_input
+			? backend_->create_virtual_input(kVirtualInName, device_index)
+			: backend_->create_virtual_output(kVirtualOutName, device_index);
+	if (err != MidiError::OK) {
+		notify_port_error(-1, backend_->last_error().c_str());
 		return -1;
 	}
-	PortMidiStream *stream = nullptr;
-	PmError err;
-	if (p_is_input) {
-		err = with_pm_mutex([&] {
-			return Pm_OpenInput(&stream, device_id, nullptr, kPmBufferEvents,
-					nullptr, nullptr);
-		});
-	} else {
-		err = with_pm_mutex([&] {
-			return Pm_OpenOutput(&stream, device_id, nullptr, kPmBufferEvents,
-					nullptr, nullptr, 0);
-		});
-	}
-	if (err != pmNoError) {
-		// Do not leak the just-created device.
-		with_pm_mutex([&] {
-			Pm_DeleteVirtualDevice(device_id);
-		});
-		const std::string text = with_pm_mutex(
-				[&] { return std::string(Pm_GetErrorText(err)); }) +
-				" (pm device " + std::to_string(device_id) + ")";
-		notify_port_error(-1, text.c_str());
-		return -1;
-	}
-	{
-		std::lock_guard<std::mutex> lock(mutex_);
-		int port_id = next_port_id_++;
-		auto port = std::make_unique<Port>();
-		port->in_use = true;
-		port->is_input = p_is_input;
-		port->pm_index = device_id;
-		port->pm_stream = stream;
-		port->pm_device_owned = true;
-		if (p_is_input) {
-			port->input = new PortInput(this, port_id);
-		}
-		ports_[port_id] = std::move(port);
-		return port_id;
-	}
-#else
-	(void)p_is_input;
-	return -1;
-#endif
+	return open_port(p_is_input, device_index);
 }
 
 void MidiRouter::close_port(int p_port_id) {
-#ifdef PORTMIDI_ENABLED
-	PortMidiStream *stream = nullptr;
+	MidiBackend::PortHandle handle = MidiBackend::NO_HANDLE;
 	bool is_input = false;
-	int owned_device = -1;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto it = ports_.find(p_port_id);
 		if (it == ports_.end() || !it->second->in_use) {
 			return; // unknown port, or already closed
 		}
-		stream = it->second->pm_stream;
+		handle = it->second->backend_handle;
 		is_input = it->second->is_input;
-		owned_device = it->second->pm_device_owned ? it->second->pm_index : -1;
 	}
-	if (stream != nullptr) {
-		// Best effort; the stream is ours (I/O thread).
-		with_pm_mutex([&] {
-			Pm_Close(stream);
-		});
-	}
-	// App-created virtual device: delete it now that the stream is
-	// closed. Pm_Close alone does not remove it (ALSA's alsa_in_close
-	// keeps virtual ports open on purpose — the port IS the device),
-	// and Pm_DeleteVirtualDevice refuses an open device.
-	if (owned_device >= 0) {
-		with_pm_mutex([&] {
-			Pm_DeleteVirtualDevice(owned_device);
-		});
+	// Close the backend stream (this thread owns it); if the port
+	// created a virtual device, the backend deletes it after the
+	// stream closes. Pm_Close alone does not remove it (ALSA's
+	// alsa_in_close keeps virtual ports open on purpose — the port IS
+	// the device), and Pm_DeleteVirtualDevice refuses an open device.
+	// No router lock is held for the backend call (lock discipline,
+	// midi_router.h).
+	if (handle != MidiBackend::NO_HANDLE) {
+		backend_->close(handle);
 	}
 	// Auto-unroute the port (spec §7: close stops the port, unroutes it).
 	if (is_input) {
@@ -616,7 +507,7 @@ void MidiRouter::close_port(int p_port_id) {
 		if (it != ports_.end()) {
 			Port &p = *it->second;
 			p.in_use = false;
-			p.pm_stream = nullptr;
+			p.backend_handle = MidiBackend::NO_HANDLE;
 			p.ring.reset();
 			p.read_stage.reset();
 			if (p.input != nullptr) {
@@ -630,18 +521,14 @@ void MidiRouter::close_port(int p_port_id) {
 	for (auto &kv : raw_writers_) {
 		kv.second.erase(p_port_id);
 	}
-#else
-	(void)p_port_id;
-#endif
 }
 
-void MidiRouter::handle_read_error(int p_port_id, int p_err) {
-#ifdef PORTMIDI_ENABLED
-	if (p_err == pmBufferOverflow) {
-		// PM flushed its input buffer on overflow. Drop the partial ring
-		// and reset the framer so no torn message is decoded; keep the
-		// port open (per Pm_Read's docs, ordinary processing resumes as
-		// soon as a new message arrives).
+void MidiRouter::handle_poll_error(int p_port_id, MidiBackend::PollResult p_result) {
+	if (p_result == MidiBackend::PollResult::BUFFER_OVERFLOW) {
+		// The backend flushed its input buffer on overflow. Drop the
+		// partial ring and reset the framer so no torn message is
+		// decoded; keep the port open (per Pm_Read's docs, ordinary
+		// processing resumes as soon as a new message arrives).
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			auto it = ports_.find(p_port_id);
@@ -653,20 +540,15 @@ void MidiRouter::handle_read_error(int p_port_id, int p_err) {
 				}
 			}
 		}
-		notify_port_error(p_port_id,
-			with_pm_mutex([] { return Pm_GetErrorText(pmBufferOverflow); }));
+		notify_port_error(p_port_id, backend_->last_error().c_str());
 		return;
 	}
-	// pmDeviceRemoved / pmHostError / anything else: the port is dead —
-	// drop the handle, unroute, and notify.
-	const std::string text = with_pm_mutex(
-			[&] { return std::string(Pm_GetErrorText(static_cast<PmError>(p_err))); });
+	// FATAL (pmDeviceRemoved / pmHostError / anything else): the port
+	// is dead — drop the handle, unroute, and notify. The backend
+	// composed the error text during the poll.
+	const std::string text = backend_->last_error();
 	close_port(p_port_id);
 	notify_port_error(p_port_id, text.c_str());
-#else
-	(void)p_port_id;
-	(void)p_err;
-#endif
 }
 
 MidiRouter::Port *MidiRouter::port_ptr(int p_port_id) {
@@ -680,7 +562,6 @@ MidiRouter::Port *MidiRouter::port_ptr(int p_port_id) {
 // ---------------------------------------------------------------------------
 
 void MidiRouter::output_stage() {
-#ifdef PORTMIDI_ENABLED
 	std::vector<int64_t> instance_ids;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -722,45 +603,44 @@ void MidiRouter::output_stage() {
 			port_ids = out_routes_.ports_for_instance(instance);
 		}
 		for (int port_id : port_ids) {
-			PortMidiStream *stream = nullptr;
+			MidiBackend::PortHandle handle = MidiBackend::NO_HANDLE;
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				auto pit = ports_.find(port_id);
 				if (pit != ports_.end() && pit->second->in_use &&
-						pit->second->pm_stream != nullptr) {
-					stream = pit->second->pm_stream;
+						pit->second->backend_handle != MidiBackend::NO_HANDLE) {
+					handle = pit->second->backend_handle;
 				}
 			}
-			if (stream == nullptr) {
+			if (handle == MidiBackend::NO_HANDLE) {
 				continue; // port closed in the meantime: drop the messages
 			}
 			// No router lock during delivery: ports_ and raw_writers_
-			// are I/O-thread-owned; Pm_WriteShort is never made under a
-			// router lock (see the lock discipline in midi_router.h).
+			// are I/O-thread-owned; backend calls are never made under
+			// a router lock (see the lock discipline in midi_router.h).
 			auto &writers = raw_writers_[instance];
 			for (const MidiOutMsg &msg : msgs) {
-				if (!deliver_out_msg(stream, port_id, writers, msg)) {
-					// Write failed: write_short already closed and
-					// unrouted the port (its stream and raw-byte
-					// framing state are gone) — drop the rest of this
-					// port's batch; writing to the closed stream would
-					// be UB.
+				if (!deliver_out_msg(handle, port_id, writers, msg)) {
+					// Write failed: write_short / write_sysex_msg
+					// already closed and unrouted the port (its stream
+					// and raw-byte framing state are gone) — drop the
+					// rest of this port's batch; writing to the closed
+					// stream would be UB.
 					break;
 				}
 			}
 		}
 	}
-#else
-	(void)0;
-#endif
 }
 
-#ifdef PORTMIDI_ENABLED
-bool MidiRouter::deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
+bool MidiRouter::deliver_out_msg(MidiBackend::PortHandle p_handle, int p_port_id,
 		std::unordered_map<int, RawRouteState> &p_writers,
 		const MidiOutMsg &p_msg) {
 	if (p_msg.kind == MidiOutMsg::RAW_BYTE) {
-		return raw_byte_to_stream(p_stream, p_port_id, p_writers, p_msg.byte);
+		return raw_byte_to_stream(p_handle, p_port_id, p_writers, p_msg.byte);
+	}
+	if (p_msg.kind == MidiOutMsg::SYSEX) {
+		return write_sysex_msg(p_handle, p_port_id, p_msg.sysex);
 	}
 	// Channels are masked to the low nibble: output hooks may carry
 	// pd_channel + 16*pd_port; the port nibble is dropped (v1
@@ -800,19 +680,21 @@ bool MidiRouter::deliver_out_msg(PortMidiStream *p_stream, int p_port_id,
 			break;
 		case MidiOutMsg::RAW_BYTE:
 			return true; // handled above
+		case MidiOutMsg::SYSEX:
+			return true; // handled above
 	}
-	return write_short(p_stream, p_port_id, Pm_Message(status, d1, d2));
+	return write_short(p_handle, p_port_id, status, d1, d2);
 }
 
-bool MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
+bool MidiRouter::raw_byte_to_stream(MidiBackend::PortHandle p_handle, int p_port_id,
 		std::unordered_map<int, RawRouteState> &p_writers,
 		uint8_t p_byte) {
 	RawRouteState &st = p_writers[p_port_id]; // default-constructed per route
 	// The pinned MidiOutWriter transform (its per-call return is the wire
 	// bytes for this input byte). The framing below mirrors that state
 	// machine in lockstep — same transitions — and additionally tracks
-	// message completion, because Pm_WriteShort needs full-form
-	// PmMessage words (running-status input is re-expanded here).
+	// message completion, because MidiBackend::write needs full-form
+	// {status, d1, d2} bytes (running-status input is re-expanded here).
 	const std::vector<uint8_t> emitted = st.writer.feed(p_byte);
 	(void)emitted; // wire bytes == input bytes except where suppressed
 	const uint8_t b = p_byte;
@@ -829,13 +711,14 @@ bool MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 	}
 	if (b >= 0x80) {
 		if (b == 0xF0) {
-			st.in_sysex = true; // raw F0..F7 dropped (no sysex output path)
+			st.in_sysex = true; // raw F0..F7 dropped (no sysex output path
+			// on the raw-byte route; full sysex goes out via SYSEX)
 			return true;
 		}
 		if (b >= 0xF8) {
 			// Realtime: complete one-byte message, always sent (never
 			// subject to running status).
-			return write_short(p_stream, p_port_id, Pm_Message(b, 0, 0));
+			return write_short(p_handle, p_port_id, b, 0, 0);
 		}
 		// Status byte (emitted, or running-suppressed — the wire status
 		// is st.status, which equals b in the suppressed case) starts a
@@ -857,33 +740,52 @@ bool MidiRouter::raw_byte_to_stream(PortMidiStream *p_stream, int p_port_id,
 	if (st.data_have < st.data_need) {
 		return true;
 	}
-	// Message complete: send the full-form word.
+	// Message complete: send the full-form message.
 	const uint8_t d2 = (st.data_need == 2) ? st.data[1] : 0;
-	return write_short(p_stream, p_port_id, Pm_Message(st.status, st.data[0], d2));
+	return write_short(p_handle, p_port_id, st.status, st.data[0], d2);
 }
 
-bool MidiRouter::write_short(PortMidiStream *p_stream, int p_port_id, PmMessage p_msg) {
-	const PmError err = with_pm_mutex(
-			[&] { return Pm_WriteShort(p_stream, 0, p_msg); });
-	if (err != pmNoError) {
-		// Spec §7 (approved mapping: any nonzero PM error, notably
-		// pmDeviceRemoved/pmHostError): drop the handle, unroute the
-		// port, and notify. Pm_* calls are never made under a router
-		// lock; close_port takes the locks it needs on its own.
-		//
-		// The port is dead now: returning false makes output_stage drop
-		// the rest of the batch (writing to the closed stream would be
-		// UB). Error text is gathered under the PM lock; the user
-		// callback fires after it is released.
-		const std::string text = with_pm_mutex(
-				[&] { return std::string(Pm_GetErrorText(err)); });
-		close_port(p_port_id);
+bool MidiRouter::write_short(MidiBackend::PortHandle p_handle, int p_port_id,
+		uint8_t p_status, uint8_t p_d1, uint8_t p_d2) {
+	const uint8_t bytes[3] = {p_status, p_d1, p_d2};
+	const MidiError err = backend_->write(p_handle, bytes, 3);
+	if (err == MidiError::OK) {
+		return true;
+	}
+	// Spec §7 (approved mapping: any backend write failure, notably
+	// device-removed / host errors on PortMidi): drop the handle,
+	// unroute the port, and notify. Backend calls are never made under
+	// a router lock; close_port takes the locks it needs on its own.
+	//
+	// The port is dead now: returning false makes output_stage drop
+	// the rest of the batch (writing to the closed stream would be
+	// UB). Error text came from the backend; the user callback fires
+	// without any lock held.
+	const std::string text = backend_->last_error();
+	close_port(p_port_id);
+	notify_port_error(p_port_id, text.c_str());
+	return false;
+}
+
+bool MidiRouter::write_sysex_msg(MidiBackend::PortHandle p_handle, int p_port_id,
+		const std::vector<uint8_t> &p_sysex) {
+	const MidiError err = backend_->write_sysex(p_handle,
+			p_sysex.data(), static_cast<int>(p_sysex.size()));
+	if (err == MidiError::OK) {
+		return true;
+	}
+	const std::string text = backend_->last_error();
+	if (err == MidiError::InvalidParameter) {
+		// A malformed payload is a logic error, not a port fault:
+		// report it and drop the message, but keep the port open.
 		notify_port_error(p_port_id, text.c_str());
 		return false;
 	}
-	return true;
+	// Stream failure: same drop-the-port semantics as write_short.
+	close_port(p_port_id);
+	notify_port_error(p_port_id, text.c_str());
+	return false;
 }
-#endif // PORTMIDI_ENABLED
 
 // ---------------------------------------------------------------------------
 // Input fan-out (I/O thread; called from the per-port framer sink)

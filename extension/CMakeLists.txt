@@ -61,6 +61,7 @@ add_library(godot_libpd SHARED
     src/libpd_instance.cpp
     src/libpd_worker.cpp
     src/midi_router.cpp
+    src/midi_backend_portmidi.cpp
     src/core/pd_event_ring.cpp
     src/core/pd_command_queue.cpp
     src/core/pd_midi_framer.cpp
@@ -144,6 +145,21 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_include_directories(midi_read_stage_tests PRIVATE src)
     add_test(NAME midi_read_stage_tests COMMAND $<TARGET_FILE:midi_read_stage_tests>)
 
+    # v2 M2 Task 1: the MidiBackend contract through a fake backend —
+    # no platform MIDI, no device (the Android RtMidi backend must
+    # satisfy the same contract; the virtual-loopback case is the
+    # on-device test path there).
+    add_executable(midi_backend_fake_tests
+        tests/midi_backend_fake_tests.cpp
+        src/midi_router.cpp
+        src/midi_backend_portmidi.cpp
+        src/core/pd_midi_framer.cpp
+        src/core/pd_command_queue.cpp
+    )
+    target_include_directories(midi_backend_fake_tests PRIVATE src)
+    target_link_libraries(midi_backend_fake_tests PRIVATE pthread)
+    add_test(NAME midi_backend_fake_tests COMMAND $<TARGET_FILE:midi_backend_fake_tests>)
+
     if(BUILD_PORTMIDI)
         # Task 7: PortMIDI virtual device lifecycle (create -> open ->
         # write -> close -> delete). Host API only; delivery is proven
@@ -162,6 +178,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         add_executable(midi_open_bounds_tests
             tests/midi_open_bounds_tests.cpp
             src/midi_router.cpp
+            src/midi_backend_portmidi.cpp
             src/core/pd_midi_framer.cpp
         )
         target_include_directories(midi_open_bounds_tests PRIVATE src)

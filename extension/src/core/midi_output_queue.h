@@ -9,8 +9,9 @@ namespace godot_libpd {
 
 /**
  * One MIDI output event captured from a pd output hook on the worker
- * thread (spec §4). Plain C data. The MIDI I/O thread (Task 4) drains
- * the queue and writes it to PortMIDI — the worker never knows PortMIDI.
+ * thread (spec §4). The MIDI I/O thread (Task 4) drains the queue and
+ * writes it to the MIDI backend — the worker never knows the platform
+ * MIDI API.
  */
 struct MidiOutMsg {
 	enum Kind : uint8_t {
@@ -21,6 +22,7 @@ struct MidiOutMsg {
 		AFTERTOUCH,       // channel, d1 = pressure (d2 unused; matches MidiShortMsg)
 		POLY_AFTERTOUCH,  // channel, d1 = pitch, d2 = pressure
 		RAW_BYTE,         // byte ([midiout])
+		SYSEX,            // full 0xF0..0xF7 sequence in sysex (output hooks arrive v2)
 	};
 
 	Kind kind = NOTE;
@@ -28,6 +30,7 @@ struct MidiOutMsg {
 	uint8_t d1 = 0;
 	uint8_t d2 = 0;
 	uint8_t byte = 0; // RAW_BYTE only
+	std::vector<uint8_t> sysex; // SYSEX only
 };
 
 /**
