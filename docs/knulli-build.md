@@ -205,9 +205,23 @@ backend creates real snd_seq clients visible to `aconnect`):
 `midi_close_input()` makes it vanish → `midi_port_removed`. The ALSA name is
 the full `"godot-libpd:<port> <client>:<port>"` string (e.g.
 `"godot-libpd:libpd test app in 0 128:0"`), unlike CoreMIDI's bare name —
-match on a substring. An external plug/unplug (USB-MIDI) exercises the same
-diff plus the auto-close path (ctest-covered; the A133 has no USB-MIDI port
-and no `amidi`).
+match on a substring.
+
+**Real USB-MIDI hotplug on the A133 (OTG):** the A133 has a **host-only OTG
+port** (separate from the adb USB-C port), so a physical USB-MIDI device
+plugged there appears as an ALSA kernel client (`aconnect -l` →
+`client NN '<dev>' [type=kernel,card=1]`, card=1 = USB). Use
+`--midi-hotplug-monitor` (keeps the app running, logs every live
+add/remove/error, auto-opens new input ports so an unplug exercises
+auto-close). Because the app must run **foreground** on the A133, use
+**concurrent adb sessions**: launch the monitor in a backgrounded adb session
+(`adb shell "... ./test --midi-hotplug-monitor > /tmp/monitor.log 2>&1" &`)
+and read `/tmp/monitor.log` from a second session. Verified with a
+nanoKONTROL2 and an FM-1 (three plug/unplug cycles): each plug →
+`midi_port_added` for both sides + auto-open (RtMidi ALSA then creates a
+`godot-libpd:<dev> 128:0` receive port, seen as an extra output); each
+unplug → `midi_port_error(port, "device removed")` (auto-close) +
+`midi_port_removed` for the device and its receive port.
 
 Device-free self-test: stage `test.pck` (main scene `test_midi.tscn`) + the
 `.so`, then `stdbuf -oL -eL ./test --midi-hotplug-smoke` →
