@@ -93,11 +93,24 @@ Extract `MidiBackend` (spec §3) from the router's direct `Pm_*` usage;
 - `test_midi.tscn`/`test_midi.gd`: Android smoke variant — virtual
   loopback instead of IAC auto-detect (detect backend name from the
   port list; same `MIDI_SMOKE_OK` contract).
-- Export debug APK (gradle), install RG DS, run:
+- Export debug APK (gradle), install device, run:
   - `midi_available() == true`;
   - port list shows the loopback pair (+ dumpsys cross-check);
   - boot_check unaffected.
 - Commit + ledger with real device output pasted.
+
+STATUS (controller, 2026-10-02): done on the Anbernic RK3568 (Android
+14; the RG DS was unavailable during this stretch — same OS-level
+constraints, loopback contract identical). The plan-assumed "dlsym
+JNI_GetCreatedJavaVMs from libart" approach was PROVEN INFEASIBLE
+on-device (Android 14 app linker namespace blocks every dlopen of
+libart; RTLD_DEFAULT has no JVM). Resolution: ELF-scan of libart's own
+dynamic symbol table via /proc/self/maps + /proc/self/mem (see
+docs/android-build.md "How the extension gets a JavaVM*"). RtMidi's
+real-port path reuses the result via the gdpd_rtmidi_host_java_vm()
+host hook (submodule third local fix, b8b2720). Device evidence:
+MIDI_SMOKE_OK print=1 note=1 (loopback 200/201), clean exit 0, zero
+crashes; macOS ctest 11/11, MIDI_SMOKE_OK (IAC), SMOKE_OK all green.
 
 ## Task 4 — On-device verification + docs (worker)
 

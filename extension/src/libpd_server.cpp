@@ -104,6 +104,7 @@ void LibpdServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("midi_open_output", "index"), &LibpdServer::midi_open_output);
 	ClassDB::bind_method(D_METHOD("midi_open_virtual_input"), &LibpdServer::midi_open_virtual_input);
 	ClassDB::bind_method(D_METHOD("midi_open_virtual_output"), &LibpdServer::midi_open_virtual_output);
+	ClassDB::bind_method(D_METHOD("midi_create_loopback", "name"), &LibpdServer::midi_create_loopback);
 	ClassDB::bind_method(D_METHOD("midi_close_input", "port_id"), &LibpdServer::midi_close_input);
 	ClassDB::bind_method(D_METHOD("midi_close_output", "port_id"), &LibpdServer::midi_close_output);
 	ClassDB::bind_method(D_METHOD("midi_route_input", "port_id", "instance", "add"), &LibpdServer::midi_route_input, DEFVAL(true));
@@ -231,6 +232,22 @@ int LibpdServer::midi_open_virtual_output() {
 				"Failed to open virtual MIDI output port (see the midi_port_error signal)");
 	}
 	return port;
+}
+
+int LibpdServer::midi_create_loopback(const String &p_name) {
+	if (!midi_available()) {
+		UtilityFunctions::push_error("MIDI not available on this platform");
+		return -1;
+	}
+	const int err = midi_router.create_virtual_loopback(p_name.utf8().get_data());
+	if (err != 0) {
+		UtilityFunctions::push_error(
+				"Failed to create the in-process MIDI loopback (see the "
+				"midi_port_error signal); it is unavailable on the PortMidi "
+				"hosts — use IAC / aconnect there");
+		return -1;
+	}
+	return 0;
 }
 
 void LibpdServer::midi_close_input(int p_port_id) {

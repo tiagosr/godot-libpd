@@ -89,6 +89,14 @@ public:
 	/// out 0"; on ALSA an snd_seq virtual port visible in aconnect -l).
 	/// Returns the new port id (>= 0) or -1 on failure.
 	int midi_open_virtual_output();
+	/// Create the backend's in-process virtual loopback (M2 spec §3;
+	/// the Android RtMidi backend — no virtual MIDI device API there).
+	/// The pair appears in midi_list_inputs()/midi_list_outputs() as
+	/// "<p_name> in" / "<p_name> out" (device indices 200/201); open
+	/// them with the ordinary midi_open_input()/midi_open_output().
+	/// PortMidi hosts: unavailable (use IAC / aconnect). Returns 0 on
+	/// success, -1 on failure.
+	int midi_create_loopback(const String &p_name);
 	/// Close an open input port (errors surface via the midi_port_error signal).
 	void midi_close_input(int p_port_id);
 	/// Close an open output port.

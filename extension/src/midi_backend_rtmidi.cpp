@@ -18,10 +18,14 @@
 #include "midi_backend_rtmidi.h"
 
 #include <android/log.h>
-#include <dlfcn.h>
 #include <jni.h>
 
+#include <cstddef>
+#include <cstdio>
+#include <dlfcn.h>
+#include <cstring>
 #include <utility>
+#include <vector>
 
 namespace godot_libpd {
 
@@ -32,47 +36,294 @@ constexpr const char *kLogTag = "libpd.midi.rtmidi";
 #define RLOGE(...) __android_log_print(ANDROID_LOG_ERROR, kLogTag, __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// JNI plumbing (mirrors RtMidi's androidGetThreadEnv /
-// androidGetContext recipes; NDK r25 has no libjvm.so —
-// JNI_GetCreatedJavaVMs is dlsym'ed from libart.so, Task 0 recon).
+// JavaVM capture. The app's linker namespace ("clns-N") cannot dlopen
+// libart at all (verified on-device: /apex/com.android.art is "not
+// accessible for the namespace clns-6") and the VM is not in the
+// RTLD_DEFAULT scope for app processes either — but the libart.so
+// TEXT is mapped into our address space (it is the JVM itself) and
+// /proc/self/mem is readable by the app. So the JNI_GetCreatedJavaVMs
+// entry point is located by parsing libart.so's own ELF dynamic
+// symbol table through /proc/self/mem and the function pointer is
+// taken at its mapped address. (The JavaVM* itself is the same
+// process-wide singleton either way.)
 // ---------------------------------------------------------------------------
 
 typedef jint (*JniGetCreatedVMsFn)(JavaVM **, jsize, jsize *);
 
 JavaVM *g_jvm = nullptr;
 
+namespace {
+
+struct Mapping {
+	uintptr_t start = 0;
+	uintptr_t end = 0;
+};
+
+// The address range of the named library's first file mapping
+// (its ELF load base). Returns false if not mapped.
+bool find_mapping_base(const char *p_lib, Mapping *r_map) {
+	FILE *f = fopen("/proc/self/maps", "r");
+	if (f == nullptr) {
+		return false;
+	}
+	// Match only the exact /lib64/<p_lib> path suffix — a plain
+	// strstr("libart") would land on libart-compiler.so first, whose
+	// dynamic symbols do not contain the JNI bootstrap entry.
+	const size_t liblen = strlen(p_lib);
+	bool found = false;
+	char line[512];
+	while (fgets(line, sizeof(line), f) != nullptr) {
+		const char *path = strrchr(line, '/');
+		if (path == nullptr) {
+			continue;
+		}
+		char name[128];
+		if (snprintf(name, sizeof(name), "%s", path) >=
+				(int)sizeof(name)) {
+			continue;
+		}
+		name[strcspn(name, "\r\n")] = '\0';
+		if (strlen(name) < liblen ||
+			strcmp(name + strlen(name) - liblen, p_lib) != 0) {
+			continue;
+		}
+		uintptr_t lo = 0;
+		uintptr_t hi = 0;
+		if (sscanf(line, "%lx-%lx", &lo, &hi) == 2) {
+			r_map->start = lo;
+			r_map->end = hi;
+			found = true;
+			break; // first mapping = ELF header at the load base
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+// Reads p_len bytes from the current process's memory (our own
+// address space, which is always readable via /proc/self/mem).
+bool read_self_mem(uintptr_t p_addr, void *p_out, size_t p_len) {
+	FILE *f = fopen("/proc/self/mem", "r");
+	if (f == nullptr) {
+		return false;
+	}
+	if (fseeko(f, (off_t)p_addr, SEEK_SET) != 0) {
+		fclose(f);
+		return false;
+	}
+	const size_t n = fread(p_out, 1, p_len, f);
+	fclose(f);
+	return n == p_len;
+}
+
+// True if p_addr falls inside an r-x mapping of the named library.
+bool address_in_exec_mapping(uintptr_t p_addr, const char *p_lib) {
+	FILE *f = fopen("/proc/self/maps", "r");
+	if (f == nullptr) {
+		return false;
+	}
+	const size_t liblen = strlen(p_lib);
+	bool ok = false;
+	char line[512];
+	while (fgets(line, sizeof(line), f) != nullptr) {
+		if (strstr(line, "r-xp") == nullptr) {
+			continue;
+		}
+		const char *path = strrchr(line, '/');
+		if (path == nullptr) {
+			continue;
+		}
+		char name[128];
+		if (snprintf(name, sizeof(name), "%s", path) >= (int)sizeof(name)) {
+			continue;
+		}
+		name[strcspn(name, "\r\n")] = '\0';
+		if (strlen(name) < liblen ||
+			strcmp(name + strlen(name) - liblen, p_lib) != 0) {
+			continue;
+		}
+		uintptr_t lo = 0;
+		uintptr_t hi = 0;
+		if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && lo <= p_addr &&
+				p_addr < hi) {
+			ok = true;
+			break;
+		}
+	}
+	fclose(f);
+	return ok;
+}
+
+} // namespace
+
 bool ensure_jvm() {
 	if (g_jvm != nullptr) {
 		return true;
 	}
-	void *handle = dlopen("libart.so", RTLD_NOW);
-	if (handle == nullptr) {
-		RLOGE("dlopen(libart.so) failed");
+	// 1) Find libart's load base (the first /apex/com.android.art
+	//    mapping in /proc/self/maps).
+	Mapping map;
+	if (!find_mapping_base("libart.so", &map)) {
+		RLOGE("libart mapping not found in /proc/self/maps");
 		return false;
 	}
-	const auto fn = reinterpret_cast<JniGetCreatedVMsFn>(
-			dlsym(handle, "JNI_GetCreatedJavaVMs"));
-	if (fn == nullptr) {
-		RLOGE("dlsym(JNI_GetCreatedJavaVMs) failed");
+	// 2) Walk the ELF: PT_DYNAMIC -> DT_SYMTAB/DT_STRTAB/DT_STRSZ,
+	//    then scan the dynamic symbols for JNI_GetCreatedJavaVMs.
+	char hdr[64];
+	if (!read_self_mem(map.start, hdr, sizeof(hdr))) {
+		RLOGE("cannot read the ELF header");
 		return false;
 	}
+	const char *eh = hdr;
+	if (eh[0] != 0x7F || strncmp(eh + 1, "ELF", 3) != 0) {
+		RLOGE("not an ELF image at the libart base");
+		return false;
+	}
+	const bool big = (eh[5] == 2);
+	(void)big; // aarch64 Android images are little-endian
+	const uint16_t ei_class = eh[4];
+	if (ei_class != 2) { // ELFCLASS64
+		RLOGE("unexpected ELF class");
+		return false;
+	}
+	// Program header table.
+	struct Elf64Phdr {
+		uint32_t p_type;
+		uint32_t p_flags;
+		uint64_t p_offset;
+		uint64_t p_vaddr;
+		uint64_t p_paddr;
+		uint64_t p_filesz;
+		uint64_t p_memsz;
+		uint64_t p_align;
+	};
+	struct Elf64Dyn {
+		uint64_t d_tag;
+		uint64_t d_val;
+	};
+	const uintptr_t e_phoff = *reinterpret_cast<const uint64_t *>(eh + 0x20);
+	const int e_phentsize = *reinterpret_cast<const uint16_t *>(eh + 0x36);
+	const int e_phnum = *reinterpret_cast<const uint16_t *>(eh + 0x38);
+	uintptr_t symtab = 0;
+	uintptr_t strtab = 0;
+	size_t strsz = 0;
+	{
+		Elf64Phdr ph;
+		for (int i = 0; i < e_phnum; ++i) {
+			if (!read_self_mem(map.start + e_phoff + (uintptr_t)i * (uintptr_t)e_phentsize,
+						&ph, sizeof(ph))) {
+				RLOGE("cannot read program headers");
+				return false;
+			}
+			if (ph.p_type == 2 /* PT_DYNAMIC */) {
+				// Read all PT_DYNAMIC entries.
+				const int n = (int)(ph.p_filesz / sizeof(Elf64Dyn));
+				std::vector<Elf64Dyn> dyn;
+				dyn.resize(n);
+				if (!read_self_mem(map.start + ph.p_offset, dyn.data(),
+							ph.p_filesz)) {
+					RLOGE("cannot read PT_DYNAMIC");
+					return false;
+				}
+				for (const Elf64Dyn &d : dyn) {
+					if (d.d_tag == 6) { // DT_SYMTAB
+						symtab = d.d_val;
+					} else if (d.d_tag == 5) { // DT_STRTAB
+						strtab = d.d_val;
+					} else if (d.d_tag == 10) { // DT_STRSZ
+						strsz = d.d_val;
+					} else if (d.d_tag == 0) { // DT_END
+						break;
+					}
+				}
+			}
+		}
+	}
+	if (symtab == 0 || strtab == 0) {
+		RLOGE("no dynamic symbol table found (phoff=%lx phnum=%d phentsize=%d)",
+				e_phoff, e_phnum, e_phentsize);
+		return false;
+	}
+	RLOGE("dyn: symtab=%lx strtab=%lx strsz=%zu phoff=%lx phnum=%d",
+			symtab, strtab, strsz, e_phoff, e_phnum);
+	// The dynamic vaddrs are relative to the load base.
+	const size_t sym64 = 24; // sizeof(Elf64_Sym)
+	// Bound: DT_SYMTAB gives the address; symbol count comes from
+	// DT_HASH/DT_GNU_HASH — instead, scan until a NUL name AND
+	// value past strsz; cap at a generous count.
+	const size_t kMaxSyms = 4096;
+	std::vector<char> syms(kMaxSyms * sym64);
+	std::vector<char> strs(strsz);
+	if (!read_self_mem(map.start + symtab, syms.data(), syms.size())) {
+		RLOGE("cannot read symtab");
+		return false;
+	}
+	if (!read_self_mem(map.start + strtab, strs.data(), strsz)) {
+		RLOGE("cannot read strtab");
+		return false;
+	}
+	constexpr char kSymName[] = "JNI_GetCreatedJavaVMs";
+	uintptr_t fn_addr = 0;
+	for (size_t i = 0; i < kMaxSyms; ++i) {
+		struct Elf64Sym {
+			uint32_t st_name;
+			uint8_t st_info;
+			uint8_t st_other;
+			uint16_t st_shndx;
+			uint64_t st_value;
+			uint64_t st_size;
+		}; // sizeof == 24, exactly Elf64_Sym
+		static_assert(sizeof(Elf64Sym) == 24, "Elf64_Sym is 24 bytes");
+		Elf64Sym sym;
+		std::memcpy(&sym, syms.data() + i * sym64, sym64);
+		if (sym.st_name == 0 || sym.st_name >= strsz) {
+			if (i > 64) {
+				break; // end of the table
+			}
+			continue;
+		}
+		if (std::strncmp(strs.data() + sym.st_name, kSymName,
+					sizeof(kSymName)) == 0) {
+			fn_addr = map.start + sym.st_value;
+			break;
+		}
+	}
+	if (fn_addr == 0) {
+		RLOGE("JNI_GetCreatedJavaVMs not in libart's dynamic symbols");
+		return false;
+	}
+	RLOGE("found JNI_GetCreatedJavaVMs at %lx (base=%lx)",
+			fn_addr, map.start);
+	if (!address_in_exec_mapping(fn_addr, "libart.so")) {
+		RLOGE("refusing to call %lx: not in an executable libart mapping",
+				fn_addr);
+		return false;
+	}
+	auto fn = reinterpret_cast<JniGetCreatedVMsFn>(fn_addr);
 	JavaVM *vms[1] = { nullptr };
 	jsize found = 0;
 	if (fn(vms, 1, &found) != JNI_OK || found != 1) {
-		RLOGE("no JVM found");
+		RLOGE("JNI_GetCreatedJavaVMs call failed");
 		return false;
 	}
 	g_jvm = vms[0];
+	RLOGE("jvm resolved via /proc/self/mem ELF scan (libart base=%lx)",
+			map.start);
 	return true;
 }
 
 // A JNIEnv for the current (router I/O) thread; attaches a daemon
-// thread if needed.
+// thread if needed. Retries briefly: the libart mapping is present
+// from process start, but the router I/O thread may race the very
+// first /proc read during early engine init.
 bool ensure_env(JNIEnv **r_env) {
+	for (int attempt = 0; attempt < 10 && !ensure_jvm(); ++attempt) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
 	if (!ensure_jvm()) {
 		return false;
 	}
- JNIEnv *env = nullptr;
+	JNIEnv *env = nullptr;
 	int rc = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
 	if (rc == JNI_EDETACHED) {
 		rc = g_jvm->AttachCurrentThreadAsDaemon(&env, nullptr);
@@ -83,6 +334,21 @@ bool ensure_env(JNIEnv **r_env) {
 	}
 	*r_env = env;
 	return true;
+}
+
+// Host JVM hook for the vendored RtMidi. RtMidi's own
+// androidGetThreadEnv() resolves JNI_GetCreatedJavaVMs with
+// dlsym(RTLD_DEFAULT) — which fails in an Android app's linker
+// namespace (verified on-device: libart is namespace-private, and
+// the VM is not in the global scope either). RtMidi (this same
+// .so) therefore looks up this extern "C" symbol first and takes
+// the JavaVM* from our /proc/self/mem ELF scan — one source of
+// truth, no duplicated memory parsing. The lookup goes through
+// dlsym(RTLD_DEFAULT) against OUR OWN symbol, which is in the
+// default namespace because the engine dlopened the whole .so.
+extern "C" JavaVM *gdpd_rtmidi_host_java_vm() {
+	ensure_jvm();
+	return g_jvm;
 }
 
 // Build.VERSION.SDK_INT (the AMidi C API requires API 29).
@@ -117,45 +383,83 @@ struct RawDevice {
 };
 
 bool jni_enumerate_devices(JNIEnv *p_env, std::vector<RawDevice> *r_out) {
+	// Every JNI call below can throw (hidden-API NoSuchMethodError on
+	// OEM ROMs, a missing midi service, ...). A pending exception MUST
+	// be cleared before returning or the NEXT JNI call on this thread
+	// aborts the whole process — so each failure path funnels through
+	// the cleanup lambda. Enumeration failure degrades to "no system
+	// devices"; the in-process loopback stays available.
+	std::vector<jobject> locals; // cleaned at scope exit
+	auto cleanup = [&]() {
+		if (p_env->ExceptionCheck()) {
+			p_env->ExceptionClear();
+		}
+		for (auto ref : locals) {
+			p_env->DeleteLocalRef(ref);
+		}
+		locals.clear();
+	};
 	const jclass at_class = p_env->FindClass("android/app/ActivityThread");
 	if (at_class == nullptr) {
+		cleanup();
 		return false;
 	}
+	locals.push_back(at_class);
 	const jmethodID cur_at = p_env->GetStaticMethodID(at_class,
 			"currentActivityThread", "()Landroid/app/ActivityThread;");
 	auto at = p_env->CallStaticObjectMethod(at_class, cur_at);
 	if (at == nullptr) {
-		p_env->DeleteLocalRef(at_class);
+		cleanup();
 		return false;
 	}
-	const jmethodID get_app = p_env->GetMethodID(at_class, "getApplication",
-			"()Landroid/content/Context;");
+	locals.push_back(at);
+	// On API 29+ ActivityThread.getApplication() returns Application
+	// (a Context). Older ROMs expose it with the Context return type;
+	// try both and take whichever resolves.
+	jmethodID get_app = p_env->GetMethodID(at_class, "getApplication",
+			"()Landroid/app/Application;");
+	if (get_app == nullptr && p_env->ExceptionCheck()) {
+		p_env->ExceptionClear();
+		get_app = p_env->GetMethodID(at_class, "getApplication",
+				"()Landroid/content/Context;");
+	}
+	if (get_app == nullptr) {
+		RLOGE("ActivityThread.getApplication not resolvable (hidden API "
+				"blocked?)");
+		cleanup();
+		return false;
+	}
 	auto context = p_env->CallObjectMethod(at, get_app);
-	p_env->DeleteLocalRef(at);
 	if (context == nullptr) {
-		p_env->DeleteLocalRef(at_class);
+		cleanup();
 		return false;
 	}
+	locals.push_back(context);
 	const jclass context_class = p_env->FindClass("android/content/Context");
+	if (context_class == nullptr) {
+		cleanup();
+		return false;
+	}
+	locals.push_back(context_class);
 	const jmethodID get_service = p_env->GetMethodID(context_class,
 			"getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
 	auto midi_mgr = p_env->CallObjectMethod(context, get_service,
 			p_env->NewStringUTF("midi"));
 	if (midi_mgr == nullptr) {
 		RLOGE("MIDI system service unavailable (feature missing?)");
-		p_env->DeleteLocalRef(context);
-		p_env->DeleteLocalRef(at_class);
+		cleanup();
 		return false;
 	}
+	locals.push_back(midi_mgr);
 	const jclass mgr_class = p_env->FindClass("android/media/midi/MidiManager");
 	const jmethodID get_devices = p_env->GetMethodID(mgr_class, "getDevices",
 			"()[Landroid/media/midi/MidiDeviceInfo;");
 	auto j_devices = (jobjectArray) p_env->CallObjectMethod(midi_mgr, get_devices);
 	if (j_devices == nullptr) {
-		p_env->DeleteLocalRef(context);
-		p_env->DeleteLocalRef(at_class);
+		cleanup();
 		return false;
 	}
+	locals.push_back(j_devices);
 	const jclass info_class = p_env->FindClass("android/media/midi/MidiDeviceInfo");
 	const jmethodID in_count = p_env->GetMethodID(info_class, "getInputPortCount", "()I");
 	const jmethodID out_count = p_env->GetMethodID(info_class, "getOutputPortCount", "()I");
@@ -174,10 +478,10 @@ bool jni_enumerate_devices(JNIEnv *p_env, std::vector<RawDevice> *r_out) {
 		auto props = p_env->CallObjectMethod(dev, get_props);
 		if (props != nullptr) {
 			auto j_name = (jstring) p_env->CallObjectMethod(props, get_string,
-					p_env->NewStringUTF("name"));
+						p_env->NewStringUTF("name"));
 			if (j_name == nullptr) {
 				j_name = (jstring) p_env->CallObjectMethod(props, get_string,
-						p_env->NewStringUTF("product"));
+							p_env->NewStringUTF("product"));
 			}
 			if (j_name != nullptr) {
 				const char *chars = p_env->GetStringUTFChars(j_name, nullptr);
@@ -194,8 +498,7 @@ bool jni_enumerate_devices(JNIEnv *p_env, std::vector<RawDevice> *r_out) {
 		}
 		p_env->DeleteLocalRef(dev);
 	}
-	p_env->DeleteLocalRef(context);
-	p_env->DeleteLocalRef(at_class);
+	cleanup();
 	return true;
 }
 

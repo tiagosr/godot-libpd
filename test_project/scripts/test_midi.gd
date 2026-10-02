@@ -152,6 +152,15 @@ func _run_smoke() -> void:
 	if not _instance_ready:
 		await _smoke_fail("instance not ready")
 		return
+	# Port errors surface as signals; log them in smoke mode too so a
+	# backend failure is visible in the captured stdout.
+	Libpd.server.midi_port_error.connect(func(port: int, what: String) -> void:
+		print("MIDI_SMOKE | port_error port=%d: %s" % [port, what]))
+	if OS.get_name() == "Android":
+		# M2: the in-process loopback (no virtual MIDI device API on
+		# Android) replaces the IAC bus — same MIDI_SMOKE_OK contract.
+		await _run_smoke_android()
+		return
 	if not Libpd.server.midi_available():
 		print("MIDI_SMOKE_SKIP no IAC bus")
 		await _finish_smoke(0)
@@ -257,6 +266,60 @@ func _dump_smoke_state() -> void:
 				int(_instance.debug_blocks_pushed)])
 	print("state | in_port=%d out_port=%d got_print=%s got_note=%s" % [
 			_in_port, _out_port, str(_smoke_got_print), str(_smoke_got_note)])
+
+
+func _run_smoke_android() -> void:
+	if not Libpd.server.midi_available():
+		await _smoke_fail("midi_available() is false on Android (backend init failed — check logcat libpd.midi.rtmidi)")
+		return
+	if Libpd.server.midi_create_loopback("libpd") != 0:
+		await _smoke_fail("midi_create_loopback failed")
+		return
+	var in_list := Libpd.server.midi_list_inputs()
+	var out_list := Libpd.server.midi_list_outputs()
+	print("MIDI_SMOKE | inputs=%s outputs=%s" % [str(in_list), str(out_list)])
+	var in_idx := _find_name_suffix_index(in_list, "libpd in")
+	var out_idx := _find_name_suffix_index(out_list, "libpd out")
+	if in_idx < 0 or out_idx < 0:
+		await _smoke_fail("loopback pair missing from the port list (in=%d out=%d)" % [in_idx, out_idx])
+		return
+	print("MIDI_SMOKE | loopback pair=(%d,%d)" % [in_idx, out_idx])
+	_in_port = Libpd.server.midi_open_input(in_idx)
+	_out_port = Libpd.server.midi_open_output(out_idx)
+	if _in_port < 0 or _out_port < 0:
+		await _smoke_fail("loopback open failed (in_port=%d out_port=%d)" % [_in_port, _out_port])
+		return
+	Libpd.server.midi_route_input(_in_port, _instance)
+	Libpd.server.midi_route_output(_instance, _out_port)
+	Libpd.server.instance_print.connect(func(_id: int, text: String) -> void:
+		if "test_patch" in text:
+			_smoke_got_print = true)
+	Libpd.server.midi_note_on.connect(func(_port: int, _ch: int, pitch: int, _vel: int) -> void:
+		if pitch == 60:
+			_smoke_got_note = true)
+	Libpd.server.midi_sysex.connect(func(_port: int, data: PackedByteArray) -> void:
+		if _smoke_sysex.is_empty():
+			_smoke_sysex = data)
+	_instance.send_midi(0, 60, 100)
+	print("MIDI_SMOKE | note sent, waiting up to %d ms for print + looped note_on" % SMOKE_TIMEOUT_MS)
+	while not (_smoke_got_print and _smoke_got_note):
+		if Time.get_ticks_msec() - _smoke_start >= SMOKE_TIMEOUT_MS:
+			break
+		await get_tree().process_frame
+	if _smoke_got_print and _smoke_got_note:
+		print("MIDI_SMOKE_OK print=1 note=1 (android loopback in_idx=%d out_idx=%d)" % [in_idx, out_idx])
+		_report_smoke_sysex()
+		await _finish_smoke(0)
+		return
+	await _smoke_fail("timeout print=%s note=%s (android loopback in_idx=%d out_idx=%d)" % [
+			str(_smoke_got_print), str(_smoke_got_note), in_idx, out_idx])
+
+
+func _find_name_suffix_index(ports: Array, name: String) -> int:
+	for d in ports:
+		if str(d["name"]) == name:
+			return int(d["index"])
+	return -1
 
 
 func _find_iac_pair(in_ports: Array, out_ports: Array) -> Array:

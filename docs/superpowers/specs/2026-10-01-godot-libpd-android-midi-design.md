@@ -1,6 +1,6 @@
 # Godot libpd GDExtension — v2 M2: Android MIDI I/O (RtMidi AMIDI) — Design
 
-**Status:** proposed v2 (2026-10-01, supersedes the MidiBridge design)
+**Status:** approved v2 (2026-10-01, supersedes the MidiBridge design) — Tasks 0–3 implemented (2026-10-02); JavaVM capture resolved via ELF scan of libart through /proc/self/mem (see docs/android-build.md); on-device loopback smoke verified on Android 14
 **Supersedes:** nothing — extends v1 (2026-09-27) and v2 M1 MIDI (2026-09-30)
 **Targets:** Android arm64-v8a (Godot 4.6, official 4.6.2 export templates + gradle
 build), tested on Retroid RG DS (API 34). macOS/Linux MIDI (M1, PortMIDI)

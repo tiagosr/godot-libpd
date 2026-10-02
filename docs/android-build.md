@@ -95,14 +95,41 @@ compile the RtMidi `MidiDeviceOpenedListener` Java class into the APK):
 - RtMidi NDK cross-compile facts (NDK 25.1.8937393): legacy toolchain
   vars (`ANDROID_ABI=arm64-v8a ANDROID_PLATFORM=android-29
   ANDROID_STL=c++_shared`), `RTMIDI_API_AMIDI=ON`; RtMidi's CMake omits
-  `-ljvm` — the extension supplies a `JNI_GetCreatedJavaVMs` shim that
-  dlsyms the real function from `libart.so` (NDK r25 ships no
-  `libjvm.so`).
+  `-ljvm` (see the JavaVM note below — the NDK ships no linkable
+  libart/jvm).
+
+### How the extension gets a `JavaVM*` (Android 14, on-device verified)
+
+An Android app's linker namespace ("clns-N") blocks every obvious route
+to the JVM from native code:
+
+* `dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs")` → NULL (the VM is not in
+  the global symbol scope of an app process);
+* `dlopen("/apex/com.android.art/lib64/libart.so")` → *"not accessible
+  for the namespace clns-N"*;
+* `dlopen("libart.so")` / `dlopen("/system/lib64/libart.so")` → not found;
+* a GDExtension `.so` is loaded by the engine with a plain C++ `dlopen`, so
+  `JNI_OnLoad` is **never** called — there is no native bootstrap hook.
+
+The working solution (implemented in `midi_backend_rtmidi.cpp`) resolves
+`JNI_GetCreatedJavaVMs` by parsing libart.so's own ELF dynamic symbol
+table through `/proc/self/maps` + `/proc/self/mem`: libart's TEXT is mapped
+into the app's address space (it *is* the JVM) and `/proc/self/mem` is
+readable by the app. The pointer is only called after verifying it sits
+inside an `r-x` libart mapping (the guard caught a real struct-size
+misparse before it could execute a bad pointer). The vendored RtMidi's own
+`androidGetThreadEnv()` (used when opening a *real* MIDI port) reuses that
+result via the host hook `gdpd_rtmidi_host_java_vm()` — an `extern "C"`
+symbol in the same `.so`, reachable through `dlsym(RTLD_DEFAULT)`
+(verified on device).
 
 ### MIDI on the Retroid ROM (device prep, RG DS)
 
-The Retroid ROM (V1.15, Android 14) has the MIDI framework classes but
-`SystemServer` only starts the MIDI system service when
+> Verified on the RG DS (Retroid ROM V1.15, Android 14) **and** an
+> Anbernic RK3568 (Android 14 engineering ROM) — same OS-level behaviour.
+
+The Retroid ROM has the MIDI framework classes but `SystemServer` only
+starts the MIDI system service when
 `hasSystemFeature("android.software.midi")` — the ROM ships without
 that feature, so `MidiManager` was unusable. Fix (root, persistent in
 `/system`):
@@ -124,5 +151,27 @@ After reboot: `service list | grep midi` → `midi:
 [android.media.midi.IMidiManager]`, `dumpsys midi` works. Note the
 service name is `midi` (not `media.midi`). The RG DS has **zero**
 system MIDI ports (no USB/BT MIDI hardware) — device MIDI testing uses
-the backend's in-process virtual loopback.
+the backend's in-process virtual loopback (`LibpdServer.midi_create_loopback()`).
+
+### OEM-ROM enumeration hardening
+
+Chinese-OEM Android 14 ROMs (e.g. the Anbernic "eng.builde" build) can
+throw `NoSuchMethodError` from the hidden `ActivityThread.getApplication()`
+call used to reach `MidiManager`. The backend's `jni_enumerate_devices()`
+clears any pending JNI exception on **every** failure path and degrades to
+"no system devices" (the loopback stays available) instead of letting the
+exception abort the process on the next Godot `step()` JNI call.
+
+### Debug APK signing
+
+`gradlew assembleStandardDebug` alone produces an **unsigned** APK on a
+fresh template tree. Sign before `adb install`:
+
+    apksigner sign --ks ~/.android/debug.keystore --ks-key-alias androiddebugkey \
+        --ks-pass pass:android --out android_debug.apk android_debug.apk
+
+After rebuilding the extension `.so`, copy it to
+`test_project/android/build/libs/debug/arm64-v8a/libgodot_libpd.so`
+before `gradlew assembleStandardDebug`, otherwise the APK keeps the stale
+`.so` (the Godot `--export-debug` step refreshes it too).
 
