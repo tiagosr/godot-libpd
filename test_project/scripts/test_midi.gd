@@ -118,6 +118,13 @@ func _ready() -> void:
 		_hotplug_start = Time.get_ticks_msec()
 		_run_hotplug_smoke()
 		return
+	if "--midi-hotplug-monitor" in cmdline:
+		# Real USB-MIDI unplug leg: keep the app running and log every live
+		# device add/remove/error, auto-opening newly-appearing input ports
+		# so an unplug exercises the auto-close path (midi_port_error
+		# "device removed"). Does NOT auto-quit (stop it externally).
+		_run_hotplug_monitor()
+		return
 	_instance = LibpdInstance.new()
 	add_child(_instance)
 	var mix_rate := int(AudioServer.get_mix_rate())
@@ -496,6 +503,35 @@ func _finish_hotplug(code: int) -> void:
 	_hotplug_done = true
 	# Hotplug mode skips instance creation, so nothing to tear down here.
 	get_tree().quit(code)
+
+
+# --------------------------------------------------------------------------
+# --midi-hotplug-monitor: real USB-MIDI plug/unplug leg (keeps running)
+# --------------------------------------------------------------------------
+func _run_hotplug_monitor() -> void:
+	# For the physical unplug leg: the app stays alive and logs every live
+	# device change. New input ports are auto-opened so that unplugging a
+	# device exercises the auto-close path (a real_device open port whose
+	# device disappeared is auto-closed + midi_port_error "device removed").
+	# Does NOT quit — stop it externally (it has no smoke watchdog).
+	print("HOTPLUG_MONITOR | start — plug/unplug a USB-MIDI device to test live hotplug")
+	if not Libpd.server.midi_available():
+		print("HOTPLUG_MONITOR_SKIP midi not available on this platform")
+		get_tree().quit(0)
+		return
+	Libpd.server.midi_set_poll_interval(0.2)
+	Libpd.server.midi_port_added.connect(func(kind: String, index: int, name: String) -> void:
+		print("HOTPLUG_MONITOR | ADDED   kind=%s index=%d name=%s" % [kind, index, name])
+		if kind == "input":
+			var p := Libpd.server.midi_open_input(index)
+			print("HOTPLUG_MONITOR |     auto-opened input port=%d" % p))
+	Libpd.server.midi_port_removed.connect(func(kind: String, index: int, name: String) -> void:
+		print("HOTPLUG_MONITOR | REMOVED kind=%s index=%d name=%s" % [kind, index, name]))
+	Libpd.server.midi_port_error.connect(func(port: int, what: String) -> void:
+		print("HOTPLUG_MONITOR | PORT_ERROR port=%d: %s" % [port, what]))
+	print("HOTPLUG_MONITOR | initial inputs=%s" % str(Libpd.server.midi_list_inputs()))
+	print("HOTPLUG_MONITOR | initial outputs=%s" % str(Libpd.server.midi_list_outputs()))
+	print("HOTPLUG_MONITOR | running; plug a USB-MIDI device now (unplug to test removal + auto-close)")
 
 
 # --------------------------------------------------------------------------

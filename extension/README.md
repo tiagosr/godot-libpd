@@ -224,6 +224,17 @@ which enumerates while active → `port_added` (the loopback has no runtime
 close, so the removed leg is ctest-covered there). `HOTPLUG_SMOKE_OK` on all
 three platforms.
 
+**Real-hardware unplug leg** — `test_project/scripts/test_midi.gd
+--midi-hotplug-monitor` keeps the app running and logs every live device
+change, auto-opening new input ports so an unplug exercises the auto-close
+path. Verified on macOS CoreMIDI with two physical USB-MIDI devices (a
+nanoKONTROL2 — two distinct port names — and an FM-1 — same name on both
+sides): each plug fires `midi_port_added` for both sides, each unplug fires
+`midi_port_removed` for both sides **and** auto-closes the open real-device
+input port with `midi_port_error(port, "device removed")`. The
+(direction, name)-keyed diff handles both the multi-name controller and the
+same-name device correctly.
+
 ### On-device verification status (M2–M4)
 
 - **Android (M2, Anbernic RK3568; M3 regression on Retroid RG DS):**
@@ -246,8 +257,11 @@ three platforms.
   the smoke matches a name substring); Android (RtMidi) `HOTPLUG_SMOKE_OK
   added=1 removed=0` (in-process loopback — no AMIDI virtual port, no runtime
   loopback close); macOS (RtMidi CoreMIDI) `HOTPLUG_SMOKE_OK added=1
-  removed=1`. All device-free; the auto-close-on-external-removal path is
-  ctest-covered (no USB-MIDI hardware on the devices).
+  removed=1`. Device-free smoke on all three; **the auto-close-on-external
+  removal path is verified on real hardware** (macOS CoreMIDI, physical
+  nanoKONTROL2 + FM-1 unplug — see "Real-hardware unplug leg" above). A
+  handheld unplug needs USB OTG, which is unavailable while the USB-C port is
+  in adb/charge mode (device-hardware limitation, not a code gap).
 
 **Sysex input and CC capture are not exercisable on a device with no MIDI
 hardware** (input-only sysex by design; CC needs a real controller) — the
