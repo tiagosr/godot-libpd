@@ -399,3 +399,5 @@ $RECYCLE.BIN/
 # godot-libpd extension outputs
 extension/build/
 dist/
+probes/rtmidi_probe_macos
+probes/rtmidi_probe_linux
