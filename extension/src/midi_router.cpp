@@ -446,6 +446,9 @@ bool MidiRouter::process_control_ops() {
 				close_port(op.port_id);
 				result = 0;
 				break;
+			case ControlOpType::REFRESH:
+				result = reenum_and_diff();
+				break;
 		}
 		if (op.done != nullptr) {
 			op.done->set_value(result);
@@ -583,6 +586,19 @@ void MidiRouter::close_port(int p_port_id) {
 
 void MidiRouter::set_poll_interval(double p_seconds) {
 	poll_interval_.store(p_seconds);
+}
+
+int MidiRouter::refresh_ports() {
+	ControlHandle handle = enqueue_control(ControlOpType::REFRESH, -1, -1);
+	if (!handle.result.valid()) {
+		return -1; // no I/O thread (stub build, or init failed)
+	}
+	if (handle.result.wait_for(std::chrono::milliseconds(kControlTimeoutMs)) !=
+			std::future_status::ready) {
+		notify_port_error(-1, "midi refresh timed out");
+		return -1;
+	}
+	return handle.result.get();
 }
 
 int MidiRouter::reenum_and_diff() {

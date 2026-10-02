@@ -325,6 +325,15 @@ public:
 	void set_poll_interval(double p_seconds);
 
 	/**
+	 * Force an immediate hotplug re-enumeration + diff (M4). Thread-safe:
+	 * enqueues a REFRESH op on the I/O thread and waits up to 500 ms. Returns
+	 * the number of changed ports (added + removed), or -1 if there is no I/O
+	 * thread or the wait timed out (a timeout is surfaced via on_port_error
+	 * with port_id -1).
+	 */
+	int refresh_ports();
+
+	/**
 	 * (backend device index, name) for every device with an input
 	 * (resp. output) side. Backend device indices are stable for the
 	 * process lifetime; the UI passes the chosen index to open_input/
@@ -484,6 +493,9 @@ private:
 		CREATE_LOOPBACK,
 		CLOSE_INPUT,
 		CLOSE_OUTPUT,
+		// Hotplug (M4): force an immediate re-enumeration + diff; the op's
+		// promise is fulfilled with the changed-port count.
+		REFRESH,
 		SHUTDOWN,
 	};
 

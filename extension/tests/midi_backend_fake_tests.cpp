@@ -810,6 +810,30 @@ int main() {
 		r.shutdown();
 	}
 
+	// 7.8 refresh_ports(): forces an immediate diff, returns the change count.
+	{
+		HotplugProbe probe;
+		auto owned = std::make_unique<FakeBackend>();
+		FakeBackend *hp = owned.get();
+		hp->set_devices({mport(0, "A", true, false)});
+		MidiRouter r(std::move(owned));
+		probe.bind(r);
+		r.set_poll_interval(10.0); // long: periodic ticks won't fire in the test
+		// Force the initial enumeration with a refresh -> annotates A.
+		const int n0 = r.refresh_ports();
+		CHECK(n0 == 1); // A added
+		CHECK(probe.count_added("A") == 1);
+		// Add a device, then force it with a refresh (no periodic tick relied on).
+		hp->add_device(1, "C", true, false);
+		const int n = r.refresh_ports();
+		CHECK(n == 1); // C added
+		CHECK(probe.count_added("C") == 1);
+		// Nothing changed -> 0.
+		const int n2 = r.refresh_ports();
+		CHECK(n2 == 0);
+		r.shutdown();
+	}
+
 	router.shutdown();
 	if (failures != 0) {
 		std::printf("%d FAILURE(S)\n", failures);
