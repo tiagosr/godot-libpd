@@ -30,6 +30,17 @@ extends Control
 ## is proven by extension/tests/midi_read_stage_tests.cpp, and a sysex
 ## written to the same IAC bus by any host during the window is reported.
 
+## --midi-hotplug-smoke (headless, device-free hotplug self-test): no
+## external hardware needed. Sets a fast poll interval (0.05 s), waits for
+## the startup baseline to settle, then opens an app-owned VIRTUAL input
+## port ("libpd test app in 0") — which CoreMIDI/ALSA enumerate into
+## list_ports — and expects a midi_port_added(input); then closes it and
+## expects a midi_port_removed(input). Both observed -> HOTPLUG_SMOKE_OK,
+## quit(0). (Virtual ports are the device-free vehicle: they appear and
+## disappear in the live enumeration exactly like a plugged/unplugged
+## device; the in-process loopback is Android-only, and a real USB device
+## needs a physical plug.)
+
 # Both modes load the echo patch (notein -> print test_patch + noteout):
 # smoke mode needs [noteout] for the IAC loopback, GUI mode needs it for
 # the A133 aconnect loopback — the audio demo test_patch.pd has no
@@ -76,6 +87,13 @@ var _smoke_got_fanout := false # android: 2nd instance's print via loopback fan-
 var _smoke_done := false
 var _smoke_sysex: PackedByteArray = PackedByteArray()
 
+# --midi-hotplug-smoke state.
+var _hotplug_active := false
+var _hotplug_start := 0
+var _hotplug_done := false
+var _hp_added: Array = []   # [{kind, index, name}]
+var _hp_removed: Array = [] # [{kind, index, name}]
+
 
 func _ready() -> void:
 	# The scene-owned instance (child node): init + load the patch +
@@ -87,6 +105,15 @@ func _ready() -> void:
 	# sources are checked (the no-separator form is covered too).
 	var cmdline := OS.get_cmdline_args() + OS.get_cmdline_user_args()
 	var smoke := "--midi-smoke" in cmdline
+	var hotplug := "--midi-hotplug-smoke" in cmdline
+	if hotplug:
+		# Device-free hotplug self-test: no libpd instance needed — the
+		# port add/remove signals come from the server/router, not the
+		# instance. Skip instance init and drive the hotplug leg only.
+		_hotplug_active = true
+		_hotplug_start = Time.get_ticks_msec()
+		_run_hotplug_smoke()
+		return
 	_instance = LibpdInstance.new()
 	add_child(_instance)
 	var mix_rate := int(AudioServer.get_mix_rate())
@@ -136,8 +163,15 @@ func _process(_delta: float) -> void:
 			_dump_smoke_state()
 			_smoke_done = true
 			get_tree().quit(2)
+	if _hotplug_active and not _hotplug_done:
+		if Time.get_ticks_msec() - _hotplug_start > SMOKE_WATCHDOG_MS:
+			print("HOTPLUG_SMOKE_FAIL watchdog (no finish in %d ms)" % SMOKE_WATCHDOG_MS)
+			_hp_added.clear()
+			_hp_removed.clear()
+			_hotplug_done = true
+			get_tree().quit(2)
 	# Focus observability (GUI mode only; see _last_focus comment).
-	if not _smoke_active:
+	if not _smoke_active and not _hotplug_active:
 		var fc = get_tree().root.gui_get_focus_owner()
 		var fn = fc.name if fc != null else "(none)"
 		if fn != _last_focus:
@@ -364,6 +398,76 @@ func _find_iac_index(ports: Array) -> int:
 		if "IAC" in str(d["name"]):
 			return int(d["index"])
 	return -1
+
+
+# --------------------------------------------------------------------------
+# --midi-hotplug-smoke headless device-free self-test (virtual port add/remove)
+# --------------------------------------------------------------------------
+func _run_hotplug_smoke() -> void:
+	print("HOTPLUG_SMOKE | start")
+	if not Libpd.server.midi_available():
+		print("HOTPLUG_SMOKE_SKIP midi not available on this platform")
+		await _finish_hotplug(0)
+		return
+	# Fast re-enumeration so the virtual-port add/remove is picked up
+	# promptly (the default poll is 0.5 s; 0.05 s keeps the smoke snappy).
+	Libpd.server.midi_set_poll_interval(0.05)
+	Libpd.server.midi_port_added.connect(func(kind: String, index: int, name: String) -> void:
+		print("HOTPLUG_SMOKE | port_added kind=%s index=%d name=%s" % [kind, index, name])
+		_hp_added.append([kind, index, name]))
+	Libpd.server.midi_port_removed.connect(func(kind: String, index: int, name: String) -> void:
+		print("HOTPLUG_SMOKE | port_removed kind=%s index=%d name=%s" % [kind, index, name])
+		_hp_removed.append([kind, index, name]))
+	Libpd.server.midi_port_error.connect(func(port: int, what: String) -> void:
+		print("HOTPLUG_SMOKE | port_error port=%d: %s" % [port, what]))
+	# Let the startup baseline settle: the server constructor's immediate
+	# refresh_ports() fires midi_port_added for devices already present;
+	# after that those devices are in the router's seen_ set, so no further
+	# added fires for them. Clearing here means only OUR virtual port's
+	# add/remove is observed.
+	await get_tree().create_timer(0.4).timeout
+	_hp_added.clear()
+	_hp_removed.clear()
+	# Open an app-owned virtual input port: CoreMIDI/ALSA enumerate it into
+	# list_ports, so the re-enumeration diff must report midi_port_added.
+	const vname_in := "libpd test app in 0"
+	var vin := Libpd.server.midi_open_virtual_input()
+	print("HOTPLUG_SMOKE | opened virtual input port=%d name=%s" % [vin, vname_in])
+	var ok_added := await _wait_for_hotplug_event(_hp_added, vname_in, 3000)
+	# Close it: it disappears from enumeration -> midi_port_removed.
+	if vin >= 0:
+		Libpd.server.midi_close_input(vin)
+		print("HOTPLUG_SMOKE | closed virtual input port=%d" % vin)
+	var ok_removed := await _wait_for_hotplug_event(_hp_removed, vname_in, 3000)
+	if ok_added and ok_removed:
+		print("HOTPLUG_SMOKE_OK added=1 removed=1 (virtual %s)" % vname_in)
+		await _finish_hotplug(0)
+		return
+	print("HOTPLUG_SMOKE_FAIL added=%s removed=%s vin=%d (added=%s removed=%s)" % [
+		str(ok_added), str(ok_removed), vin, str(_hp_added), str(_hp_removed)])
+	await _finish_hotplug(1)
+
+
+func _wait_for_hotplug_event(events: Array, name: String, timeout_ms: int) -> bool:
+	# Match on the port name only: a CoreMIDI virtual "input" port is created
+	# via MIDIDestinationCreate, so RtMidi enumerates it on the output side
+	# (kind=output) — the side is a CoreMIDI quirk, not the point of the smoke.
+	# The add/remove diff is what we're verifying, keyed by name.
+	var start := Time.get_ticks_msec()
+	while true:
+		for e in events:
+			if e[2] == name:
+				return true
+		if Time.get_ticks_msec() - start >= timeout_ms:
+			return false
+		await get_tree().process_frame
+	return false # unreachable: the loop always returns first
+
+
+func _finish_hotplug(code: int) -> void:
+	_hotplug_done = true
+	# Hotplug mode skips instance creation, so nothing to tear down here.
+	get_tree().quit(code)
 
 
 # --------------------------------------------------------------------------

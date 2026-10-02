@@ -9,6 +9,11 @@
 // Conventions:
 //  - *port index*: the backend's device index (PortMidi: Pm device
 //    id, stable within a process). The router treats it as opaque.
+//    NOTE (M4 hotplug): an index is stable only while the device set is
+//    unchanged — a device being plugged/unplugged shifts enumeration
+//    order, so indices must be re-queried after a port add/remove.
+//    (The router's hotplug diff keys by port name, not index, for this
+//    reason.)
 //  - *port handle*: an opaque token the backend assigns per open
 //    stream. NO_HANDLE means "no open port".
 //  - *word*: up to 4 raw MIDI bytes packed low-byte-first into a

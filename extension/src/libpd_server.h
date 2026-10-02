@@ -71,8 +71,11 @@ public:
 	/// virtual ports can still be created — see midi_open_virtual_*).
 	bool midi_available();
 	/// PM device indices + names of devices with an input side.
+	/// NOTE (M4 hotplug): indices are stable only while the device set is
+	/// unchanged — re-query after any midi_port_added / midi_port_removed.
 	Array midi_list_inputs();
-	/// PM device indices + names of devices with an output side.
+	/// PM device indices + names of devices with an output side. (Same
+	/// index-stability note as midi_list_inputs.)
 	Array midi_list_outputs();
 	/// Open PM device p_pm_index as an input port.
 	/// Returns the new port id (>= 0) or -1 on failure.
@@ -108,6 +111,16 @@ public:
 	/// Route p_instance's MIDI output to output port p_port_id.
 	void midi_route_output(LibpdInstance *p_instance, int p_port_id, bool p_add);
 
+	// Hotplug (M4): live device add/remove. midi_port_added / midi_port_removed
+	// fire (from _process) when the periodic re-enumeration detects a change.
+	/// Force an immediate re-enumeration + diff; returns the number of changed
+	/// ports (added + removed), or -1 if MIDI is unavailable / timed out.
+	int midi_refresh_ports();
+	/// Set the hotplug re-enumeration cadence in seconds (default 0.5).
+	void midi_set_poll_interval(double p_seconds);
+	/// Get the hotplug re-enumeration cadence in seconds.
+	double midi_get_poll_interval() const;
+
 	void _process(double p_delta) override;
 
 protected:
@@ -118,6 +131,15 @@ private:
 	struct PortErrorEvent {
 		int port_id = -1;
 		String what;
+	};
+
+	/// One midi_port_added / midi_port_removed signal waiting for emission on
+	/// the main thread (hotplug, M4).
+	struct PortEvent {
+		bool added = false;
+		String kind; // "input" or "output"
+		int index = -1;
+		String name;
 	};
 
 	void _drain_ring();
@@ -146,6 +168,11 @@ private:
 	// or the main-thread open/close timeout path); emitted in
 	// _drain_midi_events().
 	std::vector<PortErrorEvent> pending_port_errors_;
+	// Hotplug port-change events enqueued by the router's on_port_changed
+	// callback (I/O thread); emitted in _drain_midi_events().
+	std::vector<PortEvent> pending_port_events_;
+	// Backs the midi_port_poll_interval property; forwarded to the router.
+	double midi_port_poll_interval_ = 0.5;
 };
 
 } // namespace godot

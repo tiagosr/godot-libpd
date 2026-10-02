@@ -40,6 +40,19 @@ LibpdServer::LibpdServer() {
 		std::lock_guard<std::mutex> lock(midi_mutex);
 		pending_port_errors_.emplace_back(PortErrorEvent{p_port_id, String::utf8(p_what)});
 	};
+	// Hotplug (M4): port add/remove from the router's I/O thread. Copy into
+	// pending_port_events_ under midi_mutex; emission happens in
+	// _drain_midi_events() on the main thread (never here).
+	midi_router.on_port_changed = [this](bool p_added, const char *p_kind, int p_index, const char *p_name) {
+		std::lock_guard<std::mutex> lock(midi_mutex);
+		pending_port_events_.push_back(PortEvent{p_added, String(p_kind), p_index, String(p_name)});
+	};
+	// Trigger the initial re-enumeration now that the callbacks are wired, so
+	// the annotated-on-start baseline (midi_port_added for every device present
+	// at init) fires deterministically and immediately, independent of the
+	// poll interval. (The router's first periodic tick is already deferred one
+	// interval; this makes the startup annotation happen right away.)
+	midi_router.refresh_ports();
 
 	if (singleton_instance != nullptr) {
 		// Tolerate it (editor reloads create temporary duplicates) but warn.
@@ -92,6 +105,10 @@ void LibpdServer::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("midi_poly_aftertouch", PropertyInfo(Variant::INT, "port_id"), PropertyInfo(Variant::INT, "channel"), PropertyInfo(Variant::INT, "pitch"), PropertyInfo(Variant::INT, "value")));
 	ADD_SIGNAL(MethodInfo("midi_sysex", PropertyInfo(Variant::INT, "port_id"), PropertyInfo(Variant::PACKED_BYTE_ARRAY, "data")));
 	ADD_SIGNAL(MethodInfo("midi_port_error", PropertyInfo(Variant::INT, "port_id"), PropertyInfo(Variant::STRING, "what")));
+	// Hotplug (M4): live device add/remove. `kind` is "input"/"output"; index
+	// is the current index (added) or the last remembered index (removed).
+	ADD_SIGNAL(MethodInfo("midi_port_added", PropertyInfo(Variant::STRING, "kind"), PropertyInfo(Variant::INT, "index"), PropertyInfo(Variant::STRING, "name")));
+	ADD_SIGNAL(MethodInfo("midi_port_removed", PropertyInfo(Variant::STRING, "kind"), PropertyInfo(Variant::INT, "index"), PropertyInfo(Variant::STRING, "name")));
 
 	ClassDB::bind_method(D_METHOD("instance_registered", "instance_id"), &LibpdServer::instance_registered);
 	ClassDB::bind_method(D_METHOD("instance_count"), &LibpdServer::instance_count);
@@ -109,6 +126,10 @@ void LibpdServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("midi_close_output", "port_id"), &LibpdServer::midi_close_output);
 	ClassDB::bind_method(D_METHOD("midi_route_input", "port_id", "instance", "add"), &LibpdServer::midi_route_input, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("midi_route_output", "instance", "port_id", "add"), &LibpdServer::midi_route_output, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("midi_refresh_ports"), &LibpdServer::midi_refresh_ports);
+	ClassDB::bind_method(D_METHOD("midi_set_poll_interval", "seconds"), &LibpdServer::midi_set_poll_interval);
+	ClassDB::bind_method(D_METHOD("midi_get_poll_interval"), &LibpdServer::midi_get_poll_interval);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "midi_port_poll_interval"), "midi_set_poll_interval", "midi_get_poll_interval");
 }
 
 bool LibpdServer::instance_registered(int64_t p_instance_id) const {
@@ -292,6 +313,28 @@ void LibpdServer::midi_route_output(LibpdInstance *p_instance, int p_port_id, bo
 	midi_router.route_output(p_instance->instance_id(), p_port_id, p_add);
 }
 
+int LibpdServer::midi_refresh_ports() {
+	if (!midi_available()) {
+		UtilityFunctions::push_error("MIDI not available on this platform");
+		return -1;
+	}
+	// -1 from the router means no I/O thread / timeout (surfaced via
+	// midi_port_error with port_id -1).
+	return midi_router.refresh_ports();
+}
+
+void LibpdServer::midi_set_poll_interval(double p_seconds) {
+	if (p_seconds < 0.01) {
+		p_seconds = 0.01; // avoid a busy re-enumeration loop
+	}
+	midi_port_poll_interval_ = p_seconds;
+	midi_router.set_poll_interval(p_seconds);
+}
+
+double LibpdServer::midi_get_poll_interval() const {
+	return midi_port_poll_interval_;
+}
+
 void LibpdServer::debug_push_print(int64_t p_instance_id, const String &p_text) {
 	godot_libpd::PdEvent e;
 	e.instance_id = p_instance_id;
@@ -404,6 +447,18 @@ void LibpdServer::_drain_midi_events() {
 	}
 	for (const PortErrorEvent &err : errors) {
 		emit_signal("midi_port_error", err.port_id, err.what);
+	}
+
+	// Hotplug port-change events enqueued by the router's on_port_changed
+	// callback (I/O thread); emitted here (main-thread-only signals).
+	std::vector<PortEvent> port_events;
+	{
+		std::lock_guard<std::mutex> lock(midi_mutex);
+		port_events.swap(pending_port_events_);
+	}
+	for (const PortEvent &pe : port_events) {
+		emit_signal(pe.added ? "midi_port_added" : "midi_port_removed",
+				pe.kind, pe.index, pe.name);
 	}
 }
 
