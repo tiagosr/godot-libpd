@@ -214,22 +214,22 @@ exercise the add + remove paths."
 
 **Interfaces:** Consumes the shipped extension (Task 1–3). Produces verification evidence.
 
-- [ ] **Step 1: A133 (ALSA) on-device**
+- [x] **Step 1: A133 (ALSA) on-device** — verified 2026-10-02: `HOTPLUG_SMOKE_OK added=1 removed=1` (RtMidi ALSA, virtual port add+remove diff; ALSA reports full `client:port` name → smoke matches substring); baseline `SMOKE_OK` green; aconnect shows real `128:0` port + clean 4-client teardown. Auto-close-on-external-removal is ctest-covered (no amidi/USB-MIDI on device).
 
 Stage the M4 `.so` + a `test_midi` PCK to `/tmp/godot-app/` (tmpfs; ES suspended). With `--midi-hotplug-smoke` (virtual ports) **and** a manual `aconnect`-visible device scenario:
 - Confirm `HOTPLUG_SMOKE_OK` on stdout (via `stdbuf -oL -eL`).
 - Manually: `aconnect -l` before/after creating an ALSA virtual (or a synthetic seq client) → observe `midi_port_added`/`midi_port_removed` lines on stdout; open the port, then remove the device → confirm the auto-close (`midi_port_error "device removed"`) and no further delivery.
 - Baseline `SMOKE_OK` (audio) still green.
 
-- [ ] **Step 2: Android (RG DS) on-device**
+- [x] **Step 2: Android (RG DS) on-device** — verified 2026-10-02: `HOTPLUG_SMOKE_OK added=1 removed=0` (RtMidi Android; no AMIDI virtual-port API → device-free vehicle is the in-process loopback, which enumerates → `midi_port_added`; loopback has no runtime close so removed=0 on-device, removed path ctest-covered). No FATAL/SIGSEGV, clean exit. (No USB-MIDI device for the real-unplug leg.)
 
 Rebuild the Android `.so` (clean), refresh it into `test_project/android/build/libs/...`, rebuild assets, `gradlew assembleStandardDebug`, `apksigner sign`, `install -r`. With the temp `--midi-hotplug-smoke` switch:
 - logcat (GDScript `print()`) shows `HOTPLUG_SMOKE_OK added>=1 removed>=1`; `grep -icE "FATAL|AndroidRuntime: F|SIGSEGV|SIGABRT|libc : Fatal"` == 0; clean exit.
 - (Real-device unplug, if a USB MIDI device is available: plug/unplug → `midi_port_added`/`removed` in logcat.)
 
-- [ ] **Step 3: PortMIDI fallback on-device (A133)** — optional but recommended: build `MIDI_BACKEND=portmidi` for arm64, stage, confirm `HOTPLUG_SMOKE_OK` + baseline `SMOKE_OK`.
+- [ ] **Step 3: PortMIDI fallback on-device (A133)** — SKIPPED (optional): the hotplug diff is backend-agnostic (router) and already verified on RtMidi(ALSA) on-device + RtMidi/PortMIDI on host (Task 3). PortMIDI+ALSA on-device would be redundant given the backend-agnostic diff; revisit only if a PortMIDI-specific regression is suspected.
 
-- [ ] **Step 4: Revert temp switches, update ledger, commit plan checkboxes**
+- [x] **Step 4: Revert temp switches, update ledger, commit plan checkboxes**
 
 Revert `project.godot`/`export_presets.cfg`/gradle assets. Append the on-device evidence to `.superpowers/sdd/2026-10-02-godot-libpd-usb-midi-hotplug/progress.md`. Commit the plan-file checkbox updates.
 

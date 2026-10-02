@@ -32,14 +32,18 @@ extends Control
 
 ## --midi-hotplug-smoke (headless, device-free hotplug self-test): no
 ## external hardware needed. Sets a fast poll interval (0.05 s), waits for
-## the startup baseline to settle, then opens an app-owned VIRTUAL input
-## port ("libpd test app in 0") — which CoreMIDI/ALSA enumerate into
-## list_ports — and expects a midi_port_added(input); then closes it and
-## expects a midi_port_removed(input). Both observed -> HOTPLUG_SMOKE_OK,
-## quit(0). (Virtual ports are the device-free vehicle: they appear and
-## disappear in the live enumeration exactly like a plugged/unplugged
-## device; the in-process loopback is Android-only, and a real USB device
-## needs a physical plug.)
+## the startup baseline to settle, then drives a device-free port through
+## the re-enumeration diff:
+##   - Host (macOS CoreMIDI / Linux ALSA): opens an app-owned VIRTUAL input
+##     port ("libpd test app in 0") which the OS enumerates into list_ports
+##     -> midi_port_added; closes it -> midi_port_removed. (A CoreMIDI
+##     virtual "input" is a MIDIDestination, so it enumerates on the output
+##     side — the smoke matches on NAME, not side.)
+##   - Android (no AMIDI virtual-port API): uses the in-process loopback
+##     ("hp lb") which enumerates while active -> midi_port_added. The
+##     loopback has no runtime close, so on-device it asserts the added
+##     path; the removed path is ctest-covered + real-unplug.
+## Success -> HOTPLUG_SMOKE_OK, quit(0).
 
 # Both modes load the echo patch (notein -> print test_patch + noteout):
 # smoke mode needs [noteout] for the IAC loopback, GUI mode needs it for
@@ -423,40 +427,64 @@ func _run_hotplug_smoke() -> void:
 	# Let the startup baseline settle: the server constructor's immediate
 	# refresh_ports() fires midi_port_added for devices already present;
 	# after that those devices are in the router's seen_ set, so no further
-	# added fires for them. Clearing here means only OUR virtual port's
+	# added fires for them. Clearing here means only OUR device's
 	# add/remove is observed.
 	await get_tree().create_timer(0.4).timeout
 	_hp_added.clear()
 	_hp_removed.clear()
-	# Open an app-owned virtual input port: CoreMIDI/ALSA enumerate it into
-	# list_ports, so the re-enumeration diff must report midi_port_added.
+	# Primary device-free vehicle: an app-owned virtual input port (macOS
+	# CoreMIDI / Linux ALSA). It enumerates into list_ports, so the
+	# re-enumeration diff must fire midi_port_added on create and
+	# midi_port_removed on close.
 	const vname_in := "libpd test app in 0"
 	var vin := Libpd.server.midi_open_virtual_input()
-	print("HOTPLUG_SMOKE | opened virtual input port=%d name=%s" % [vin, vname_in])
-	var ok_added := await _wait_for_hotplug_event(_hp_added, vname_in, 3000)
-	# Close it: it disappears from enumeration -> midi_port_removed.
 	if vin >= 0:
+		print("HOTPLUG_SMOKE | opened virtual input port=%d name=%s" % [vin, vname_in])
+		var ok_added := await _wait_for_hotplug_event(_hp_added, vname_in, 3000)
+		# Close it: it disappears from enumeration -> midi_port_removed.
 		Libpd.server.midi_close_input(vin)
 		print("HOTPLUG_SMOKE | closed virtual input port=%d" % vin)
-	var ok_removed := await _wait_for_hotplug_event(_hp_removed, vname_in, 3000)
-	if ok_added and ok_removed:
-		print("HOTPLUG_SMOKE_OK added=1 removed=1 (virtual %s)" % vname_in)
+		var ok_removed := await _wait_for_hotplug_event(_hp_removed, vname_in, 3000)
+		if ok_added and ok_removed:
+			print("HOTPLUG_SMOKE_OK added=1 removed=1 (virtual %s)" % vname_in)
+			await _finish_hotplug(0)
+			return
+		print("HOTPLUG_SMOKE_FAIL added=%s removed=%s vin=%d (added=%s removed=%s)" % [
+			str(ok_added), str(ok_removed), vin, str(_hp_added), str(_hp_removed)])
+		await _finish_hotplug(1)
+		return
+	# Fallback (Android: no AMIDI virtual-port API, so midi_open_virtual_input
+	# returns -1): use the in-process loopback as the device-free vehicle. It
+	# enumerates in list_ports() while active, so the diff fires
+	# midi_port_added for its "<name> in" port. The loopback has no runtime
+	# close, so the REMOVED path is verified by the router ctest (Task 1)
+	# and by a real device unplug; on-device we assert the added path here.
+	print("HOTPLUG_SMOKE | virtual input unavailable (vin=%d); using in-process loopback" % vin)
+	var lb := Libpd.server.midi_create_loopback("hp lb")
+	print("HOTPLUG_SMOKE | created loopback=%d" % lb)
+	const lname_in := "hp lb in"
+	var ok_lb_added := await _wait_for_hotplug_event(_hp_added, lname_in, 3000)
+	if ok_lb_added:
+		print("HOTPLUG_SMOKE_OK added=1 removed=0 (loopback %s; removed path ctest-covered + real-unplug)" % lname_in)
 		await _finish_hotplug(0)
 		return
-	print("HOTPLUG_SMOKE_FAIL added=%s removed=%s vin=%d (added=%s removed=%s)" % [
-		str(ok_added), str(ok_removed), vin, str(_hp_added), str(_hp_removed)])
+	print("HOTPLUG_SMOKE_FAIL loopback added=%s lb=%d (added=%s)" % [str(ok_lb_added), lb, str(_hp_added)])
 	await _finish_hotplug(1)
 
 
-func _wait_for_hotplug_event(events: Array, name: String, timeout_ms: int) -> bool:
-	# Match on the port name only: a CoreMIDI virtual "input" port is created
-	# via MIDIDestinationCreate, so RtMidi enumerates it on the output side
-	# (kind=output) — the side is a CoreMIDI quirk, not the point of the smoke.
-	# The add/remove diff is what we're verifying, keyed by name.
+func _wait_for_hotplug_event(events: Array, name_substr: String, timeout_ms: int) -> bool:
+	# Match on a SUBSTRING of the port name, not an exact string: backends
+	# report different name formats — CoreMIDI reports the bare port name
+	# ("libpd test app in 0"), while ALSA reports "client:port client:port"
+	# ("godot-libpd:libpd test app in 0 128:0"). The add/remove diff is keyed
+	# by whatever list_ports() returns, so we match the stable core substring.
+	# (Name-only match: a CoreMIDI/ALSA virtual "input" port is a
+	# MIDIDestination/snd_seq input, so it may enumerate on the output side —
+	# the side is backend-specific, not the point of the smoke.)
 	var start := Time.get_ticks_msec()
 	while true:
 		for e in events:
-			if e[2] == name:
+			if name_substr in e[2]:
 				return true
 		if Time.get_ticks_msec() - start >= timeout_ms:
 			return false
