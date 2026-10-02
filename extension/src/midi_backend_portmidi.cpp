@@ -311,28 +311,11 @@ const std::string &PortMidiBackend::last_error() const {
 	return last_error_;
 }
 
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
-std::unique_ptr<MidiBackend> create_midi_backend() {
-	return std::make_unique<PortMidiBackend>();
-}
-
-} // namespace godot_libpd
-
-#else // PORTMIDI_ENABLED
-
-#include "midi_backend.h"
-
-namespace godot_libpd {
-
-std::unique_ptr<MidiBackend> create_midi_backend() {
-	// No PortMidi in this build (stub / pre-RtMidi Android). The router
-	// degrades to the inert stub, as the pre-v2 stub builds did.
-	return nullptr;
-}
-
 } // namespace godot_libpd
 
 #endif // PORTMIDI_ENABLED
+
+// The platform factory (create_midi_backend) lives in
+// midi_backend_factory.cpp — it selects PortMidiBackend on
+// macOS/Linux (PORTMIDI_ENABLED), RtMidiAndroidBackend on Android
+// (__ANDROID__), and nullptr on hosts without a platform backend.

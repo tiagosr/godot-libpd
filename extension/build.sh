@@ -51,7 +51,7 @@ case "${1:-}" in
 			-DCMAKE_ANDROID_NDK="$NDK" \
 			-DCMAKE_ANDROID_STL_TYPE=c++_shared \
 			-DANDROID_ABI=arm64-v8a \
-			-DANDROID_PLATFORM=android-21 \
+			-DANDROID_PLATFORM=android-29 \
 			-DCMAKE_BUILD_TYPE=Release \
 			-DBUILD_PORTMIDI=OFF
 		build build/cmake-android-arm64

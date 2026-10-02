@@ -40,7 +40,7 @@ set(PD_BUILD_C_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/libpd EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
-# PortMidi static (v1: compiled in, not wired up; no Android backend)
+# PortMidi static (macOS/Linux; no Android — the RtMidi backend there)
 # ---------------------------------------------------------------------------
 option(BUILD_PORTMIDI "Compile PortMIDI into the extension" ON)
 if(ANDROID)
@@ -53,6 +53,15 @@ if(BUILD_PORTMIDI)
 endif()
 
 # ---------------------------------------------------------------------------
+# RtMidi static (Android only — the RtMidiAndroidBackend; the local
+# sysex fix is pinned at submodule commit 759d4e6)
+# ---------------------------------------------------------------------------
+if(ANDROID)
+    set(RTMIDI_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    add_subdirectory(thirdparty/rtmidi EXCLUDE_FROM_ALL)
+endif()
+
+# ---------------------------------------------------------------------------
 # The GDExtension
 # ---------------------------------------------------------------------------
 add_library(godot_libpd SHARED
@@ -62,6 +71,8 @@ add_library(godot_libpd SHARED
     src/libpd_worker.cpp
     src/midi_router.cpp
     src/midi_backend_portmidi.cpp
+    src/midi_backend_rtmidi.cpp
+    src/midi_backend_factory.cpp
     src/core/pd_event_ring.cpp
     src/core/pd_command_queue.cpp
     src/core/pd_midi_framer.cpp
@@ -91,6 +102,9 @@ if(BUILD_PORTMIDI)
     # MidiRouter compiles against the vendored PortMIDI 2.0.7 only when
     # the backend is built in; otherwise it degrades to inert stubs.
     target_compile_definitions(godot_libpd PRIVATE PORTMIDI_ENABLED)
+endif()
+if(ANDROID)
+    target_link_libraries(godot_libpd PRIVATE rtmidi)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -153,12 +167,24 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         tests/midi_backend_fake_tests.cpp
         src/midi_router.cpp
         src/midi_backend_portmidi.cpp
+        src/midi_backend_factory.cpp
         src/core/pd_midi_framer.cpp
         src/core/pd_command_queue.cpp
     )
     target_include_directories(midi_backend_fake_tests PRIVATE src)
     target_link_libraries(midi_backend_fake_tests PRIVATE pthread)
     add_test(NAME midi_backend_fake_tests COMMAND $<TARGET_FILE:midi_backend_fake_tests>)
+
+    # v2 M2 Task 2: the RtMidi Android backend's platform-free seams
+    # (word chop, device-position translation, word ring) — header-only
+    # logic, tested on every host; the AMIDI glue itself is verified
+    # on device (M2 Task 3/4).
+    add_executable(midi_rtmidi_seam_tests
+        tests/midi_rtmidi_seam_tests.cpp
+    )
+    target_include_directories(midi_rtmidi_seam_tests PRIVATE src)
+    target_link_libraries(midi_rtmidi_seam_tests PRIVATE pthread)
+    add_test(NAME midi_rtmidi_seam_tests COMMAND $<TARGET_FILE:midi_rtmidi_seam_tests>)
 
     if(BUILD_PORTMIDI)
         # Task 7: PortMIDI virtual device lifecycle (create -> open ->
@@ -179,6 +205,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             tests/midi_open_bounds_tests.cpp
             src/midi_router.cpp
             src/midi_backend_portmidi.cpp
+            src/midi_backend_factory.cpp
             src/core/pd_midi_framer.cpp
         )
         target_include_directories(midi_open_bounds_tests PRIVATE src)
