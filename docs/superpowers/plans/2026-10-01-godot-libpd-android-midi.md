@@ -125,6 +125,24 @@ crashes; macOS ctest 11/11, MIDI_SMOKE_OK (IAC), SMOKE_OK all green.
 - Final verification by controller: ctest 9/9 (or new count), macOS
   `MIDI_SMOKE_OK`, tree clean.
 
+STATUS (controller, 2026-10-02): COMPLETE.
+- loopback note smoke: MIDI_SMOKE_OK on the Anbernic RK3568 (Android 14;
+  RG DS unavailable during this stretch — identical OS-level constraints
+  and loopback contract).
+- multi-instance fan-out A->B: added to the Android smoke leg, verified on
+  device (MIDI_SMOKE_OK print=1 note=1 fanout=1, B id=2; commit 0ba718a219).
+- sysex input: NOT exercisable on a hardware-free device (input-only by
+  design; no sysex output API) — recorded as a documented limitation, not a
+  silent pass. Reassembly logic covered by host read-stage tests + the
+  RtMidi vendor fix (759d4e6).
+- CC capture: GUI/MIDI-Learn flow, needs a real controller; unchanged from
+  the M1 macOS IAC verification.
+- docs: docs/android-build.md (JavaVM mechanism + OEM hardening + signing),
+  extension/README.md (MIDI backends section), spec status -> implemented,
+  SDD ledger updated.
+- Final verification: macOS ctest 11/11, macOS MIDI_SMOKE_OK (IAC) exit 0,
+  baseline SMOKE_OK exit 0, tree clean, temp switches reverted.
+
 ## Device protocol
 
 - RG DS stays adb-connected through tasks 0, 3, 4.
