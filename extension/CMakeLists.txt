@@ -25,6 +25,12 @@ add_subdirectory(thirdparty/godot-cpp EXCLUDE_FROM_ALL)
 # ---------------------------------------------------------------------------
 # libpd (+ pd) static, multi-instance
 # ---------------------------------------------------------------------------
+# Multi-instance MIDI hook attribution REQUIRES PD_MULTI: only then is
+# each worker's instancedata/hook state per instance (thread-local
+# pd_this); PD_MULTI OFF falls back to one process-wide libpd_mainimp
+# and every instance's hooks misroute to the last-initialized worker.
+# See README "Multi-instance MIDI hook attribution" and tests/
+# multi_instance_midi_tests.cpp. Do not turn this OFF.
 set(PD_MULTI ON CACHE BOOL "" FORCE)
 set(PD_UTILS OFF CACHE BOOL "" FORCE)
 set(PD_EXTRA OFF CACHE BOOL "" FORCE)
@@ -178,4 +184,24 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     )
     target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp pthread)
     add_test(NAME worker_midi_tests COMMAND $<TARGET_FILE:libpd_worker_midi_tests>)
+
+    # Multi-instance regression (P1-1 investigated, disproven): per-instance
+    # hook attribution with two real workers + routed fan-out A -> port -> B
+    # at the hook level. The fan-out uses the pure header-only
+    # MidiRoutingTable plus a local mirror of MidiRouter::build_command, so
+    # no PortMIDI I/O ever happens (same sources as libpd_worker_midi_tests).
+    add_executable(multi_instance_midi_tests
+        tests/multi_instance_midi_tests.cpp
+        src/libpd_worker.cpp
+        src/core/pd_command_queue.cpp
+        src/core/pd_debug.cpp
+        src/core/pd_audio_sink_generator.cpp
+    )
+    target_include_directories(multi_instance_midi_tests PRIVATE
+        src
+        thirdparty/libpd/libpd_wrapper
+        thirdparty/libpd/libpd_wrapper/util
+    )
+    target_link_libraries(multi_instance_midi_tests PRIVATE libpd_static godot-cpp pthread)
+    add_test(NAME multi_instance_midi_tests COMMAND $<TARGET_FILE:multi_instance_midi_tests>)
 endif()
