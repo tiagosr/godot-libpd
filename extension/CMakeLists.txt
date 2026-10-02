@@ -248,6 +248,8 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             src thirdparty/rtmidi)
         target_link_libraries(midi_rtmidi_host_backend_tests PRIVATE
             rtmidi pthread)
+        target_compile_definitions(midi_rtmidi_host_backend_tests PRIVATE
+            RTMIDI_HOST_ENABLED)
         if(APPLE)
             target_link_libraries(midi_rtmidi_host_backend_tests PRIVATE
                 "-framework CoreMIDI" "-framework CoreAudio"

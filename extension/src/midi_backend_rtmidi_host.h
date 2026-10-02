@@ -33,7 +33,7 @@
 
 #pragma once
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && defined(RTMIDI_HOST_ENABLED)
 
 #include <memory>
 #include <mutex>
@@ -159,4 +159,4 @@ private:
 
 } // namespace godot_libpd
 
-#endif // !__ANDROID__
+#endif // !__ANDROID__ && RTMIDI_HOST_ENABLED

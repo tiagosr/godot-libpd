@@ -11,7 +11,7 @@
 // 4.9: openVirtualPort both directions + aconnect loopback with note
 // and 7-byte sysex).
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && defined(RTMIDI_HOST_ENABLED)
 
 #include "midi_backend_rtmidi_host.h"
 
