@@ -110,17 +110,45 @@ sleep:
 - `backend_->list_ports()` is const and self-locked (already called from the
   API thread by `list_inputs`); calling it from the I/O thread is safe.
 
+**Transient-empty guard (debounce).** A backend `list_ports()` can transiently
+return an **empty** list (a bad probe tick on CoreMIDI/ALSA/AMIDI). A naive
+diff would read that as "every device removed" and auto-close every open
+port. But the *only device unplugged* case is also a genuine empty list — so a
+plain "skip empty" guard would miss a real unplug. The diff therefore uses a
+**2-consecutive-empty debounce**:
+
+- New list **non-empty** → apply the diff normally (adds + removals), update
+  `seen_`, clear `pending_empty_`.
+- New list **empty**:
+  - `seen_` empty → nothing to do.
+  - `seen_` non-empty and `pending_empty_ == false` → set
+    `pending_empty_ = true`, **skip** (wait for confirmation).
+  - `seen_` non-empty and `pending_empty_ == true` → **confirm** empty: apply
+    removals (all removed), set `seen_` empty, clear `pending_empty_`.
+
+A transient blip (recovers within one tick) is ignored; a real unplug
+(persists to the next tick, ~one `poll_interval` later) is applied.
+
 ### 4.2 Router — `Port` record
 
 Add to `Port`:
 
-- `bool real_device = false;` — set **true only for OS-enumerated opens**
-  (`open_input` / `open_output`). `open_virtual_input/output` and
-  `create_virtual_loopback` leave it **false**, so those ports are never
-  closed by the diff (they are app-owned, not OS-enumerated).
+- `bool real_device = false;` — true only for ports backed by an OS/device
+  endpoint that can hot-plug. Set in `open_port` from a router-maintained
+  `std::set<int> non_real_indices_` (I/O-thread-only): a port is
+  `real_device` iff its open index is **not** in that set. The set is populated
+  by the only producers of non-real indices, both on the I/O thread:
+  - `OPEN_VIRTUAL_*`: the `create_virtual_*` `device_index` is inserted.
+  - `CREATE_LOOPBACK`: snapshot `list_ports()` before/after
+    `backend_->create_virtual_loopback(name)`; the new indices are inserted.
+  So `open_input`/`open_output` on a **real** device index → `real_device=true`;
+  the same calls on a loopback index, or `open_virtual_*`, → `false`. Only
+  `real_device` ports are auto-closed by the diff (virtual/loopback are
+  app-owned and never closed by it). `close_port` is idempotent, so even a
+  stray close of an already-closed port is a safe no-op.
 - `std::string device_name;` — the backend port name captured at open time, used
-  to match a removed key to the open port(s). (Index is not used for matching —
-  it is volatile.)
+  to match a removed key to the open port(s). (Index is **not** used for
+  matching — it is volatile; the match is on `(direction, device_name)`.)
 
 ### 4.3 Router — refresh control op
 
@@ -171,8 +199,10 @@ router methods from the I/O thread** (re-entrancy contract).
 ### 4.7 Error handling
 
 - **Dead open port:** detected only by the diff (host backends don't `FATAL` on
-  unplug). On removal, the matching `real_device` port is closed →
+  unplug). On a *confirmed* removal, the matching `real_device` port is closed →
   `midi_port_error(port_id, "device removed")` + `midi_port_removed(...)`.
+  Transient empty `list_ports()` is debounced (§4.1), so a bad tick never
+  closes live ports and a real "last device" unplug is still caught.
 - **Refresh timeout:** reuses the 500 ms control-op wait; a timeout is surfaced
   via `midi_port_error(-1, ...)`.
 - **Name collision:** two ports with the same `(direction, name)` are treated as
@@ -211,6 +241,14 @@ router methods from the I/O thread** (re-entrancy contract).
    *not* spuriously removed (proves name-keyed diff, not index-keyed).
 5. **Refresh** — `refresh_ports()` returns the correct change count.
 6. **Poll interval** — with a short interval the diff runs; events land.
+7. **Transient-empty debounce** — `list_ports()` returns empty for exactly one
+   tick then recovers → **no** `port_removed`, no auto-close (the blip is
+   ignored). Returns empty for **two** consecutive ticks (the only device
+   unplugged) → `port_removed` fires + the open `real_device` port is closed.
+8. **Virtual/loopback not auto-closed** — a virtual (or loopback) port
+   disappears from the list → `port_removed` fires but the (already-closed)
+   non-`real_device` port is left untouched; a `real_device` port with the
+   same name **is** closed.
 
 ### 7.2 Host smoke (device-free safe)
 
