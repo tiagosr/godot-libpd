@@ -72,6 +72,7 @@ var _smoke_active := false
 var _smoke_start := 0
 var _smoke_got_print := false
 var _smoke_got_note := false
+var _smoke_got_fanout := false # android: 2nd instance's print via loopback fan-out
 var _smoke_done := false
 var _smoke_sysex: PackedByteArray = PackedByteArray()
 
@@ -300,19 +301,41 @@ func _run_smoke_android() -> void:
 	Libpd.server.midi_sysex.connect(func(_port: int, data: PackedByteArray) -> void:
 		if _smoke_sysex.is_empty():
 			_smoke_sysex = data)
+	# Multi-instance fan-out leg: a SECOND instance (B, same echo patch)
+	# is fed from the SAME loopback input — A's [noteout] echo circulates
+	# back through the loopback and must reach B as well. B is
+	# input-only (its [noteout] is NOT routed, so no A<->B ping-pong);
+	# B's receipt is observed on its own print output (instance_print
+	# carries the instance id — per-instance attribution check).
+	var b := LibpdInstance.new()
+	add_child(b)
+	if not b.init(int(AudioServer.get_mix_rate())):
+		await _smoke_fail("fan-out instance B init failed")
+		return
+	if b.load_patch("res://data/smoke_patch.pd") != Error.OK:
+		await _smoke_fail("fan-out instance B load failed")
+		return
+	if b.start_dsp() != Error.OK:
+		await _smoke_fail("fan-out instance B start_dsp failed")
+		return
+	Libpd.server.midi_route_input(_in_port, b, true) # fan-out: keep A too
+	var b_id: int = b.instance_id
+	Libpd.server.instance_print.connect(func(id: int, _text: String) -> void:
+		if id == b_id:
+			_smoke_got_fanout = true)
 	_instance.send_midi(0, 60, 100)
-	print("MIDI_SMOKE | note sent, waiting up to %d ms for print + looped note_on" % SMOKE_TIMEOUT_MS)
-	while not (_smoke_got_print and _smoke_got_note):
+	print("MIDI_SMOKE | note sent, waiting up to %d ms for print + looped note_on + B fan-out print" % SMOKE_TIMEOUT_MS)
+	while not (_smoke_got_print and _smoke_got_note and _smoke_got_fanout):
 		if Time.get_ticks_msec() - _smoke_start >= SMOKE_TIMEOUT_MS:
 			break
 		await get_tree().process_frame
-	if _smoke_got_print and _smoke_got_note:
-		print("MIDI_SMOKE_OK print=1 note=1 (android loopback in_idx=%d out_idx=%d)" % [in_idx, out_idx])
+	if _smoke_got_print and _smoke_got_note and _smoke_got_fanout:
+		print("MIDI_SMOKE_OK print=1 note=1 fanout=1 (android loopback in_idx=%d out_idx=%d, B id=%d)" % [in_idx, out_idx, b_id])
 		_report_smoke_sysex()
 		await _finish_smoke(0)
 		return
-	await _smoke_fail("timeout print=%s note=%s (android loopback in_idx=%d out_idx=%d)" % [
-			str(_smoke_got_print), str(_smoke_got_note), in_idx, out_idx])
+	await _smoke_fail("timeout print=%s note=%s fanout=%s (android loopback in_idx=%d out_idx=%d)" % [
+			str(_smoke_got_print), str(_smoke_got_note), str(_smoke_got_fanout), in_idx, out_idx])
 
 
 func _find_name_suffix_index(ports: Array, name: String) -> int:
