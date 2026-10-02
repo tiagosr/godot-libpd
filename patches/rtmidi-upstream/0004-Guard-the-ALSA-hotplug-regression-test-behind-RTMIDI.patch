@@ -1,0 +1,32 @@
+From 748eb75faa011a4be5f01f401d51ceb502e8f69c Mon Sep 17 00:00:00 2001
+From: tiago <tiago@local>
+Date: Fri, 2 Oct 2026 19:26:39 +0200
+Subject: [PATCH 4/4] Guard the ALSA hotplug regression test behind
+ RTMIDI_BUILD_HOTPLUG_TEST
+
+The hotplug test builds and runs a linker-wrapped fixture as part of
+the normal build. When RtMidi is embedded in a larger project (the
+godot-libpd GDExtension), that build-time test is unwanted; the option
+(ON by default, preserving standalone behavior) lets embedders opt out.
+---
+ CMakeLists.txt | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 101b90e..3df4153 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -236,7 +236,9 @@ if(RTMIDI_BUILD_MODULES)
+ endif()
+ 
+ # Compile and run hotplug regression tests whenever the ALSA library is built.
+-if("alsa" IN_LIST API_LIST)
++option(RTMIDI_BUILD_HOTPLUG_TEST
++  "Build and run the ALSA hotplug regression test." ON)
++if("alsa" IN_LIST API_LIST AND RTMIDI_BUILD_HOTPLUG_TEST)
+   include(tests/AlsaHotplug.cmake)
+   rtmidi_add_hotplug_test(rtmidi "${CMAKE_CURRENT_SOURCE_DIR}")
+ endif()
+-- 
+2.54.0
+

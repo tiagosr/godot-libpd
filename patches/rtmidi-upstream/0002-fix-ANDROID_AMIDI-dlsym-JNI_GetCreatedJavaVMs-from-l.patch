@@ -1,0 +1,77 @@
+From 9727ab6d2b5cbd1e01467d403e73453900cd6934 Mon Sep 17 00:00:00 2001
+From: Tiago Rezende <tiagosr@gmail.com>
+Date: Fri, 2 Oct 2026 15:03:52 +0200
+Subject: [PATCH 2/4] fix(ANDROID_AMIDI): dlsym JNI_GetCreatedJavaVMs from
+ libart.so
+
+Local fix (second, on top of the sysex fix) for NDK builds: the
+NDK does not ship a linkable libart.so, so the direct call to
+JNI_GetCreatedJavaVMs in androidGetThreadEnv() fails the
+--no-undefined link of Android shared libraries built with NDK
+r25-class toolchains. Resolve the entry point at runtime from the
+device's libart.so (the app process always has exactly one JVM),
+cached with std::call_once.
+---
+ RtMidi.cpp | 35 ++++++++++++++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/RtMidi.cpp b/RtMidi.cpp
+index b8ad3b0..d7b556b 100644
+--- a/RtMidi.cpp
++++ b/RtMidi.cpp
+@@ -368,8 +368,10 @@ class MidiOutWeb: public MidiOutApi
+ #define LOG_TAG "RtMidi"
+ #include <amidi/AMidi.h>
+ #include <android/log.h>
++#include <dlfcn.h>
+ #include <pthread.h>
+ #include <atomic>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ #include <jni.h>
+@@ -5509,15 +5511,34 @@ static std::vector<jobject> androidMidiDevices;
+ //*********************************************************************//
+ 
+ static JNIEnv* androidGetThreadEnv() {
+-  // Every Android app has only one JVM. Calling JNI_GetCreatedJavaVMs
+-  // will retrieve the JVM running the app.
+-  jsize jvmsFound = 0;
+-  JavaVM jvms[1];
+-  JavaVM* pjvms = jvms;
+-  jint result = JNI_GetCreatedJavaVMs(&pjvms, 1, &jvmsFound);
++  // Every Android app has only one JVM. JNI_GetCreatedJavaVMs
++  // retrieves it — but the NDK does not ship a linkable libart.so
++  // (NDK r25 and friends), so the symbol must be dlsym'ed from the
++  // runtime libart.so instead of called directly (a direct call
++  // fails the --no-undefined link of Android shared libraries).
++  static JavaVM* jvm = nullptr;
++  static std::once_flag jvmOnce;
++  std::call_once(jvmOnce, []() {
++    void* handle = dlopen("libart.so", RTLD_NOW);
++    if (handle == nullptr) {
++      LOGE("dlopen(libart.so) failed");
++      return;
++    }
++    auto fn = (jint (*)(JavaVM**, jsize, jsize*)) dlsym(handle, "JNI_GetCreatedJavaVMs");
++    if (fn == nullptr) {
++      LOGE("dlsym(JNI_GetCreatedJavaVMs) failed");
++      return;
++    }
++    JavaVM* vms[1] = { nullptr };
++    jsize found = 0;
++    if (fn(vms, 1, &found) == JNI_OK && found == 1) {
++      jvm = vms[0];
++    }
++  });
++  JavaVM* pjvms = jvm;
+ 
+   // Something went terribly wrong, no JVM was found
+-  if (jvmsFound != 1 || result != JNI_OK) {
++  if (pjvms == nullptr) {
+       LOGE("No JVM found");
+       return NULL;
+   }
+-- 
+2.54.0
+

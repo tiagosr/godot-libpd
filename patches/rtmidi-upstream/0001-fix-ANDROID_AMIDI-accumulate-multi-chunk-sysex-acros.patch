@@ -1,0 +1,52 @@
+From 759d4e6f86eac36ae350ff64c468f7981328aca4 Mon Sep 17 00:00:00 2001
+From: Tiago Rezende <tiagosr@gmail.com>
+Date: Fri, 2 Oct 2026 14:27:08 +0200
+Subject: [PATCH 1/4] fix(ANDROID_AMIDI): accumulate multi-chunk sysex across
+ poll iterations; raise receive buffer to 512
+
+Local fix on top of pinned master 23b8cd5 (same local-fix pattern as
+the vendored PortMIDI in this project).
+
+1. MidiInAndroid::pollMidi used a copy of inputData_.message
+   (auto message = self->inputData_.message); sysex continuation
+   bytes accumulated into that local across loop iterations via
+   continueSysex and were discarded each iteration, so the callback
+   only ever received the FINAL chunk of a multi-chunk sysex,
+   without the leading F0. Use a reference instead, matching the
+   CoreMidi and JACK backends in the same file.
+
+2. MAX_BYTES_TO_RECEIVE was 128; a complete MIDI-1 sysex can be
+   257 bytes (F0 + 255 data + F7). Raise to 512 for headroom.
+---
+ RtMidi.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/RtMidi.cpp b/RtMidi.cpp
+index 22ea0a5..b8ad3b0 100644
+--- a/RtMidi.cpp
++++ b/RtMidi.cpp
+@@ -5766,7 +5766,7 @@ void* MidiInAndroid :: pollMidi(void* context) {
+   auto self = (MidiInAndroid*) context;
+   self->reading = true;
+ 
+-  const size_t MAX_BYTES_TO_RECEIVE = 128;
++  const size_t MAX_BYTES_TO_RECEIVE = 512;
+   uint8_t incomingMessage[MAX_BYTES_TO_RECEIVE];
+ 
+   while (self->reading) {
+@@ -5814,7 +5814,11 @@ void* MidiInAndroid :: pollMidi(void* context) {
+     }
+ 
+     if (numMessagesReceived > 0 && numBytesReceived >= 0) {
+-      auto message = self->inputData_.message;
++      // Reference, not copy: sysex continuation bytes accumulate into
++      // inputData_.message across loop iterations (continueSysex) and a
++      // copy here would discard everything except the final chunk
++      // (matches the CoreMidi/JACK backends' message reference).
++      MidiInApi::MidiMessage &message = self->inputData_.message;
+ 
+       if (self->inputData_.firstMessage == true) {
+         message.timeStamp = 0.0;
+-- 
+2.54.0
+

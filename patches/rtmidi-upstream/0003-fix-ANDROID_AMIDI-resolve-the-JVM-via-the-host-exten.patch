@@ -1,0 +1,65 @@
+From b8b27207a259ba76e7134c673c8d6016d66aa0b1 Mon Sep 17 00:00:00 2001
+From: Tiago Rezende <tiagosr@gmail.com>
+Date: Fri, 2 Oct 2026 16:56:39 +0200
+Subject: [PATCH 3/4] fix(ANDROID_AMIDI): resolve the JVM via the host
+ extension's resolver
+
+An Android 14 app's linker namespace blocks BOTH dlsym(RTLD_DEFAULT,
+"JNI_GetCreatedJavaVMs") (the VM is not in the global scope) and
+dlopen of libart ("not accessible for the namespace clns-N"), so
+the previous dlsym fallback found no JVM and every real-port open
+failed. The host GDExtension (same .so) now exports
+gdpd_rtmidi_host_java_vm(), which resolves the JavaVM through a
+/proc/self/mem ELF scan of the already-mapped libart; consult it
+first, keep the RTLD lookup as fallback.
+---
+ RtMidi.cpp | 28 +++++++++++++++++++---------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/RtMidi.cpp b/RtMidi.cpp
+index d7b556b..7f134c5 100644
+--- a/RtMidi.cpp
++++ b/RtMidi.cpp
+@@ -5513,20 +5513,30 @@ static std::vector<jobject> androidMidiDevices;
+ static JNIEnv* androidGetThreadEnv() {
+   // Every Android app has only one JVM. JNI_GetCreatedJavaVMs
+   // retrieves it — but the NDK does not ship a linkable libart.so
+-  // (NDK r25 and friends), so the symbol must be dlsym'ed from the
+-  // runtime libart.so instead of called directly (a direct call
+-  // fails the --no-undefined link of Android shared libraries).
++  // (NDK r25 and friends) and, on Android 14, an app's linker
++  // namespace cannot even dlopen libart by path, so the symbol
++  // must be obtained at runtime instead of called directly (a
++  // direct call fails the --no-undefined link of Android shared
++  // libraries). Preferred source: the host GDExtension (same .so)
++  // exports gdpd_rtmidi_host_java_vm(), which resolves the JavaVM
++  // via a /proc/self/mem ELF scan of the already-mapped libart
++  // (dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs") fails in app
++  // namespaces: the VM is not in the global scope). The RTLD
++  // lookup of the host symbol itself succeeds because it lives
++  // in the same default-namespace .so as this code.
+   static JavaVM* jvm = nullptr;
+   static std::once_flag jvmOnce;
+   std::call_once(jvmOnce, []() {
+-    void* handle = dlopen("libart.so", RTLD_NOW);
+-    if (handle == nullptr) {
+-      LOGE("dlopen(libart.so) failed");
+-      return;
++    auto host = (JavaVM* (*)()) dlsym(nullptr, "gdpd_rtmidi_host_java_vm");
++    if (host != nullptr) {
++      jvm = host();
++      if (jvm != nullptr) {
++        return;
++      }
+     }
+-    auto fn = (jint (*)(JavaVM**, jsize, jsize*)) dlsym(handle, "JNI_GetCreatedJavaVMs");
++    auto fn = (jint (*)(JavaVM**, jsize, jsize*)) dlsym(nullptr, "JNI_GetCreatedJavaVMs");
+     if (fn == nullptr) {
+-      LOGE("dlsym(JNI_GetCreatedJavaVMs) failed");
++      LOGE("dlsym(RTLD_DEFAULT, JNI_GetCreatedJavaVMs) failed");
+       return;
+     }
+     JavaVM* vms[1] = { nullptr };
+-- 
+2.54.0
+
