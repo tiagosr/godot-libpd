@@ -10,6 +10,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-02-godot-libpd-usb-midi-hotplug-design.md`
 
+> **STATUS: MILESTONE COMPLETE (2026-10-02).** All five tasks done and
+> verified: router diff (ctest 10/10 RtMidi + 11/11 PortMIDI), refresh +
+> server API, and on-device hotplug on both devices (A133 RtMidi ALSA
+> `HOTPLUG_SMOKE_OK added=1 removed=1`; Android RtMidi `added=1 removed=0`
+> via the in-process loopback). Spec → implemented; SDD ledger closed.
+
 ## Global Constraints
 
 - All `libpd_*` on instance worker threads; **all backend port ops on the MIDI I/O thread**; Godot signals on the main thread only. (Inherited, spec §5.)
@@ -32,7 +38,7 @@
 
 ---
 
-### Task 1: Router hotplug re-enumeration + diff engine
+### Task 1: Router hotplug re-enumeration + diff engine (COMPLETE)
 
 **Files:**
 - Modify: `extension/src/midi_router.h` (add `on_port_changed`, `set_poll_interval`, `Port.real_device`+`device_name`, `PortKey`, diff state members, `REFRESH`-adjacent scaffolding, `reenum_and_diff`).
@@ -110,7 +116,7 @@ set_poll_interval + immediate first tick (annotated-on-start)."
 
 ---
 
-### Task 2: Router `refresh_ports()` + REFRESH control op
+### Task 2: Router `refresh_ports()` + REFRESH control op (COMPLETE)
 
 **Files:**
 - Modify: `extension/src/midi_router.h` (add `REFRESH` to `ControlOpType`; declare + implement `refresh_ports()`).
@@ -146,7 +152,7 @@ changed-port count; timeout -> midi_port_error(-1)."
 
 ---
 
-### Task 3: Server GDScript API + host smoke
+### Task 3: Server GDScript API + host smoke (COMPLETE)
 
 **Files:**
 - Modify: `extension/src/libpd_server.h` (two signals, `PortEvent`, `pending_port_events_`, `midi_refresh_ports()`, `midi_set_poll_interval`/`midi_get_poll_interval` + `midi_port_poll_interval` property, amended list-method docs).
@@ -208,7 +214,7 @@ exercise the add + remove paths."
 
 ---
 
-### Task 4: On-device verification (A133 ALSA + Android RG DS) + PortMIDI regression
+### Task 4: On-device verification (A133 ALSA + Android RG DS) + PortMIDI regression (COMPLETE)
 
 **Files:** none in-repo (verification only; may touch `test_project` scene wiring if a device-specific knob is needed). Update the SDD ledger + plan checkboxes.
 
@@ -235,7 +241,7 @@ Revert `project.godot`/`export_presets.cfg`/gradle assets. Append the on-device 
 
 ---
 
-### Task 5: Docs + closure
+### Task 5: Docs + closure (COMPLETE)
 
 **Files:**
 - Modify: `extension/README.md` (MIDI backends section → add hotplug; new "USB-MIDI hotplugging (M4)" section: signals, refresh, poll interval, debounce, non-goals).

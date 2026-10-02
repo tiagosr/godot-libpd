@@ -1,6 +1,7 @@
 # v2 M4 — USB-MIDI Hotplugging (live device add/remove)
 
-**Status:** proposed (2026-10-02)
+**Status:** implemented (2026-10-02; M4 Task 5 closure — see
+`../plans/2026-10-02-godot-libpd-usb-midi-hotplug.md`, all tasks complete)
 **Depends on:** v2 M1 (MIDI I/O + `MidiBackend`), M2 (RtMidi Android), M3 (RtMidi
 host). Builds on the existing server-wide `MidiRouter` + `MidiBackend` seam; adds
 no new backend interface surface.

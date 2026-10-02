@@ -65,7 +65,7 @@ last called `libpd_set_instancedata`. Do not turn `PD_MULTI` off.
 > appears only in that worker's queue, and a routed A -> port -> B
 > fan-out reaches only B.
 
-## MIDI backends (v2 M1 + M2 + M3)
+## MIDI backends (v2 M1–M4)
 
 MIDI I/O is owned **server-wide** by `LibpdServer` (not per instance) and
 runs on a single dedicated **MIDI I/O thread** (`MidiRouter`). All `libpd_*`
@@ -174,7 +174,57 @@ does not expose sysex send). A 127-data-byte cap applies per message.
   regression test behind `RTMIDI_BUILD_HOTPLUG_TEST` so embedders can skip
   its build-time check (`748eb75`).
 
-### On-device verification status (M2 + M3)
+### USB-MIDI hotplugging (M4)
+
+Live device add/remove. The router periodically re-enumerates the backend's
+`list_ports()` (default cadence 0.5 s) and diffs the set, firing
+`midi_port_added` / `midi_port_removed` on the main thread for changes.
+This is the **only** mechanism — no backend (CoreMIDI / ALSA / AMIDI)
+exposes a public "port changed" push callback, so every backend is polled.
+
+**The diff is keyed by (direction, name), not index.** Port indices are not
+stable across device-set changes on any backend, so the diff matches ports
+by the name `list_ports()` reports (CoreMIDI's bare port name, ALSA's
+`"client:port client:port"`, AMIDI's device name) and remembers the last
+index seen for removal reporting.
+
+- **Signals** — `midi_port_added(kind, index, name)` and
+  `midi_port_removed(kind, index, name)`; `kind` is `"input"`/`"output"`,
+  `index` is the current index on add and the last remembered index on
+  remove. **Annotated on start**: the constructor's immediate
+  `refresh_ports()` fires `midi_port_added` for every device present at
+  init (deterministic, independent of the poll interval).
+- **`midi_refresh_ports()`** — forces an immediate re-enumeration + diff;
+  returns the number of changed ports (added + removed), or -1 if MIDI is
+  unavailable / the I/O thread did not respond.
+- **`midi_port_poll_interval`** (property, seconds, default 0.5, min 0.01) —
+  the re-enumeration cadence; `midi_set_poll_interval()` / 
+  `midi_get_poll_interval()`.
+- **Removal debounce** — a device (or the whole set) is reported removed only
+  after **two consecutive** empty/absent enumerations, so a transient bad
+  probe tick (any backend can momentarily return an empty list) does not
+  flap ports. A single missing tick is ignored.
+- **Auto-close on removal** — open **real-device** ports whose device
+  disappeared are auto-closed and reported via
+  `midi_port_error(port, "device removed")`. App-owned **non-real** ports
+  (virtual ports, the in-process loopback) are *not* auto-closed by the
+  diff.
+- **Non-goals** — no **auto-reopen** on reconnect (the app re-opens the
+  port itself by re-querying `list_ports()`); no **stable port tokens**
+  (indices shift, so re-query `midi_list_inputs()`/`midi_list_outputs()`
+  after any `midi_port_*`); **no `MidiBackend` interface change** (hotplug is
+  entirely router-side, over `list_ports()`).
+
+**Device-free self-test** — `test_project/scripts/test_midi.gd
+--midi-hotplug-smoke` drives the add/remove diff without hardware: on host it
+opens/closes an app-owned **virtual** port (CoreMIDI/ALSA enumerate it, so
+`port_added` on open, `port_removed` on close → full add + remove); on
+Android (no AMIDI virtual-port API) it creates the **in-process loopback**,
+which enumerates while active → `port_added` (the loopback has no runtime
+close, so the removed leg is ctest-covered there). `HOTPLUG_SMOKE_OK` on all
+three platforms.
+
+### On-device verification status (M2–M4)
 
 - **Android (M2, Anbernic RK3568; M3 regression on Retroid RG DS):**
   `MIDI_SMOKE_OK print=1 note=1 fanout=1` over the in-process loopback,
@@ -191,6 +241,13 @@ does not expose sysex send). A 127-data-byte cap applies per message.
   "MIDI I/O (RtMidi — ALSA sequencer)".
 - **PortMIDI fallback (M3):** `MIDI_BACKEND=portmidi` builds and its macOS
   IAC smoke reports `[MIDI] backend=PortMIDI` + `MIDI_SMOKE_OK`.
+- **Hotplug (M4):** A133 (RtMidi ALSA) `HOTPLUG_SMOKE_OK added=1 removed=1`
+  (virtual-port add + remove; ALSA reports the full `client:port` name, so
+  the smoke matches a name substring); Android (RtMidi) `HOTPLUG_SMOKE_OK
+  added=1 removed=0` (in-process loopback — no AMIDI virtual port, no runtime
+  loopback close); macOS (RtMidi CoreMIDI) `HOTPLUG_SMOKE_OK added=1
+  removed=1`. All device-free; the auto-close-on-external-removal path is
+  ctest-covered (no USB-MIDI hardware on the devices).
 
 **Sysex input and CC capture are not exercisable on a device with no MIDI
 hardware** (input-only sysex by design; CC needs a real controller) — the
@@ -200,4 +257,5 @@ deferred milestone.
 
 See `../docs/superpowers/specs/2026-10-01-godot-libpd-android-midi-design.md`
 (status: implemented), `../docs/superpowers/specs/2026-10-02-godot-libpd-rtmidi-full-design.md`
+(status: implemented), `../docs/superpowers/specs/2026-10-02-godot-libpd-usb-midi-hotplug-design.md`
 (status: implemented), and their plans.

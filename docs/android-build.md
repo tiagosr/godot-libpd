@@ -175,3 +175,37 @@ After rebuilding the extension `.so`, copy it to
 before `gradlew assembleStandardDebug`, otherwise the APK keeps the stale
 `.so` (the Godot `--export-debug` step refreshes it too).
 
+### Hotplug (M4) — live device add/remove on Android
+
+The router re-enumerates the backend's `list_ports()` every
+`midi_port_poll_interval` seconds (default 0.5) and fires
+`midi_port_added` / `midi_port_removed` on the main thread, keyed by
+**(direction, name)** — not index. On Android each re-enumeration is a fresh
+`MidiManager.getDevices()` JNI query (via RtMidi's AMIDI `getPortCount()`/`getPortName()`),
+so a plugged/unplugged USB-MIDI device is picked up on the next tick.
+Removal is debounced (two consecutive empty enumerations); open real-device
+ports whose device disappeared are auto-closed with
+`midi_port_error(port, "device removed")`. **No auto-reopen** — the app
+re-opens by re-querying `midi_list_inputs()`/`midi_list_outputs()` after a
+`midi_port_added`.
+
+**Device-free vehicle: the in-process loopback.** Android has no AMIDI
+virtual-port API (`midi_open_virtual_input()` returns -1), so the
+device-free self-test uses the backend's in-process loopback
+(`midi_create_loopback(name)`, device indices 200 in / 201 out), which
+enumerates in `list_ports()` while active → fires `midi_port_added`. The
+loopback has **no runtime close**, so on-device it verifies the *added*
+path only; the *removed* path is ctest-covered and exercised by a real
+USB-MIDI unplug.
+
+**Visibility is logcat-only.** GDScript `print()` reaches Android logcat; C
+`printf` (e.g. the router's `[MIDI] backend=<name>` startup line) does
+**not**. So the hotplug self-test's `HOTPLUG_SMOKE_*` lines appear in logcat
+but the C-level backend banner does not.
+
+Self-test: temp-switch the Android preset `command_line/extra_args` to
+`"--headless --midi-hotplug-smoke"` and the project `run/main_scene` to
+`res://scenes/test_midi.tscn`, re-export + sign + install, launch, then
+`adb logcat -d | grep HOTPLUG` → `HOTPLUG_SMOKE_OK added=1 removed=0
+(loopback ...)`.
+

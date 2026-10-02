@@ -189,6 +189,33 @@ tick-timestamped events on a queue the port's client does not own. All
   out-of-bounds descriptor read on the I/O thread — the original A133
   freeze.
 
+**Hotplug (M4) — live device add/remove.** The router re-enumerates
+`list_ports()` every `midi_port_poll_interval` seconds (default 0.5) and
+fires `midi_port_added` / `midi_port_removed` on the main thread, keyed by
+**(direction, name) — not index** (indices shift when the device set
+changes). Removal is debounced (**two consecutive empty enumerations**) so a
+transient bad ALSA probe tick doesn't flap ports; open real-device ports
+whose device disappeared are auto-closed with
+`midi_port_error(port, "device removed")`. No auto-reopen (the app re-opens
+by re-querying `list_ports()`).
+
+On the A133 the device-free vehicle is the app's own virtual ports (the
+backend creates real snd_seq clients visible to `aconnect`):
+`midi_open_virtual_input()` makes the port appear → `midi_port_added`;
+`midi_close_input()` makes it vanish → `midi_port_removed`. The ALSA name is
+the full `"godot-libpd:<port> <client>:<port>"` string (e.g.
+`"godot-libpd:libpd test app in 0 128:0"`), unlike CoreMIDI's bare name —
+match on a substring. An external plug/unplug (USB-MIDI) exercises the same
+diff plus the auto-close path (ctest-covered; the A133 has no USB-MIDI port
+and no `amidi`).
+
+Device-free self-test: stage `test.pck` (main scene `test_midi.tscn`) + the
+`.so`, then `stdbuf -oL -eL ./test --midi-hotplug-smoke` →
+`HOTPLUG_SMOKE_OK added=1 removed=1`. **Run it foreground in the same adb
+command** — a backgrounded app on the A133 stalls at init (fbdev/vsync +
+SIGHUP on adb close); the `<basename>.pck` + `uikeys` + `stdbuf` gotchas
+above apply.
+
 ## v1 status (all verified on the Brick)
 
 - [x] Engine load + extension load (SMOKE_OK headless, 10/10)
