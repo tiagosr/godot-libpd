@@ -1,0 +1,37 @@
+From 883b32f4054f86ad15ef61dc1e4278744ed41e05 Mon Sep 17 00:00:00 2001
+From: Tiago Rezende <tiagosr@gmail.com>
+Date: Thu, 1 Oct 2026 21:15:24 +0200
+Subject: [PATCH 1/2] fix(portmidi): Pm_OpenInput missing bounds check (A133
+ freeze)
+
+Upstream asymmetry: Pm_OpenOutput validates outputDevice against
+pm_descriptor_len, Pm_OpenInput does not. On a device where the ALSA
+sequencer exposes zero SUBS-capable ports (A133: pm_descriptor_len ==
+0), Pm_OpenInput(0) read pm_descriptors out of bounds (UB, app freeze
+on the I/O thread). Mirror Pm_OpenOutput's check.
+---
+ pm_common/portmidi.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/pm_common/portmidi.c b/pm_common/portmidi.c
+index f016216..afe0559 100644
+--- a/pm_common/portmidi.c
++++ b/pm_common/portmidi.c
+@@ -955,7 +955,13 @@ PMEXPORT PmError Pm_OpenInput(PortMidiStream** stream,
+     *stream = NULL;  /* invariant: *stream == midi */
+     
+     /* arg checking */
+-    if (!pm_descriptors[inputDevice].pub.input) 
++    /* Bounds check mirroring Pm_OpenOutput: an out-of-range id would
++       read pm_descriptors out of bounds (UB — the A133 enumerates
++       zero devices). Upstream PortMIDI bug: Pm_OpenOutput has this
++       check, Pm_OpenInput does not. */
++    if (inputDevice < 0 || inputDevice >= pm_descriptor_len)
++        err = pmInvalidDeviceId;
++    else if (!pm_descriptors[inputDevice].pub.input) 
+         err =  pmInvalidDeviceId;
+     else if (pm_descriptors[inputDevice].pub.opened)
+         err =  pmInvalidDeviceId;
+-- 
+2.54.0
+

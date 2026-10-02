@@ -1,0 +1,63 @@
+From 6be63b777e99dbfd33ee7afd17b13b0910b40856 Mon Sep 17 00:00:00 2001
+From: Tiago Rezende <tiagosr@gmail.com>
+Date: Thu, 1 Oct 2026 21:15:24 +0200
+Subject: [PATCH 2/2] fix(portmidi): ALSA virtual ports stamped with
+ pre-allocation seq queue never delivered (A133)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+alsa_create_virtual() stamped the port's timestamp queue with the
+global `queue` variable, which is zero-initialized and only
+lazy-allocated by alsa_use_queue() at the first Pm_Open. Virtual
+ports created before that first open therefore carried queue 0 — a
+queue owned by a different client (on the A133 it is owned by
+PipeWire-RT-Event and Stopped). The ALSA sequencer schedules
+tick-timestamped events on that queue, so events addressed to our
+virtual input were never delivered; aconnect loopback into the
+virtual input silently produced nothing.
+
+Guard the three timestamp lines on queue_used > 0; ports created
+before the shared queue exists keep the kernel default (real-time)
+timestamping, which delivers correctly. Verified on-device: A133
+aconnect out->in loopback into the app's own virtual ports
+delivers note_on after this guard.
+---
+ pm_linux/pmlinuxalsa.c | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/pm_linux/pmlinuxalsa.c b/pm_linux/pmlinuxalsa.c
+index 2ad0973..376efd2 100644
+--- a/pm_linux/pmlinuxalsa.c
++++ b/pm_linux/pmlinuxalsa.c
+@@ -354,10 +354,23 @@ static PmError alsa_create_virtual(int is_input, const char *name,
+     snd_seq_port_info_set_name(pinfo, name);
+     snd_seq_port_info_set_port(pinfo, id);
+     snd_seq_port_info_set_port_specified(pinfo, 1);
+-    /* next 3 lines needed to generate timestamp - PaulLiu */
+-    snd_seq_port_info_set_timestamping(pinfo, 1);
+-    snd_seq_port_info_set_timestamp_real(pinfo, 0);
+-    snd_seq_port_info_set_timestamp_queue(pinfo, queue);
++    /* next 3 lines needed to generate timestamp - PaulLiu.
++       Guarded: the shared queue is lazy-allocated by alsa_use_queue()
++       at the first Pm_Open, so at virtual-port creation time `queue`
++       is still its zero-initialized default — a queue owned by a
++       different client (on the A133 it is queue 0, owned by
++       PipeWire-RT-Event). A port stamped with a queue its client does
++       not own never receives events (the ALSA sequencer drops the
++       tick-scheduled delivery), so loopback into the virtual input
++       silently delivered nothing there. Ports created before the
++       queue exists keep the kernel default (real-time) timestamping,
++       which delivers correctly; event timestamps are ignored by
++       handle_event anyway. */
++    if (queue_used > 0) {
++        snd_seq_port_info_set_timestamping(pinfo, 1);
++        snd_seq_port_info_set_timestamp_real(pinfo, 0);
++        snd_seq_port_info_set_timestamp_queue(pinfo, queue);
++    }
+ 
+     err = snd_seq_create_port(seq, pinfo);
+     if (err < 0) {
+-- 
+2.54.0
+
