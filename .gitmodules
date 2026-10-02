@@ -8,3 +8,6 @@
 [submodule "extension/thirdparty/portmidi"]
 	path = extension/thirdparty/portmidi
 	url = https://github.com/PortMidi/PortMidi.git
+[submodule "extension/thirdparty/rtmidi"]
+	path = extension/thirdparty/rtmidi
+	url = https://github.com/thestk/rtmidi.git

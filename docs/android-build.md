@@ -71,3 +71,58 @@ arrives).
 Retroid "RG DS" (API 34, arm64-v8a): debug and release APKs both `SMOKE_OK`
 (engine 4.6.2 official template, extension from `lib/arm64-v8a/`, all six
 smoke steps including MIDI round-trip and two concurrent instances).
+
+## 5. Gradle build + Android MIDI (v2 M2)
+
+Since M2 the Android preset uses the **gradle source build** (needed to
+compile the RtMidi `MidiDeviceOpenedListener` Java class into the APK):
+
+- `test_project/android/build/` — the official 4.6.2 `android_source.zip`
+  template (installed layout: build dir = `res://android/build`, marker
+  `res://android/.build_version`).
+- `test_project/android/build/src/main/java/com/yellowlab/rtmidi/MidiDeviceOpenedListener.java`
+  — RtMidi's required listener (from `extension/thirdparty/rtmidi/contrib/java/`).
+- Preset options: `gradle_build/use_gradle_build=true`,
+  `gradle_build/min_sdk=29`, `gradle_build/target_sdk=35`
+  (minSdk 29 because the NDK **AMidi** C API is API 29+; the Java MIDI
+  API itself is 26).
+- Export: `--export-debug Android ...` runs the gradle build; the APK
+  lands in `test_project/android/build/build/outputs/apk/standard/debug/`
+  (gradle build dir is gitignored).
+- The device screen must be **awake/unlocked** for the app to run
+  (even `--headless`): `adb shell input keyevent KEYCODE_WAKEUP` before
+  launching.
+- RtMidi NDK cross-compile facts (NDK 25.1.8937393): legacy toolchain
+  vars (`ANDROID_ABI=arm64-v8a ANDROID_PLATFORM=android-29
+  ANDROID_STL=c++_shared`), `RTMIDI_API_AMIDI=ON`; RtMidi's CMake omits
+  `-ljvm` — the extension supplies a `JNI_GetCreatedJavaVMs` shim that
+  dlsyms the real function from `libart.so` (NDK r25 ships no
+  `libjvm.so`).
+
+### MIDI on the Retroid ROM (device prep, RG DS)
+
+The Retroid ROM (V1.15, Android 14) has the MIDI framework classes but
+`SystemServer` only starts the MIDI system service when
+`hasSystemFeature("android.software.midi")` — the ROM ships without
+that feature, so `MidiManager` was unusable. Fix (root, persistent in
+`/system`):
+
+    adb remount
+    adb push midi_feature.xml /system/etc/permissions/midi_feature.xml
+    adb shell chcon u:object_r:system_file:s0 /system/etc/permissions/midi_feature.xml
+    adb reboot
+
+`midi_feature.xml`:
+
+    <?xml version="1.0" encoding="utf-8"?>
+    <permissions>
+        <feature name="android.hardware.midi" />
+        <feature name="android.software.midi" />
+    </permissions>
+
+After reboot: `service list | grep midi` → `midi:
+[android.media.midi.IMidiManager]`, `dumpsys midi` works. Note the
+service name is `midi` (not `media.midi`). The RG DS has **zero**
+system MIDI ports (no USB/BT MIDI hardware) — device MIDI testing uses
+the backend's in-process virtual loopback.
+

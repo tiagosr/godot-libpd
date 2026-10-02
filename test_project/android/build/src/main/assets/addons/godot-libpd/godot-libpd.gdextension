@@ -1,0 +1,14 @@
+[configuration]
+
+entry_symbol = "godot_libpd_library_init"
+compatibility_minimum = "4.5"
+reloadable = true
+
+[libraries]
+
+macos.debug = "../../../extension/build/macos/libgodot_libpd.dylib"
+macos.release = "../../../extension/build/macos/libgodot_libpd.dylib"
+linux.debug.arm64 = "../../../extension/build/linux/libgodot_libpd.so"
+linux.release.arm64 = "../../../extension/build/linux/libgodot_libpd.so"
+android.debug.arm64 = "../../../extension/build/android-arm64/libgodot_libpd.so"
+android.release.arm64 = "../../../extension/build/android-arm64/libgodot_libpd.so"

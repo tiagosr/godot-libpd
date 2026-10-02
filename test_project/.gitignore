@@ -2,3 +2,4 @@
 !.godot/extension_list.cfg
 dist/*
 export_templates/*
+android/build/build/
