@@ -164,6 +164,18 @@ void LibpdWorker::push_command(const PdCommand &p_command) {
 	queue.push(p_command);
 }
 
+void LibpdWorker::close_patch() {
+	if (patch_handle == nullptr) {
+		return;
+	}
+	if (config.role == WorkerRole::MIXER && pd_instance != nullptr) {
+		// Re-bind before closefile (see the declaration, Task 4 finding).
+		libpd_set_instance(pd_instance);
+	}
+	libpd_closefile(patch_handle);
+	patch_handle = nullptr;
+}
+
 void LibpdWorker::emit_print(const char *p_text) {
 	if (!config.on_event) {
 		return;
@@ -236,8 +248,10 @@ void LibpdWorker::run() {
 			break;
 		}
 
-		// 2) dsp block + pacing.
-		if (dsp_on.load() && pd_instance != nullptr && patch_handle != nullptr) {
+		// 2) dsp block + pacing (M5 Task 5: MIXER never renders — the
+		//    PortAudio callback renders the mix instance, not the worker).
+		if (dsp_on.load() && pd_instance != nullptr && patch_handle != nullptr &&
+				config.role != WorkerRole::MIXER) {
 			if (!last_dsp_branch) {
 				wlog(config.instance_id, "dsp branch: ON");
 				last_dsp_branch = true;
@@ -246,7 +260,12 @@ void LibpdWorker::run() {
 			const int frames = bs * n_out;
 			if ((int)out_buffer.size() >= frames) {
 				libpd_process_float(1, nullptr, out_buffer.data());
-				if (config.sink != nullptr) {
+				if (config.role == WorkerRole::SYNTH) {
+					// Hand the block to the mix-down's per-worker ring.
+					if (config.worker_ring != nullptr) {
+						config.worker_ring->push(out_buffer.data(), bs);
+					}
+				} else if (config.sink != nullptr) {
 					config.sink->push_block(out_buffer.data(), bs, n_out);
 				}
 			}
@@ -281,18 +300,23 @@ void LibpdWorker::run() {
 		}
 	}
 
-	// Teardown on the worker thread (spec §5).
-	if (patch_handle != nullptr) {
-		wlog(config.instance_id, "teardown: libpd_closefile start");
-		libpd_closefile(patch_handle);
-		patch_handle = nullptr;
-		wlog(config.instance_id, "teardown: libpd_closefile done");
-	}
-	if (pd_instance != nullptr) {
-		wlog(config.instance_id, "teardown: libpd_free_instance start");
-		libpd_free_instance(pd_instance);
-		pd_instance = nullptr;
-		wlog(config.instance_id, "teardown: libpd_free_instance done; thread exit");
+	// Teardown on the worker thread (spec §5). MIXER runs the whole
+	// teardown under with_mixer_lock: the PortAudio callback may still be
+	// rendering the mix instance (Task 4 finding).
+	if (patch_handle != nullptr || pd_instance != nullptr) {
+		with_lock([&] {
+			if (patch_handle != nullptr) {
+				wlog(config.instance_id, "teardown: libpd_closefile start");
+				close_patch();
+				wlog(config.instance_id, "teardown: libpd_closefile done");
+			}
+			if (pd_instance != nullptr) {
+				wlog(config.instance_id, "teardown: libpd_free_instance start");
+				libpd_free_instance(pd_instance);
+				pd_instance = nullptr;
+				wlog(config.instance_id, "teardown: libpd_free_instance done; thread exit");
+			}
+		});
 	}
 }
 
@@ -306,71 +330,76 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 
 	switch (p_command.opcode) {
 		case PdCommand::INIT: {
-			wlog(config.instance_id, "INIT: libpd_new_instance start");
-			{
-				static std::once_flag pd_globals_once;
-				std::call_once(pd_globals_once, [] {
-					const int err = libpd_init();
-					if (err != 0) {
-						std::fprintf(stderr, "godot-libpd: libpd_init() failed (%d)\n", err);
-					}
-				});
-			}
-			pd_instance = libpd_new_instance();
-			wlog(config.instance_id, "INIT: libpd_new_instance done (null=%d)", pd_instance == nullptr);
-			if (pd_instance == nullptr) {
-				fulfill(-1);
-				return;
-			}
-			libpd_set_instance(pd_instance);
-			samplerate = p_command.i32;
-			const int n_ins = (int)((p_command.i64 / 1000) & 0xFF);
-			n_out = (int)(p_command.i64 & 0xFF);
-			wlog(config.instance_id, "INIT: libpd_init_audio start (%d/%d/%d)", n_ins, n_out, samplerate);
-			const int err = libpd_init_audio(n_ins, n_out, samplerate);
-			wlog(config.instance_id, "INIT: libpd_init_audio done (err=%d)", err);
-			if (err != 0) {
-				fulfill(-1);
-				return;
-			}
-			// Turn pd's dsp engine on once; the dsp_on flag in run() gates whether
-			// libpd_process_float is actually called (libpd has no realtime callback).
-			libpd_start_message(1);
-			libpd_add_float(1.0f);
-			libpd_finish_message("pd", "dsp");
-			blocksize = libpd_blocksize();
-			out_buffer.resize((size_t)blocksize * n_out);
-			libpd_set_printhook(c_printhook);
-			install_midi_output_hooks(this);
-			wlog(config.instance_id, "INIT: done (blocksize=%d)", blocksize);
-			fulfill(0);
+			// MIXER: the PortAudio callback may be rendering the mix instance
+			// concurrently, so the whole INIT body runs under with_mixer_lock
+			// (Task 4 finding). SYNTH/ANDROID: runs as-is (existing path).
+			with_lock([&] {
+				wlog(config.instance_id, "INIT: libpd_new_instance start");
+				{
+					static std::once_flag pd_globals_once;
+					std::call_once(pd_globals_once, [] {
+						const int err = libpd_init();
+						if (err != 0) {
+							std::fprintf(stderr, "godot-libpd: libpd_init() failed (%d)\n", err);
+						}
+					});
+				}
+				pd_instance = libpd_new_instance();
+				wlog(config.instance_id, "INIT: libpd_new_instance done (null=%d)", pd_instance == nullptr);
+				if (pd_instance == nullptr) {
+					fulfill(-1);
+					return;
+				}
+				libpd_set_instance(pd_instance);
+				samplerate = p_command.i32;
+				const int n_ins = (int)((p_command.i64 / 1000) & 0xFF);
+				n_out = (int)(p_command.i64 & 0xFF);
+				wlog(config.instance_id, "INIT: libpd_init_audio start (%d/%d/%d)", n_ins, n_out, samplerate);
+				const int err = libpd_init_audio(n_ins, n_out, samplerate);
+				wlog(config.instance_id, "INIT: libpd_init_audio done (err=%d)", err);
+				if (err != 0) {
+					fulfill(-1);
+					return;
+				}
+				// Turn pd's dsp engine on once; the dsp_on flag in run() gates whether
+				// libpd_process_float is actually called (libpd has no realtime callback).
+				libpd_start_message(1);
+				libpd_add_float(1.0f);
+				libpd_finish_message("pd", "dsp");
+				blocksize = libpd_blocksize();
+				out_buffer.resize((size_t)blocksize * n_out);
+				libpd_set_printhook(c_printhook);
+				install_midi_output_hooks(this);
+				wlog(config.instance_id, "INIT: done (blocksize=%d)", blocksize);
+				fulfill(0);
+			});
 			return;
 		}
 		case PdCommand::LOAD: {
-			if (patch_handle != nullptr) {
-				libpd_closefile(patch_handle);
-				patch_handle = nullptr;
-			}
-			const std::string name = p_command.path;
-			// libpd_openfile takes (file, dir).
-			const size_t slash = name.find_last_of("/\\");
-			const std::string file = (slash == std::string::npos) ? name : name.substr(slash + 1);
-			const std::string dir = (slash == std::string::npos) ? "." : name.substr(0, slash);
-			if (!p_command.search.empty()) {
-				libpd_add_to_search_path(p_command.search.c_str());
-			}
-			wlog(config.instance_id, "LOAD: libpd_openfile start (%s, %s)", file.c_str(), dir.c_str());
-			patch_handle = libpd_openfile(file.c_str(), dir.c_str());
-			wlog(config.instance_id, "LOAD: libpd_openfile done (ok=%d)", patch_handle != nullptr);
-			fulfill(patch_handle != nullptr ? 0 : -1);
+			// MIXER: openfile is RT-sensitive — under with_mixer_lock (Task 4).
+			with_lock([&] {
+				close_patch();
+				const std::string name = p_command.path;
+				// libpd_openfile takes (file, dir).
+				const size_t slash = name.find_last_of("/\\");
+				const std::string file = (slash == std::string::npos) ? name : name.substr(slash + 1);
+				const std::string dir = (slash == std::string::npos) ? "." : name.substr(0, slash);
+				if (!p_command.search.empty()) {
+					libpd_add_to_search_path(p_command.search.c_str());
+				}
+				wlog(config.instance_id, "LOAD: libpd_openfile start (%s, %s)", file.c_str(), dir.c_str());
+				patch_handle = libpd_openfile(file.c_str(), dir.c_str());
+				wlog(config.instance_id, "LOAD: libpd_openfile done (ok=%d)", patch_handle != nullptr);
+				fulfill(patch_handle != nullptr ? 0 : -1);
+			});
 			return;
 		}
 		case PdCommand::UNLOAD: {
-			if (patch_handle != nullptr) {
-				libpd_closefile(patch_handle);
-				patch_handle = nullptr;
-			}
-			fulfill(0);
+			// MIXER: closefile is RT-sensitive — under with_mixer_lock (Task 4).
+			with_lock([&] {
+				close_patch();
+				fulfill(0);
+			});
 			return;
 		}
 		case PdCommand::MESSAGE: {

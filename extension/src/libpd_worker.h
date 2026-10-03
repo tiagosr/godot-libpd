@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/midi_output_queue.h"
+#include "core/mix_input_ring.h"
 #include "core/pd_audio_sink.h"
 #include "core/pd_command_queue.h"
 #include "core/pd_event_ring.h"
@@ -31,6 +32,18 @@ namespace godot_libpd {
  */
 class LibpdWorker {
 public:
+	/**
+	 * What the worker does with audio (M5 Task 5):
+	 * - ANDROID: the existing a1/generator path — render, push to
+	 *   config.sink (default: existing tests + Android unchanged).
+	 * - SYNTH: render, but push each block to config.worker_ring — the
+	 *   NativeAudio mix-down gathers it in the PortAudio callback.
+	 * - MIXER: control-only — the PortAudio callback renders the mix
+	 *   instance, so the worker never calls libpd_process_float; its
+	 *   RT-sensitive control ops run under config.with_mixer_lock.
+	 */
+	enum class WorkerRole { SYNTH, MIXER, ANDROID };
+
 	struct Config {
 		int64_t instance_id = 0;
 		int samplerate = 44100;
@@ -39,6 +52,16 @@ public:
 		PdAudioSink *sink = nullptr;
 		// Hook event delivery (thread-safe; may be null).
 		std::function<void(const PdEvent &)> on_event;
+
+		// M5 role (default: ANDROID — the existing a1/generator behavior).
+		WorkerRole role = WorkerRole::ANDROID;
+		// SYNTH only: ring the DSP loop pushes rendered blocks to instead
+		// of config.sink. null = SYNTH renders to nowhere.
+		MixInputRing *worker_ring = nullptr;
+		// MIXER only: serialize RT-sensitive control ops with the
+		// PortAudio callback's mix render (Task 4 finding). Unset = the
+		// op runs as-is.
+		std::function<void(std::function<void()>)> with_mixer_lock;
 	};
 
 	explicit LibpdWorker(Config p_config);
@@ -66,6 +89,15 @@ public:
 		return config.instance_id;
 	}
 
+	/**
+	 * This worker's pd instance — valid after the INIT command completes,
+	 * nullptr before. Task 6 uses this to bind the NativeAudio mix-down
+	 * (set_mixer(mix.pd, mix_n_in, 2) on the mixer worker's instance).
+	 */
+	t_pdinstance *pd_instance_ptr() const {
+		return pd_instance;
+	}
+
 	/// Called by the C printhook (worker thread context).
 	void emit_print(const char *p_text);
 	/// Called by the C noteonhook (worker thread context).
@@ -90,6 +122,33 @@ public:
 private:
 	void run();
 	void execute_command(const PdCommand &p_command);
+
+	/**
+	 * Run p_op on the worker thread, serialized against the PortAudio
+	 * callback ONLY for MIXER role with a configured with_mixer_lock
+	 * (Task 4 finding: the callback renders the mix instance
+	 * concurrently). SYNTH/ANDROID — and MIXER without a lock — run p_op
+	 * as-is, exactly like the existing lock-free path.
+	 */
+	template <class F>
+	void with_lock(F &&p_op) {
+		if (config.role == WorkerRole::MIXER && config.with_mixer_lock) {
+			config.with_mixer_lock(std::function<void()>(std::forward<F>(p_op)));
+		} else {
+			std::forward<F>(p_op)();
+		}
+	}
+
+	/**
+	 * Close the open patch (worker thread only). MIXER first re-binds
+	 * this thread's pd_this to its own instance: libpd_closefile does
+	 * NOT self-bind — it runs pd_free(canvas) under the calling
+	 * thread's thread-local pd_this, and a prior libpd_free_instance on
+	 * that thread would have reset the binding to the main libpd
+	 * instance (Task 4 teardown finding). Harmless no-op if already
+	 * bound.
+	 */
+	void close_patch();
 
 	Config config;
 	std::thread thread;
