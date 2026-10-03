@@ -1,15 +1,21 @@
 # godot-libpd v2 (M5/M6): Native audio backends (a2) + audio input — Design
 
-Status: proposed (Approach A + PortAudio spike validated on macOS 2026-10-03 — see §2 facts and §4.5)
+Status: proposed, **architecture revised 2026-10-03** (Approach A's single
+shared RT thread is infeasible for multi-instance — pd global state breaks on
+`pd_this` switching; revised to per-instance workers + a mix-down instance
+rendered in the PortAudio callback; repro-validated at 9 concurrent instances).
+See §2 constraints, §4, §4.5, §10.
 Supersedes nothing; extends `2026-09-27-godot-libpd-gdextension-design.md`
 (the v1 spec listed "native audio backends a2: CoreAudio / OpenSL ES / ALSA"
 and "audio input / microphone capture" as v2 items, and left the sink behind
 the `PdAudioSink` interface for exactly this swap).
 
-Chosen approach: **PortAudio** as the native backend, with the libpd DSP
-running **inside PortAudio's real-time stream callback** ("Approach A" — see
-§4). **AAudio/Oboe is integrated as a new PortAudio hostapi backend** to cover
-Android (M6).
+Chosen approach: **PortAudio** as the native backend (device stream +
+latency/enumeration). Per-instance libpd DSP runs on the **existing a1 worker
+threads** (one pinned audio thread per instance); the overall **EQ+FX mix-down
+is a dedicated libpd instance rendered in PortAudio's real-time stream
+callback** (§4). **AAudio/Oboe is integrated as a new PortAudio hostapi
+backend** to cover Android (M6).
 
 ## 1. Purpose & success criteria
 
@@ -91,10 +97,19 @@ the API surfaces are untested beyond that).
 - **v1 fail-fast** on `AudioServer.get_mix_rate() != instance samplerate`
   goes away with native audio (no more Godot mix-rate coupling); the
   constraint becomes "instance samplerate == open stream sample rate."
-- **Multi-instance** (v1 requirement): each `LibpdInstance` owns one pd
-  instance + one worker thread. Under Approach A there is **one** hardware
-  output device, so all instances are rendered and mixed on one shared
-  real-time thread (§4.3).
+- **Multi-instance — HARD CONSTRAINT (repro-confirmed 2026-10-03):**
+  `libpd_set_instance()` is a thread-local (`pd_this`), but pd's **global**
+  dsp/scheduler state cannot survive *switching* `pd_this` between live
+  instances mid-dsp. A shared thread doing `set_instance(A); process_float;
+  set_instance(B); process_float` **crashes** (`EXC_BAD_ACCESS`) with ≥2
+  instances — even 2 merely existing (one rendered) crashes. **One dedicated
+  thread per instance** (each `set_instance` once, then loop) supports **9+
+  concurrent instances** (repro: 8 stereo synth workers + 16-in/2-out mix-down
+  on a separate render thread, no crash). So the audio model is **one audio
+  thread per instance** (the a1 worker model) + a **mix-down instance** on the
+  PortAudio callback thread (§4). Corroborated: "libpd doesn't support multiple
+  instances because there are global variables" + libpd#406. Repros:
+  `spike/mi_*`.
 
 ## 3. Public API (GDScript)
 
@@ -118,6 +133,12 @@ Libpd.audio_blocksize() -> int
 Libpd.audio_sample_rate() -> int
 Libpd.audio_input_enabled() -> bool
 Libpd.audio_latency_estimate_ms() -> float      # device-block + driver floor
+Libpd.set_mixer(instance: LibpdInstance) -> bool
+    # Designate the mix-down instance (a 16-in/2-out patch: [adc~ 1..16] ->
+    # EQ+FX -> [dac~]). It is rendered in the PortAudio callback; its 16
+    # inputs are the 8 synth workers' stereo pairs. All other instances are
+    # synth workers feeding their MixInputRing. Must be called before the
+    # mixer's start_dsp(); re-designating swaps the callback's target.
 
 # ---- per instance (LibpdInstance) — v1 signature, now wired to the stream ----
 LibpdInstance.init(samplerate: int = 44100, n_ins: int = 0, n_out: int = 2) -> bool
@@ -147,80 +168,94 @@ Semantics:
   existing Android behavior is unchanged. (The a1 path stays compiled until
   M6 retires it.)
 
-## 4. Architecture & threading — Approach A
+## 4. Architecture & threading — per-instance workers + mix-down in the audio callback
 
-libpd's DSP runs **on the single real-time audio thread** (the PortAudio
-stream callback). The worker threads become pure **control** threads. This is
-the model that delivers the §1 goals: one clock, no ring, direct device
-buffers, input for free.
+**Constraint that shapes the whole design (repro-confirmed 2026-10-03):**
+libpd's `libpd_set_instance()` sets a thread-local `pd_this`, but pd's
+**global** dsp/scheduler state cannot survive *switching* `pd_this` between
+instances mid-dsp. Reproduced: a shared thread doing
+`set_instance(A); process_float; set_instance(B); process_float` **crashes**
+(`EXC_BAD_ACCESS`) with ≥2 live instances — even 2 instances merely *existing*
+(only one rendered) crashes. Conversely, **one dedicated thread per instance**
+(each calls `set_instance` exactly once, then loops `process_float`) supports
+**9+ concurrent instances** cleanly. Corroborated upstream ("libpd doesn't
+support multiple instances because there are global variables"; libpd#406).
+
+**Consequence:** the original "Approach A" (one shared RT thread rendering
+*all* instances) is **infeasible for multi-instance**. The adopted model keeps
+**one audio thread per instance** — exactly v1's a1 worker-thread model — and
+moves the *mix* into a dedicated **mix-down libpd instance** rendered on the
+PortAudio callback thread.
 
 ```
-Real-time audio thread  (NEW, owned by LibpdServer; the ONLY thread that
-    calls libpd_process_float). PortAudio stream callback, ~128..1024
-    frames per invocation:
+Synth worker (per instance, e.g. 8)  (EXISTING a1 worker — rendering KEPT):
+    its OWN dedicated thread, pinned: libpd_set_instance(i) ONCE (in INIT),
+    then loop:  libpd_process_float(1, nullptr, out2ch)   (paced to sample rate)
+                push out2ch -> MixInputRing_i             (lock-free ring, 2ch)
+    Renders its STEREO PAIR; does NOT touch the device or other instances.
 
-    frames = stream block size            (multiple of libpd_blocksize()=64)
-    ticks  = frames / libpd_blocksize()
-    clear  dev_out[]                       (device output scratch)
+PortAudio callback thread  (the ONLY thread that renders the MIX-DOWN):
+    pinned to the mix-down: libpd_set_instance(mix) ONCE (at stream start):
+        gather latest 2ch from each MixInputRing_i -> mix_in[16ch]   (8 pairs)
+        libpd_process_float(ticks, mix_in, mix_out)                  # EQ+FX mix
+        copy mix_out[2ch] -> PortAudio outputBuffer                  # to device
+    No allocation / I/O / Godot / blocking beyond the fixed-buffer gather.
 
-    for each active instance i (server registry, fixed order):
-        if i is not ready (no patch / dsp off): continue   (contributes 0)
-        lock   i.audio_mutex               (brief — one render block)
-        libpd_set_instance(i)              (pd_this is THREAD-LOCAL — §4.5)
-        remap  dev_in  -> i.in_buf         (§4.4, zero-copy when n_ins==dev_in_ch)
-        libpd_process_float(ticks, i.in_buf, i.out_buf)    # renders i
-        dev_out[] += i.out_buf               (mix; scale to avoid overflow)
-        unlock i.audio_mutex
-
-    copy dev_out[] -> PortAudio outputBuffer
-    (PortAudio inputBuffer is dev_in; it is already the device capture)
-
-    NO allocation, NO file I/O, NO Godot calls, no MIDI, no blocking.
-
-Per-instance control thread  (EXISTING worker, repurposed — no longer does
-    DSP / pacing). Drains the instance command queue:
-    INIT   -> libpd_new_instance / libpd_set_instance /
-              libpd_init_audio(n_ins, n_out, stream_rate) / install hooks
-    LOAD   -> libpd_openfile        (file I/O + graph alloc; NOT real-time)
-    UNLOAD -> libpd_closefile
-    MESSAGE / MIDI_* -> libpd_message / libpd_noteon / ...   (cheap)
-    Serialized against the audio thread by the SAME i.audio_mutex (§7.2).
+MIX-DOWN instance  (a normal LibpdInstance, role = mixer):
+    its worker thread is CONTROL-ONLY (INIT/LOAD/UNLOAD/MESSAGE; no render
+    loop — the PortAudio callback renders it). Loaded with a pd patch:
+    [adc~ 1..16] -> EQ + FX -> [dac~]   (16 in = 8 stereo pairs; 2 out).
 
 Main thread
-    Godot UI; LibpdInstance/Libpd method calls enqueue to control threads or
-    the server; drains the (unchanged) main-thread event/MIDI rings; emits
+    Godot UI; enqueues to workers / server; drains event/MIDI rings; emits
     signals. Does NOT render audio.
 ```
 
 Invariants:
 
-- **One clock.** The device callback is the only timing source; the v1
-  `sleep_until` pacing loop and the ~250 ms output ring are deleted.
-- **No cross-thread libpd.** For a given pd instance, `libpd_process_float`
-  (audio thread) and every control op (control thread) are serialized by
-  `i.audio_mutex`. Two threads never touch one instance simultaneously.
+- **One audio thread per instance.** Each instance's `libpd_process_float`
+  runs on exactly one thread that `libpd_set_instance()`d it once. The 8
+  synth workers + the mix-down (on the callback thread) = 9 pinned threads.
+  **No thread ever switches `pd_this` between instances** — that is the
+  crash (constraint at the top of §4).
+- **No cross-thread render of one instance.** For each *synth* instance, both
+  its control ops and its render live on its single worker thread (no lock
+  needed). The *mix-down* is the exception: its control ops run on its worker
+  thread and its render on the PortAudio callback thread, serialized by a
+  single `mix_render_lock` (a brief stall while the mix patch loads — §7.2).
 - **`pd_this` is thread-local (spike-confirmed).** pd's current-instance
-  pointer is a `PERTHREAD` global (`m_class.c:34`), so an instance is only
-  visible to the thread that `libpd_set_instance()`d it. **Every thread that
-  calls `libpd_*` for instance i must call `libpd_set_instance(i)` first** —
-  the audio thread does it per-instance inside the render loop (§4.5), the
-  control thread does it once per command batch. This is why v1 worked
-  (`set_instance` + `process_float` on the same worker thread) and why a
-  naive "`process_float` on the audio thread" segfaults in `sys_lock`.
-- **Real-time discipline.** The audio thread does only: a lock, one
-  `libpd_process_float` per instance, a mix, an unlock. No allocation, no
-  I/O, no Godot/MIDI calls, nothing that can block. (Enforced by code
-  review + the §8 latency test.)
-- **Idle = silent.** The stream stays open (server-owned, §7.3); instances
-  that are not ready contribute silence, so an empty app just plays noise
-  floor, and the first `init()`+`load()` makes sound with no stream churn.
+  pointer is a `PERTHREAD` global (`m_class.c:34`). **Every thread that
+  calls `libpd_*` for an instance calls `libpd_set_instance(it)` exactly
+  once, on that thread** — synth workers do it in INIT; the PortAudio
+  callback does it for the mix-down once at stream start. This is why v1
+  worked (`set_instance` + `process_float` on the same worker thread) and why
+  a shared thread switching instances segfaults.
+- **Ring handoff.** Each synth worker pushes its block into its
+  `MixInputRing`; the callback gathers the latest block from each. A worker
+  slightly behind yields a stale (≤1 block) sample — acceptable for a
+  mixdown. Rings are sized ≥8 blocks (~11.6 ms @ 44.1 k) so steady state has
+  no underrun.
+- **Real-time discipline.** The callback does only: a fixed-buffer gather (no
+  allocation), one `libpd_process_float`, one copy. No I/O, no Godot/MIDI,
+  no blocking. Synth workers are paced (not real-time), so their pacing
+  imprecision is absorbed by the rings. (Enforced by code review + §8.)
+- **Idle = silent.** The stream stays open (server-owned, §7.3); workers
+  that are not ready contribute silence to their rings, so the mixdown just
+  sums whatever is present, and the first `init()`+`load()` makes sound with
+  no stream churn.
 
-### 4.1 Why not the v1 worker-as-clock model
-Keeping the worker rendering into a ring that a native callback drains
-("Approach B") is lower-risk but caps the win: it keeps two clocks and an
-output ring (the very indirection we are removing), and adds a *second* ring
-for input. Approach A removes all of it. The cost is the worker refactor and
-the openfile serialization in §7.2 — both bounded and testable.
+### 4.1 Why per-instance workers (not a single shared RT thread)
+The "single shared RT thread, `set_instance` per instance" model (the original
+Approach A) is **infeasible for multi-instance**: pd's global dsp/scheduler
+state does not survive switching `pd_this` between instances (repro-confirmed,
+crashes — see the constraint at the top of §4). **One audio thread per
+instance** (the a1 worker model) is the only multi-instance-capable shape, and
+it is exactly what the requirement asked for ("worker-thread DSP **per
+instance** and multi-instance support"). The mix moves into a dedicated
+mix-down instance on the callback thread, so we still get one native device
+stream + pd-native EQ/FX without the forbidden instance-switching. The cost vs
+Approach A: a small per-worker ring + the mix-down instance — both bounded and
+testable.
 
 ### 4.2 libpd call mapping
 - v1 `libpd_process_float(1, nullptr, out)` (worker, paced) →
@@ -236,13 +271,16 @@ the openfile serialization in §7.2 — both bounded and testable.
   hardening requirement for Approach A (v1 ran hooks on the worker, which
   was never real-time; now it is). §7.2.
 
-### 4.3 Multi-instance → one device
-One PortAudio stream, one physical output. The audio thread renders each
-active instance into its own `out_buf` and **sums** into `dev_out` (with
-normalization: divide by active count, or clamp — spec default: clamp to
-[-1,1], document). This is what "multi-instance support" means at the audio
-layer (v1 got this for free from Godot mixing one player per node; now we
-mix explicitly).
+### 4.3 Multi-instance → one device (via the mix-down)
+One PortAudio stream, one physical output. The 8 synth workers render into
+their rings; the **mix-down instance** (a pd patch with 16 audio inputs) takes
+all 8 stereo pairs, applies the overall **EQ + FX**, and produces the
+2-channel mix that the callback writes to the device. The *mix* is done in pd
+by the mix-down patch (the intended design), so channel layout, EQ, and FX are
+all patch-level, not C. The C side only *gathers* the worker stereo pairs into
+the 16-ch input and hands the 2-ch output to the device. A no-mixer
+single-instance mode (one instance's output straight to the device) is the
+fallback for apps that don't use a mixdown.
 
 ### 4.4 Channel remap (device layout ≠ instance layout)
 The stream has a fixed channel count (e.g. 2 in / 2 out); each instance asks
@@ -279,6 +317,13 @@ instance); output is per-instance then mixed.
   `-framework AudioToolbox` (not just CoreAudio) and `-DPA_USE_COREAUDIO=1`
   so `pa_unix_hostapis.c` registers it. The audio input object in this pd
   build is **`adc~`** (1-indexed); there is no `audioin~` class.
+- **Multi-instance constraint (post-spike repro, 2026-10-03):** the single
+  shared-RT-thread model above is infeasible for multi-instance (pd global
+  state breaks on `pd_this` switching). The adopted model (one audio thread
+  per instance + mix-down on the callback) was repro-validated at **9
+  concurrent instances** (8 stereo synth workers + 16-in/2-out mix-down on a
+  separate render thread, ~1.5 s, no crash). Repro binaries: `spike/mi_*`.
+  **Status: this revised §4 supersedes the original Approach-A diagram.**
 
 ## 5. Backends & platform matrix
 
@@ -307,46 +352,55 @@ bite on the RG DS.
 
 New (`extension/`):
 
-- `src/audio/native_audio.h/.cpp` — the shared real-time audio object
-  (owned by `LibpdServer`): owns the PortAudio stream + callback, the
-  active-instance registry, `dev_in`/`dev_out` scratch, the per-instance
-  `audio_mutex` handle, block-size/sample-rate state, device enumeration, and
-  the no-device fallback (dry). Exposes: `open/out/in/blocksize`,
-  `register_instance/unregister_instance`, `render_callback()`.
-- `src/audio/pa_compat.h` — thin wrapper over `portaudio.h` so the dry
-  fallback and the tests can run without a device (a "NullBackend" that
-  counts frames + tracks peak, mirroring v1 `DrySink`).
-- `thirdparty/portaudio/` — PortAudio as a **top-level** thirdparty
-  (lifted from the libpd-bundled copy; keeps the libpd submodule untouched).
-  M6 adds `src/hostapi/aaudio/` here. (Alternative: compile in place from
-  `thirdparty/libpd/pure-data/portaudio/portaudio`; decide in plan.)
-- `tests/native_audio_mix_tests.cpp` — host tests for the **platform-
-  independent** logic: block-size alignment/clamping, the channel remap
-  (§4.4), the multi-instance mix/clamp (§4.3), and the `ticks` computation.
-  These run with the NullBackend (no device needed).
+- `src/core/audio_port.h` + `src/core/null_port.h` — **(DONE, T1)** the
+  `AudioPort` abstraction (device enum / open / latency + a
+  `std::function<void(float*,float*,int)>` render callback), the pure
+  `mix_block` (sum+clamp; the no-mixer single-instance fallback), and
+  `NullPort` (device-free fake audio thread for host tests).
+- `src/core/portaudio_port.{h,cpp}` — **(DONE, T2)** the real PortAudio backend
+  (CoreAudio/ALSA): device enumeration, full-duplex stream, the static C
+  callback trampoline → the render `std::function`, latency from
+  `PaStreamInfo`. Rejects `blocksize % 64 != 0`.
+- `src/core/mix_input_ring.h/.cpp` — **(new)** per-synth-worker lock-free ring
+  (2 ch, ≥8 blocks). `push()` from the worker's render; `gather_latest()` from
+  the PortAudio callback. Producer = worker thread, consumer = callback thread.
+- `src/core/native_audio.{h,cpp}` — **(revised)** server-owned. Owns the
+  `PortAudioPort` stream + the **mix-down render-in-callback**: registers the
+  mix-down `t_pdinstance*` + the list of synth `MixInputRing`s. Callback body:
+  gather the latest 2ch from each ring → 16 ch, `libpd_set_instance(mix)` once,
+  `libpd_process_float(ticks, in16, out2)`, copy `out2` → device. Also
+  `mix_render_lock` (serializes the mix-down's worker-thread control ops with
+  the callback render). No-device fallback via `NullPort`.
+- `tests/` — host tests: `mix_input_ring` (producer/consumer); `native_audio`
+  gather + mix-down render (NullPort + a real libpd mix instance, 16-in/2-out);
+  and the 9-concurrent-instance scenario (8 workers + mix-down) as a regression
+  test.
 
 Modified:
 
-- `src/libpd_worker.{h,cpp}` — **repurpose the worker**: delete the
-  `libpd_process_float` + `sleep_until` pacing from `run()`; the worker
-  becomes a pure command-dispatch thread. `Config` drops `sink`; gains a
-  pointer to the shared audio object (to register `out_buf` + `audio_mutex`)
-  and the `n_ins`/`n_out`/rate it reports to `libpd_init_audio`. Output-hook
-  `push()` hardened to non-blocking (§4.2).
-- `src/libpd_instance.{h,cpp}` — `init()` now registers with the shared
-  audio object (allocate `out_buf`, join `audio_mutex`, report `n_ins`/
-  `n_out`/rate); the `AudioStreamGenerator`/`GeneratorSink`/`_process` pump
-  is **retired** (M5) — kept behind a compile flag for the Android a1
-  fallback until M6. `debug_sink_peak` repointed at the audio object.
-- `src/libpd_server.{h,cpp}` — own the `NativeAudio` object; expose the
-  `audio_*` API (§3); wire instance register/unregister into its lifecycle;
-  shutdown order (§7.3).
+- `src/libpd_worker.{h,cpp}` — **synth worker keeps the a1 render loop**
+  (`libpd_process_float` + `sleep_until` pacing) but pushes each block to its
+  `MixInputRing` (new sink) instead of the `AudioStreamGenerator`. `Config`
+  gains a role flag (**synth** / **mixer**) + the ring pointer. The **mixer**
+  worker is **control-only** (no render loop — the PortAudio callback renders
+  it); its control ops (INIT/LOAD/UNLOAD) acquire `NativeAudio`'s
+  `mix_render_lock`. Output-hook `push()` stays non-blocking (§4.2).
+- `src/libpd_instance.{h,cpp}` — **synth** instance: worker + its
+  `MixInputRing`. **Mixer** instance: designated (role=mixer), control-only
+  worker, registered with `NativeAudio` for callback rendering. The
+  `AudioStreamGenerator`/`GeneratorSink`/`_process` pump is **retired on
+  desktop** (M5) — kept behind a compile flag for the Android a1 fallback
+  until M6.
+- `src/libpd_server.{h,cpp}` — own `NativeAudio`; expose the `audio_*` API
+  (§3) + `set_mixer(instance)`; wire synth-ring registration + mixer
+  registration into the instance lifecycle; shutdown order (§7.3).
 - `src/core/pd_audio_sink.h` / `pd_audio_sink_generator.*` — **retired** on
   desktop (M5); kept as the Android a1 fallback until M6, then removed.
-- `CMakeLists.txt` — vendor PortAudio (top-level or in place); a
-  `NATIVE_AUDIO` option (default ON); per-platform link (CoreAudio/ALSA);
-  M6: an `AUDIO_AAUDIO` option that adds the aaudio hostapi + AAudio lib on
-  Android; the a1 fallback compile flag for pre-M6 Android.
+- `CMakeLists.txt` — build PortAudio **in place** from
+  `thirdparty/libpd/pure-data/portaudio/portaudio`; a `NATIVE_AUDIO` option
+  (default ON, OFF on Android); per-platform link (CoreAudio/ALSA); the new
+  test targets. M6: an `AUDIO_AAUDIO` option adding the aaudio hostapi +
+  AAudio lib on Android.
 
 ## 7. Lifecycle, errors, shutdown
 
@@ -430,17 +484,27 @@ Modified:
 
 ## 10. Risks & open notes
 
-- **Worker refactor size** — the biggest change is stripping DSP/pacing from
-  `libpd_worker::run()` and adding the shared audio thread + registry. The
-  v1 worker is well-understood and the callback pattern is validated by
-  `pdtest_portaudio.c`; the spike (§9) should shrink this risk before we
-  cut the worker loose.
+- **Worker refactor size (reduced)** — the synth workers **keep** the a1
+  render loop; the change is (a) pointing their sink at a `MixInputRing`
+  instead of the generator, (b) a control-only **mixer** role, and (c) the
+  `NativeAudio` mix-down-in-callback object. The per-instance pinned-thread
+  render is the same proven v1 pattern, so the refactor is smaller than the
+  original Approach-A plan implied.
 - **openfile glitch (§7.2)** — the default (brief audio stall on load) is
   acceptable; the scratch-swap alternative is more code. Decide in the plan
   after seeing how often loads happen in the real app.
-- **Output-hook hardening (§4.2)** — hooks now fire on a real-time thread;
-  the MIDI output queue `push` must be verified non-blocking/non-allocating
-  (covered by host test 1.4). This is the subtlest correctness item.
+- **Multi-instance audio (RESOLVED design constraint)** — repro-confirmed:
+  a shared RT thread switching `pd_this` between live libpd instances crashes
+  (`EXC_BAD_ACCESS`); one dedicated thread per instance (the a1 model)
+  supports 9+ concurrent instances. M5 uses per-instance workers + a mix-down
+  instance on the PortAudio callback (no instance-switching). The 9-instance
+  scenario is a regression test. Residual: the mix-down's
+  control-op-vs-callback-render serialization (`mix_render_lock`) — a brief
+  stall while the mix patch loads, acceptable (§7.2).
+- **Output-hook hardening (§4.2)** — synth-worker hooks fire on paced worker
+  threads (never real-time, as in v1 — low risk); the **mix-down's** hooks
+  fire on the PortAudio callback thread (real-time), so that path's
+  `push()` must be non-blocking/non-allocating. Covered by a host test.
 - **Knulli codec ceiling** — an 8 kHz mono codec means "reduced latency"
   there is bounded by hardware, not the lib. The spike + §8.3 confirm the
   real number so we don't chase a non-existent win on that device.
