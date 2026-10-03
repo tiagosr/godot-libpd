@@ -15,9 +15,10 @@
 > server API, and on-device hotplug on both devices (A133 RtMidi ALSA
 > `HOTPLUG_SMOKE_OK added=1 removed=1`; Android RtMidi `added=1 removed=0`
 > via the in-process loopback). The auto-close-on-external-removal path was
-> additionally verified on **real hardware on macOS (CoreMIDI) AND the A133
-> handheld (ALSA, USB OTG)** — physical nanoKONTROL2 + FM-1 plug/unplug →
-> `midi_port_removed` + `device removed`.
+> additionally verified on **real hardware on all three backends** — macOS
+> (CoreMIDI), A133 (ALSA, USB OTG), and RG DS (Android AMIDI, USB OTG) —
+> physical nanoKONTROL2 + FM-1 plug/unplug → `midi_port_removed` + `device
+> removed`.
 > Spec → implemented; SDD ledger closed.
 
 ## Global Constraints
@@ -224,7 +225,7 @@ exercise the add + remove paths."
 
 **Interfaces:** Consumes the shipped extension (Task 1–3). Produces verification evidence.
 
-- [x] **Step 1: A133 (ALSA) on-device** — verified 2026-10-02: `HOTPLUG_SMOKE_OK added=1 removed=1` (RtMidi ALSA, virtual port add+remove diff; ALSA reports full `client:port` name → smoke matches substring); baseline `SMOKE_OK` green; aconnect shows real `128:0` port + clean 4-client teardown. Auto-close-on-external-removal verified on real hardware on BOTH macOS (CoreMIDI) and the A133 (ALSA, USB OTG) — nanoKONTROL2 + FM-1 unplug → `device removed`; on Android it is ctest-covered (no USB-MIDI hardware).
+- [x] **Step 1: A133 (ALSA) on-device** — verified 2026-10-02: `HOTPLUG_SMOKE_OK added=1 removed=1` (RtMidi ALSA, virtual port add+remove diff; ALSA reports full `client:port` name → smoke matches substring); baseline `SMOKE_OK` green; aconnect shows real `128:0` port + clean 4-client teardown. Auto-close-on-external-removal verified on real hardware on ALL THREE backends — macOS (CoreMIDI), A133 (ALSA, USB OTG), and RG DS (Android AMIDI, USB OTG) — nanoKONTROL2 + FM-1 unplug → `device removed`. The RG DS test surfaced + fixed three Android-only USB-open bugs in vendored RtMidi (see ledger).
 
 Stage the M4 `.so` + a `test_midi` PCK to `/tmp/godot-app/` (tmpfs; ES suspended). With `--midi-hotplug-smoke` (virtual ports) **and** a manual `aconnect`-visible device scenario:
 - Confirm `HOTPLUG_SMOKE_OK` on stdout (via `stdbuf -oL -eL`).

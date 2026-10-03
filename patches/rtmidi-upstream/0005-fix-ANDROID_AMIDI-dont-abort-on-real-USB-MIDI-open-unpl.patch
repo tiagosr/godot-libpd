@@ -1,0 +1,139 @@
+From c015726386c5cd96ea83bb62b72c8a540871e74f Mon Sep 17 00:00:00 2001
+From: Tiago Rezende <tiagosr@gmail.com>
+Date: Sat, 3 Oct 2026 06:59:42 +0200
+Subject: [PATCH] fix(ANDROID_AMIDI): don't abort on real USB-MIDI device
+ open/unplug
+
+Opening a real USB-MIDI device (unlike the in-process loopback) goes
+through androidOpenDevice + the MidiDeviceOpenedListener Java helper and
+the pollMidi read thread. Four latent issues aborted the process:
+
+1. FindClass("com/yellowlab/rtmidi/MidiDeviceOpenedListener") failed from
+   the MIDI I/O pthread (attached via AttachCurrentThreadAsDaemon with no
+   app class loader -> boot loader only), throwing an uncaught
+   ClassNotFoundException. Load the app class via
+   context.getClassLoader().loadClass(...) instead.
+2. The listener's native midiDeviceOpened threw UnsatisfiedLinkError
+   because the library is loaded via dlopen (not System.loadLibrary), so
+   ART's name-based native-method lookup doesn't track it. Register it
+   with RegisterNatives in androidOpenDevice.
+3. On unplug, AMidiOutputPort_receive returns <0 and error() throws (no
+   error callback registered); the exception escaped the raw read pthread
+   and called std::terminate. Catch it in pollMidi and stop reading.
+4. closePort now releases the AMidiDevice even if the read thread already
+   stopped on its own, so the handle isn't leaked.
+
+Verified on a nanoKONTROL2 over a host-only OTG port on the RG DS
+(Android 14): plug -> midi_port_added + open; unplug -> 'device removed'
+auto-close + midi_port_removed, no crash.
+---
+ RtMidi.cpp | 72 +++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/RtMidi.cpp b/RtMidi.cpp
+index 7f134c5..b1d906c 100644
+--- a/RtMidi.cpp
++++ b/RtMidi.cpp
+@@ -5665,12 +5665,48 @@ static void androidOpenDevice(jobject deviceInfo, void* target, bool isOutput) {
+     auto handlerCtor = env->GetMethodID(handlerClass, "<init>", "(Landroid/os/Looper;)V");
+     auto handler = env->NewObject(handlerClass, handlerCtor, mainLooperObj);
+ 
+-    jclass listenerClass = env->FindClass("com/yellowlab/rtmidi/MidiDeviceOpenedListener");
++    // The listener is an app class (in the app's PathClassLoader), not a
++    // framework class. env->FindClass() from this native MIDI I/O thread uses
++    // the boot class loader (the thread is attached via
++    // AttachCurrentThreadAsDaemon with no app class loader), so it cannot
++    // resolve app classes and would throw an uncaught ClassNotFoundException
++    // (abort). Load it explicitly through the context's class loader.
++    jclass listenerClass = nullptr;
++    if (context != nullptr) {
++      jclass ctxClass = env->FindClass("android/content/Context");
++      jmethodID getClID = env->GetMethodID(ctxClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
++      jobject cl = env->CallObjectMethod(context, getClID);
++      if (cl != nullptr) {
++        jclass clClass = env->FindClass("java/lang/ClassLoader");
++        jmethodID loadClassID = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
++        listenerClass = (jclass)env->CallObjectMethod(cl, loadClassID, env->NewStringUTF("com.yellowlab.rtmidi.MidiDeviceOpenedListener"));
++      }
++    }
++    if (env->ExceptionCheck()) {
++      env->ExceptionClear();
++      listenerClass = nullptr;
++    }
+     if (!listenerClass) {
+       LOGE("Midi listener class not found com.yellowlab.rtmidi.MidiDeviceOpenedListener. Did you forget to add it to your APK?");
+       return;
+     }
+ 
++    // Register the native method explicitly. The extension .so is loaded via
++    // dlopen (not System.loadLibrary), so the ART runtime's name-based JNI
++    // lookup does not track it and the native method midiDeviceOpened would
++    // throw UnsatisfiedLinkError when onDeviceOpened() runs. Register it
++    // directly via RegisterNatives (bypasses the symbol-name lookup).
++    {
++      JNINativeMethod methods[1] = {
++        { "midiDeviceOpened", "(Landroid/media/midi/MidiDevice;JZ)V",
++          reinterpret_cast<void*>(Java_com_yellowlab_rtmidi_MidiDeviceOpenedListener_midiDeviceOpened) },
++      };
++      if (env->RegisterNatives(listenerClass, methods, 1) != JNI_OK) {
++        LOGE("RegisterNatives failed for MidiDeviceOpenedListener.midiDeviceOpened");
++        if (env->ExceptionCheck()) env->ExceptionClear();
++      }
++    }
++
+     auto targetPtr = reinterpret_cast<jlong>(target);
+     auto listenerCtor = env->GetMethodID(listenerClass, "<init>", "(JZ)V");
+     auto listener = env->NewObject(listenerClass, listenerCtor, targetPtr, isOutput);
+@@ -5771,17 +5807,20 @@ std::string MidiInAndroid :: getPortName(unsigned int portNumber) {
+ }
+ 
+ void MidiInAndroid :: closePort() {
+-  // Don't try to close a port before it was open
+-  if (!reading) {
+-    return;
++  // Stop the read thread if it's still running. (It may have already stopped
++  // on its own when the device was unplugged — see pollMidi — in which case
++  // reading is already false and there is nothing to join.)
++  if (reading) {
++    reading = false;
++    pthread_join(readThread, NULL);
++  }
++  // Release the device handle even if the read thread stopped independently,
++  // so the AMidiDevice reference isn't leaked.
++  if (receiveDevice != NULL) {
++    AMidiDevice_release(receiveDevice);
++    receiveDevice = NULL;
++    midiOutputPort = NULL;
+   }
+-
+-  reading = false;
+-  pthread_join(readThread, NULL);
+-
+-  AMidiDevice_release(receiveDevice);
+-  receiveDevice = NULL;
+-  midiOutputPort = NULL;
+ }
+ 
+ void MidiInAndroid:: setClientName(const std::string& clientName) {
+@@ -5814,8 +5853,17 @@ void* MidiInAndroid :: pollMidi(void* context) {
+         &numBytesReceived, &timestamp);
+ 
+     if (numMessagesReceived < 0) {
++      // Device error (e.g. the USB-MIDI device was unplugged). Report via
++      // error(), but never let the RtMidiError exception escape this raw
++      // pthread: with no error callback registered, error() throws, and an
++      // uncaught exception in a raw pthread calls std::terminate and aborts
++      // the whole process. Catch it and stop reading gracefully.
+       self->errorString_ = "MidiInAndroid::pollMidi: error receiving MIDI data";
+-      self->error( RtMidiError::SYSTEM_ERROR, self->errorString_ );
++      try {
++        self->error( RtMidiError::SYSTEM_ERROR, self->errorString_ );
++      } catch (const RtMidiError&) {
++        // no error callback registered — best-effort report; just stop.
++      }
+       self->reading = false;
+       break;
+     }
+-- 
+2.54.0
+

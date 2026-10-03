@@ -195,8 +195,8 @@ device-free self-test uses the backend's in-process loopback
 (`midi_create_loopback(name)`, device indices 200 in / 201 out), which
 enumerates in `list_ports()` while active → fires `midi_port_added`. The
 loopback has **no runtime close**, so on-device it verifies the *added*
-path only; the *removed* path is ctest-covered and exercised by a real
-USB-MIDI unplug.
+path only; the *removed* path is verified on real hardware via a USB-MIDI
+unplug over the OTG port (below).
 
 **Visibility is logcat-only.** GDScript `print()` reaches Android logcat; C
 `printf` (e.g. the router's `[MIDI] backend=<name>` startup line) does
@@ -208,4 +208,30 @@ Self-test: temp-switch the Android preset `command_line/extra_args` to
 `res://scenes/test_midi.tscn`, re-export + sign + install, launch, then
 `adb logcat -d | grep HOTPLUG` → `HOTPLUG_SMOKE_OK added=1 removed=0
 (loopback ...)`.
+
+**Real USB-MIDI hotplug (OTG).** The RG DS has a host-only OTG port, so a
+physical USB-MIDI device plugged there is enumerated by AMIDI. Use
+`--midi-hotplug-monitor` (same temp-switch recipe, but with
+`--midi-hotplug-monitor`) to keep the app running while you plug/unplug:
+each plug → `midi_port_added` (both sides) + auto-open; each unplug →
+`midi_port_error(port, "device removed")` (auto-close) + `midi_port_removed`.
+Verified on a nanoKONTROL2 (clean, no crash).
+
+**Android USB-open prerequisites (fixed in vendored `RtMidi.cpp`).** Opening a
+real USB-MIDI input (unlike the loopback) goes through `AmidiManager.openDevice`
++ the `com.yellowlab.rtmidi.MidiDeviceOpenedListener` Java helper (present at
+`test_project/android/build/src/main/java/com/yellowlab/rtmidi/`). Three
+Android-only bugs surfaced on the first real-device test and were fixed:
+1. `FindClass("com/yellowlab/rtmidi/MidiDeviceOpenedListener")` failed from
+   the MIDI I/O pthread (attached with no app class loader → boot loader
+   only) → uncaught `ClassNotFoundException` → abort. Fix: load the class via
+   `context.getClassLoader().loadClass(...)`.
+2. `UnsatisfiedLinkError` on the listener's native `midiDeviceOpened` — the
+   extension `.so` is `dlopen`'d (not `System.loadLibrary`), so ART's
+   name-based native lookup doesn't track it. Fix: explicit `RegisterNatives`.
+3. On unplug, `AMidiOutputPort_receive` returns <0 and `error()` throws
+   (no error callback); the exception escaped the raw read pthread →
+   `std::terminate`. Fix: `try/catch` in `MidiInAndroid::pollMidi` +
+   `closePort` releases the `AMidiDevice` even if the read thread already
+   stopped.
 

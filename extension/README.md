@@ -227,16 +227,24 @@ three platforms.
 **Real-hardware unplug leg** — `test_project/scripts/test_midi.gd
 --midi-hotplug-monitor` keeps the app running and logs every live device
 change, auto-opening new input ports so an unplug exercises the auto-close
-path. Verified with physical USB-MIDI devices on **both macOS CoreMIDI and the
-A133 handheld (ALSA, over its dedicated host-only OTG port)**: a nanoKONTROL2
-(two distinct port names) and an FM-1 (same name on both sides) each produced,
-per plug, `midi_port_added` for both sides, and per unplug `midi_port_removed`
-for both sides **and** auto-close of the open real-device input port with
-`midi_port_error(port, "device removed")`. The (direction, name)-keyed diff
-handles both the multi-name controller and the same-name device correctly.
+path. Verified with physical USB-MIDI devices on **all three backends**:
+macOS CoreMIDI, the A133 handheld (ALSA, over its dedicated host-only OTG
+port), and the RG DS handheld (Android AMIDI, over its host-only OTG port).
+A nanoKONTROL2 (two distinct port names) and an FM-1 (same name on both
+sides) each produced, per plug, `midi_port_added` for both sides, and per
+unplug `midi_port_removed` for both sides **and** auto-close of the open
+real-device input port with `midi_port_error(port, "device removed")`. The
+(direction, name)-keyed diff handles both the multi-name controller and the
+same-name device correctly.
+
 On ALSA, auto-opening a real input makes RtMidi create a `godot-libpd:<dev>
 128:0` receive port that appears as an extra output and is removed with the
-device on unplug.
+device on unplug. On Android, opening a real USB-MIDI input goes through the
+`AmidiManager` device-open callback (the `com.yellowlab.rtmidi.
+MidiDeviceOpenedListener` Java helper, loaded via the app's class loader and
+its native method registered with `RegisterNatives`); unplugging a device
+stops the input read thread gracefully (a `pollMidi` read error is caught so
+it never aborts the process).
 
 ### On-device verification status (M2–M4)
 
@@ -261,9 +269,10 @@ device on unplug.
   added=1 removed=0` (in-process loopback — no AMIDI virtual port, no runtime
   loopback close); macOS (RtMidi CoreMIDI) `HOTPLUG_SMOKE_OK added=1
   removed=1`. Device-free smoke on all three; **the auto-close-on-external
-  removal path is verified on real hardware on macOS (CoreMIDI) AND the A133
-  handheld (ALSA, USB OTG)** with physical nanoKONTROL2 + FM-1 plug/unplug —
-  see "Real-hardware unplug leg" above.
+  removal path is verified on real hardware on all three platforms** — macOS
+  (CoreMIDI), A133 (ALSA, USB OTG), and RG DS (Android AMIDI, USB OTG) with
+  physical nanoKONTROL2 + FM-1 plug/unplug — see "Real-hardware unplug leg"
+  above.
 
 **Sysex input and CC capture are not exercisable on a device with no MIDI
 hardware** (input-only sysex by design; CC needs a real controller) — the
