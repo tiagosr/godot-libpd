@@ -1,336 +1,297 @@
 # v2 M5 — Native Audio Backend (macOS + Linux) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Route libpd audio through a native PortAudio stream on macOS (CoreAudio) and Linux (ALSA/Knulli), so a `[adc~]`-fed patch renders to speakers at low latency; retire the a1 `AudioStreamGenerator` sink on these two platforms (Android keeps a1 until M6).
+**Goal:** Route libpd audio through native PortAudio on macOS (CoreAudio) + Linux (ALSA/Knulli): **8 synth `LibpdInstance` workers** (a1, one pinned audio thread each) feed their stereo pairs into **`MixInputRing`s**; a dedicated **mix-down `LibpdInstance`** (16-in/2-out patch, overall EQ+FX) is **rendered in the PortAudio real-time callback**; the mixed stereo goes to the device. Retire the a1 `AudioStreamGenerator` on desktop (Android keeps a1 until M6).
 
-**Architecture:** Approach A (spec §4): one PortAudio real-time callback renders **all** registered instances (`libpd_process_float` per instance, summed + clamped into the device output); per-instance worker threads become pure control threads; a coarse `render_lock` serializes openfile/init/free with rendering. A platform-free `AudioPort` seam (`PortAudioPort` + `NullPort`) makes the mix + per-instance render loop testable on any host without a device. The worker's a1 DSP loop is gated by a `native_audio` config flag so Android (a1) is untouched.
+**Architecture:** *Revised 2026-10-03.* The original "Approach A" (one shared RT thread rendering all instances) is **infeasible for multi-instance**: repro-confirmed that switching `libpd_set_instance` between live instances mid-dsp crashes pd's global dsp/scheduler state (`EXC_BAD_ACCESS`) — even 2 instances merely existing. One **dedicated audio thread per instance** (the a1 model, `set_instance` once per thread) supports **9+ concurrent instances** (repro: 8 stereo workers + 16-in/2-out mix-down on a separate render thread, no crash). So M5 keeps the a1 per-instance worker threads for the synths and moves the mix into a mix-down instance rendered on the PortAudio callback.
 
-**Tech Stack:** godot-cpp GDExtension, C++17, **vendored PortAudio 19.7.0** (`extension/thirdparty/libpd/pure-data/portaudio/portaudio/`), libpd-multi (`libpd_static`, PD_MULTI ON), CMake/ctest.
+**Tech Stack:** godot-cpp GDExtension, C++17, **vendored PortAudio 19.7.0** (built **in place** from `extension/thirdparty/libpd/pure-data/portaudio/portaudio/`), libpd-static (`libpd-multi.a`, PD_MULTI ON), CMake/ctest.
 
-**Spec:** `docs/superpowers/specs/2026-10-03-godot-libpd-native-audio-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-03-godot-libpd-native-audio-design.md` (status: revised 2026-10-03).
+
+## Done (do not re-do)
+
+- **T1 — `AudioPort` + `NullPort` + `mix_block`** (commit `f385d040`): `extension/src/core/audio_port.h` (`AudioPort` base with `open/close/list_*/latency_*` + `set_render_callback(std::function<void(float*,float*,int)>)`; pure `mix_block` sum+clamp), `extension/src/core/null_port.h` (`NullPort`, device-free fake audio thread, `frames_rendered()`/`last_out_peak()`), `extension/tests/audio_port_tests.cpp`.
+- **T2 — `PortAudioPort` (CoreAudio/ALSA)** (commit `6810a865`): `extension/src/core/portaudio_port.{h,cpp}` (device enum, full-duplex stream, static C callback trampoline → the render `std::function`, latency from `PaStreamInfo`, rejects `blocksize%64!=0`, `Pa_StartStream` after open). `extension/tests/audio_portaudio_tests.cpp`.
 
 ## Global Constraints
 
-- **Block-size contract:** `libpd_blocksize() == 64`; the device frame buffer MUST be a multiple of 64. `ticks = frames / 64` per `libpd_process_float` call. Default blocksize **256** (~5.8 ms @ 44.1 kHz). (Spec §6.1.)
-- **No resampling:** an instance's `samplerate` MUST equal the native stream's `samplerate`; mismatch fails fast (no resampler). (Spec §6.1.)
-- **`pd_this` is thread-local** (spike-confirmed): the audio callback MUST `libpd_set_instance(slot.pd)` for each instance before `libpd_process_float`. A naive cross-thread `process_float` segfaults in pd's `sys_lock` otherwise. (Spec §4.5.)
-- **Multi-instance = one device, explicit mix:** all instances render into their own buffer; outputs are summed into `dev_out` and clamped to `[-1, 1]`. (Spec §6.3.)
-- **openfile RT-safety (M5 default):** a coarse `render_lock` in `NativeAudio`; the audio thread holds it for the whole block; control ops (INIT/LOAD/UNLOAD/STOP) wrap their `libpd_*` calls in the same lock → a brief audio stall while loading. (Spec §6.2.)
-- **No-device fallback:** `NullPort` (counts frames, reports zero latency) preserves headless tests + Knulli CI. (Spec §6.4.)
-- **Thread invariants (inherited):** all `libpd_*` on a single thread per instance (control thread for setup, audio thread for render, **serialized by `render_lock`**); Godot signals on the main thread only. Output hooks fire on the audio thread → `midi_out.push()` must stay non-allocating (it is: `MidiOutputQueue` is a lock-free-ish bounded queue).
-- **Platform split:** `NATIVE_AUDIO` is ON for macOS + Linux, OFF for Android. The worker's a1 DSP loop runs only when `native_audio == false` (Android). `PdAudioSink`/`GeneratorSink` stay for Android.
-- **Input object is `adc~`** (1-indexed); there is no `audioin~` class in this pd build. Device capture feeds `st_soundin`; each instance's `adc~` reads its channels. (Spec §2.)
-- Submodules unchanged. `libpd_static`, `godot-cpp`, PortMIDI/RtMidi wiring unchanged.
-- Subagent timeouts 7200000 ms (slow model endpoint). HARD VERIFICATION RULE: every on-device claim needs a real command + pasted output.
-- PortAudio build notes (spike-confirmed): CoreAudio needs `-framework AudioToolbox` (not just CoreAudio) + `-framework CoreFoundation` + `-framework CoreServices`; `-DPA_USE_COREAUDIO=1` (macOS) so `pa_unix_hostapis.c` registers it. Linux ALSA: `-DPA_USE_ALSA=1`, link `asound`.
-- The built `spike/native_audio/native_audio_spike` binary is gitignored; the spike sources (`spike.c`, `build.sh`, `*.pd`) are the reproducible reference for the callback + `libpd_process_float` contract.
+- **THE threading invariant:** each libpd instance's `libpd_process_float` runs on **exactly one thread** that called `libpd_set_instance(it)` **exactly once**. **No thread ever switches `pd_this` between instances** — that crashes pd (the reason Approach A was abandoned). Synth workers = one thread each; the mix-down renders on the PortAudio callback thread (its one thread, `set_instance(mix)` once). (Spec §4.)
+- **9 concurrent instances is a hard requirement** — the plan's regression test must exercise 8 synth workers + 1 mix-down live.
+- **Block-size contract:** `libpd_blocksize()==64`; device `blocksize` MUST be a multiple of 64; `ticks = blocksize/64`. Default 256. (Spec §6.)
+- **No resampling:** the mix-down's `samplerate` and every synth's `samplerate` MUST equal the stream `samplerate`; mismatch fails fast.
+- **Channel layout:** each synth worker outputs a **stereo pair** (2 ch) into its `MixInputRing`; the mix-down has **16 inputs** (8 stereo pairs) + **2 outputs**. Ring `i` → mix-down input channels `2i, 2i+1`. (Spec §4.3.)
+- **mix_render_lock:** the mix-down's **control ops** (its worker thread: INIT/`init_audio`, LOAD/`openfile`, UNLOAD/`closefile`, teardown) are serialized with the **callback render** by `NativeAudio`'s `mix_render_lock` — a brief audio stall while the mix patch loads (Spec §7.2).
+- **No-device fallback:** `NullPort` preserves headless/host tests + Knulli CI.
+- **Mix-down callback discipline:** the PortAudio callback does only: a **fixed-buffer gather** (no allocation) of the 8 rings → 16 ch, one `libpd_set_instance(mix)` (once), one `libpd_process_float`, one copy to the device. No I/O, no Godot/MIDI, no blocking.
+- **Platform split:** `NATIVE_AUDIO` ON for macOS + Linux, OFF for Android. Android synth/mixer keep the a1 `AudioStreamGenerator` path.
+- **Input object is `adc~`** (1-indexed); no `audioin~` class in this pd build. The mix-down patch uses `[adc~ 1..16]`.
+- **PortAudio build (spike-confirmed):** CoreAudio needs `-framework AudioToolbox` + `CoreFoundation` + `CoreServices` + `-DPA_USE_COREAUDIO=1`; ALSA needs `-DPA_USE_ALSA=1` + `asound`. PortAudio root `PA = extension/thirdparty/libpd/pure-data/portaudio/portaudio`; libpd include dirs `extension/thirdparty/libpd/libpd_wrapper` + `.../pure-data/src`; libpd lib `extension/build/cmake-<plat>/thirdparty/libpd/libs/libpd-multi.a`.
+- **Subagent dispatches MUST set `timeoutMs: 7200000`** (2 h) — the default 30 min is too short for the multi-instance/native tasks. HARD VERIFICATION RULE for on-device claims.
+- libpd init/render sequence (verbatim from the working `spike/native_audio/spike.c` + `spike/mix_repro.c`): INIT (on the instance's thread): `libpd_init()` (once, process-global) → `libpd_new_instance()` → `libpd_set_instance(it)` → `libpd_init_audio(n_ins,n_out,samplerate)` → `libpd_start_message(1); libpd_add_float(1.0f); libpd_finish_message("pd","dsp")` → `libpd_openfile(file, dir)`. Render (on the pinned thread): `libpd_process_float(ticks, in, out)`.
 
 ## Review Focus
 
-- **`pd_this` thread-locality** — the callback must set the instance before every `process_float`; forgetting it segfaults in `sys_lock`, not "fails gracefully" — Task 3 test (render 1 tick per instance; a wrong/missing `set_instance` produces a crash or misattributed audio).
-- **Block-size not a multiple of 64** — `audio_open(100, …)` must fail (reject or clamp) rather than call `libpd_process_float` with a fractional tick count — Task 5 test.
-- **Samplerate mismatch** — an instance `init(48000)` while the stream is 44100 must fail fast (no resample) — Task 5 test.
-- **Multi-instance mix overflow** — two full-scale (+1.0) instances summed → must clamp to 1.0, not wrap to negative / overflow — Task 1 test (`mix_block`).
-- **Control op while rendering (openfile stall)** — `load_patch` on a running instance must not corrupt a concurrent render (the `render_lock` serializes); assert no crash + audio resumes — Task 4 test (load a patch N times while the NullPort is rendering).
-- **Instance removed while rendering** — `unregister_instance` (node exit) while the callback is mid-iteration must not read a freed `RenderSlot` (the slot list snapshot is taken under lock) — Task 3 test.
+- **No instance-switching** — confirm no thread calls `libpd_set_instance` for more than one instance across its lifetime; the callback calls it **exactly once** (for the mix-down). A second/switching call is a Critical finding (it crashes pd). (T4.)
+- **9 concurrent instances** — the regression test must actually spawn 8 synth workers + the mix-down and run them live ~0.5 s without a crash. A test that only covers 1–2 instances is an Important finding. (T4/T7.)
+- **Ring latest-vs-stale + underrun** — `MixInputRing.gather_latest` returns the newest complete block; an empty ring contributes silence (0), not garbage. Producer/consumer must not race (no torn block). (T3.)
+- **mix_render_lock correctness** — a mix-patch `load` while the callback is rendering must not corrupt (the lock serializes); no deadlock (single lock, no nesting: the callback holds it only around `process_float`; the worker holds it only around its control ops). (T4/T5.)
+- **set_mixer before render** — the callback must be null-safe before `set_mixer` (contribute silence), and must not call `process_float` on a null `mix_pd`. (T4.)
+- **Samplerate/blocksize contract** — `audio_open(100)` (not a multiple of 64) fails; a synth `init(48000)` with a 44100 stream fails fast. (T6.)
 
 ---
 
-### Task 1: `AudioPort` abstraction + `NullPort` + pure `mix_block`
+### Task 3: `MixInputRing` — per-synth-worker ring
 
-The platform-free seam. `AudioPort` abstracts a device; `NullPort` simulates an audio thread for host tests; `mix_block` is the pure sum+clamp helper. This task is 100% host-testable with no device and no libpd.
+The handoff buffer between a synth worker (producer) and the mix-down callback (consumer). Host-testable, no libpd, no device.
 
 **Files:**
-- Create: `extension/src/core/audio_port.h`
-- Create: `extension/src/core/null_port.h` (header-only, for tests)
-- Test: `extension/tests/audio_port_tests.cpp`
+- Create: `extension/src/core/mix_input_ring.h` (header-only is fine) 
+- Test: `extension/tests/mix_input_ring_tests.cpp`
 
 **Interfaces:**
-- Consumes: nothing (foundational).
-- Produces (for Tasks 2/3/5):
-  - `namespace godot_libpd {`
-  - `struct AudioDeviceInfo { int index = -1; std::string name; int max_in = 0; int max_out = 0; };` (POD; the server wraps into `Array`.)
-  - `typedef void (*RenderFn)(float *p_dev_in, float *p_dev_out, int p_frames);` — the per-block render callback (the audio-thread body). `p_dev_in` has `frames * n_ins` floats (null when `n_ins == 0`); `p_dev_out` is the caller-allocated, zero-initialized scratch that the callback must fill with `frames * n_out` floats.
-  - `class AudioPort { public: virtual ~AudioPort() = default; virtual int open(int p_n_ins, int p_n_out, int p_samplerate, int p_blocksize) = 0; virtual void close() = 0; virtual bool is_open() const = 0; virtual std::vector<AudioDeviceInfo> list_inputs() const = 0; virtual std::vector<AudioDeviceInfo> list_outputs() const = 0; virtual double output_latency_ms() const = 0; virtual double input_latency_ms() const = 0; virtual bool supports_input() const = 0; void set_render_callback(RenderFn p_fn) { render = p_fn; } protected: RenderFn render = nullptr; };`
-  - `void mix_block(float *p_out, int p_out_ch, const float *const *p_inputs, int p_n_inputs, int p_frames);` — sums `p_n_inputs` interleaved buffers (each `p_frames * p_out_ch`) into `p_out`, clamps to `[-1, 1]`. `p_out` is `p_frames * p_out_ch`.
-  - `class NullPort : public AudioPort` — `open()` succeeds for any sane args; `list_outputs()` returns one device `{index 0, name "Null", max_in 0, max_out 2}`; `list_inputs()` returns one `{index 0, name "Null In", max_in 1, max_out 0}`; latencies = `blocksize / samplerate * 1000.0` (or 0 if not open); `supports_input() == true`. While open, a background thread calls `render(zeroed_in, scratch_out, blocksize)` at real-time pace (a `std::thread` + `std::chrono` sleep of `blocksize/samplerate`), incrementing `frames_rendered()` each tick and reading peak into `last_out_peak()`. `close()` joins the thread. `NullPort` is the device-free driver for the full `NativeAudio` loop in Task 3/6.
+- Consumes: nothing.
+- Produces (for Tasks 4/5):
+  - `namespace godot_libpd { class MixInputRing { public:
+      explicit MixInputRing(int p_channels = 2, int p_blocksize = 256, int p_num_blocks = 8);
+      void push(const float *p_block, int p_frames);            // producer: worker
+      int  gather_latest(float *p_dst, int p_frames) const;     // consumer: callback; returns frames copied (0 if empty)
+      int channels() const; int blocksize() const; int num_blocks() const;
+    private:
+      // circular buffer of p_num_blocks slots, each blocksize*channels floats;
+      // head index protected by a single mutex (low-frequency SPSC) OR lock-free;
+      // "latest wins": gather copies the newest written slot.
+    }; }`
+  - `gather_latest` writes `p_frames * channels` floats into `p_dst` (the newest complete block); if the ring has no block yet it writes **0.0** to every `p_dst` sample and returns 0. The `frames` must equal the ring's `blocksize`.
 
-- [ ] **Step 1: Write the failing tests for `mix_block` + `NullPort`**
+- [ ] **Step 1: Write the failing tests**
 
-Create `extension/tests/audio_port_tests.cpp` (a `main()` with `CHECK(...)` helpers, matching the existing test style — no gtest; process exit 0 on success, 1 on any failed CHECK). Write:
-
-1. **mix single input** — two-channel, 2 frames, one input `{0.25, -0.25, 0.5, 0.0}` → `mix_block` → `out == {0.25, -0.25, 0.5, 0.0}`.
-2. **mix two inputs sums** — input A `{0.5, 0.0}`, input B `{0.25, -0.5}` (1 frame, 2 ch) → `out == {0.75, -0.5}`.
-3. **mix clamps to 1.0** — input A `{1.0}`, input B `{0.5}` (1 frame, 1 ch) → `out == {1.0}` (not 1.5, not wrapped). Negative clamp: A `{-1.0}`, B `{-0.5}` → `out == {-1.0}`.
-4. **mix zero inputs** — `p_n_inputs == 0`, pre-filled `out` → `out` stays as-is (mix writes nothing) OR is zeroed — pick zero and assert `out == {0,0}` (decide in the impl; test pins it).
-5. **NullPort open + render** — `NullPort port; port.set_render_callback(fn)` where `fn` writes a constant `0.5` into every `p_dev_out` sample; `CHECK(port.open(1, 2, 44100, 256) == 0)`; wait ~120 ms; `CHECK(port.frames_rendered() > 0)` and `CHECK(port.last_out_peak() > 0.4f)`; `port.close()`.
-6. **NullPort blocksize honored** — `open(0, 2, 44100, 128)`; the callback records `p_frames`; wait ~120 ms; `CHECK(recorded_frames == 128)`.
+`extension/tests/mix_input_ring_tests.cpp` (CHECK/main style, mirror `audio_port_tests.cpp`):
+1. **Push then gather returns latest** — `MixInputRing r(2,256,8);` push block A (all `0.25f`), push block B (all `0.5f`); `gather_latest(dst,256)`; `CHECK(dst` all ≈ `0.5f)` and returns 256.
+2. **Latest-wins after many pushes** — push 20 distinct blocks; `gather_latest` returns the 20th block's value.
+3. **Empty ring → silence** — fresh ring, `gather_latest(dst,256)` returns 0 and `dst` is all 0.0.
+4. **Producer/consumer no race** — a producer thread pushes 500 blocks (incrementing a marker per block); a consumer thread calls `gather_latest` 500 times; assert no crash and that every gathered block is either all-silence or a consistent single marker value (no torn/mixed block).
+5. **Overflow wraps (no growth)** — push `num_blocks*10` blocks; gather returns the most recent; the ring never grows (fixed size).
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: build the new test target (Task 6 adds the CMake wiring; for this step, compile directly):
-`c++ -std=c++17 -Iextension/src extension/tests/audio_port_tests.cpp -o /tmp/audio_port_tests -pthread && /tmp/audio_port_tests`
-Expected: FAIL (no `AudioPort`/`NullPort`/`mix_block`).
+`c++ -std=c++17 -Iextension/src extension/tests/mix_input_ring_tests.cpp -o /tmp/mix_input_ring_tests -pthread && /tmp/mix_input_ring_tests`
+Expected: FAIL (no `MixInputRing`).
 
-- [ ] **Step 3: Implement `mix_block` + `AudioPort` + `NullPort`**
+- [ ] **Step 3: Implement `MixInputRing`**
 
-`extension/src/core/audio_port.h`: the `AudioPort` base, `AudioDeviceInfo`, `RenderFn`, and `mix_block` (defined inline in the header so tests + the extension share it). `mix_block`: nested loop over `frames`, then `out_ch`: `acc = sum over inputs[i][f*out_ch+c]`; `out[f*out_ch+c] = clamp(acc, -1.0f, 1.0f)`; if `p_n_inputs == 0`, write 0.
-
-`extension/src/core/null_port.h`: `NullPort` (header-only). `open()` validates `blocksize % 64 == 0` (else return `-1`), starts a `std::thread` that loops while `open_`: allocates scratch `dev_in` (if `n_ins`) + `dev_out` (zeroed), calls `render(...)`, bumps `frames_rendered_` (atomic), tracks `last_out_peak_`, sleeps `blocksize/samplerate` seconds. `close()` sets `open_ = false`, joins.
+Header-only. A `std::vector<float>` circular buffer sized `num_blocks * blocksize * channels`; a `std::mutex` (or atomic head) guarding the newest-slot index; `push` writes the block to the next slot and advances; `gather_latest` copies the newest slot to `p_dst` (0.0-filled when empty). Keep it allocation-free after construction (the buffer is fixed).
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `c++ -std=c++17 -Iextension/src extension/tests/audio_port_tests.cpp -o /tmp/audio_port_tests -pthread && /tmp/audio_port_tests`
-Expected: PASS (6/6).
+Re-run the Step 2 command. Expected: PASS (5/5).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add extension/src/core/audio_port.h extension/src/core/null_port.h extension/tests/audio_port_tests.cpp
-git commit -m "native audio: AudioPort abstraction + NullPort + mix_block (M5 T1)"
+git add extension/src/core/mix_input_ring.h extension/tests/mix_input_ring_tests.cpp
+git commit -m "native audio: MixInputRing per-synth-worker ring (M5 T3)"
 ```
 
 ---
 
-### Task 2: `PortAudioPort` (CoreAudio / ALSA) — device enumeration, stream, latency
+### Task 4: `NativeAudio` — mix-down render in the PortAudio callback
 
-The real backend. Wraps PortAudio: enumerates devices, opens a full-duplex stream with a C callback trampoline that dispatches to the `RenderFn`, and reports latencies from `PaStreamInfo`.
-
-**Files:**
-- Create: `extension/src/core/portaudio_port.h`
-- Create: `extension/src/core/portaudio_port.cpp`
-
-**Interfaces:**
-- Consumes: `AudioPort` (Task 1), `RenderFn`. The PortAudio headers (`thirdparty/libpd/pure-data/portaudio/portaudio/include/portaudio.h`) and the PortAudio sources (linked in Task 6).
-- Produces (for Task 3):
-  - `class PortAudioPort : public AudioPort { public: PortAudioPort(); ~PortAudioPort(); int open(int, int, int, int) override; void close() override; bool is_open() const override; std::vector<AudioDeviceInfo> list_inputs() const override; std::vector<AudioDeviceInfo> list_outputs() const override; double output_latency_ms() const override; double input_latency_ms() const override; bool supports_input() const override; };`
-  - A **static** C callback `int pa_callback(void *out, const void *in, unsigned long frames, const PaStreamCallbackTimeInfo*, unsigned int flags, void *userData)` that zero-inits `out` if needed, then calls `static_cast<PortAudioPort *>(userData)->render` (the `RenderFn`) with the raw device buffers and returns `paContinue`. (The `render` call is what Task 3's `NativeAudio` body plugs in — it reads/writes the raw PortAudio buffers, so `PortAudioPort` stays agnostic to libpd.)
-
-- [ ] **Step 1: Write the failing test (host; graceful no-device)**
-
-Add to a new `extension/tests/audio_portaudio_tests.cpp`:
-1. **Init + enum** — `PortAudioPort port;` `CHECK(port.list_outputs().size() >= 1)` on macOS/Linux with audio; if the host has no audio device, the test detects `Pa_Initialize()`/`Pa_GetDeviceCount()==0` and **skips** (prints `SKIP (no audio)` and returns 0 — mirror the RtMidi host test's skip pattern so headless CI stays green).
-2. **Latency sane** — if output devices exist: `CHECK(port.output_latency_ms() >= 0.0)`.
-3. **Open + close** (only if a device exists) — `CHECK(port.open(0, 2, 44100, 256) == 0)`; `CHECK(port.is_open())`; a render callback that writes `0.5`; wait ~120 ms; `CHECK(peak observed > 0.4f)` (the trampoline called `render`); `port.close()`; `CHECK(!port.is_open())`.
-4. **Bad blocksize rejected** — `CHECK(port.open(0, 2, 44100, 100) == -1)` (not a multiple of 64).
-
-- [ ] **Step 2: Run test to verify it fails**
-
-`c++ -std=c++17 -Iextension/src -I<portaudio>/include extension/tests/audio_portaudio_tests.cpp <portaudio src/common *.c + os/unix *.c + hostapi/coreaudio *.c> extension/src/core/portaudio_port.cpp -o /tmp/audio_pa_tests -DPA_USE_COREAUDIO=1 -framework CoreAudio -framework CoreFoundation -framework CoreServices -framework AudioToolbox && /tmp/audio_pa_tests`
-Expected: FAIL (no `PortAudioPort`).
-
-- [ ] **Step 3: Implement `PortAudioPort`**
-
-`portaudio_port.cpp`: `Pa_Initialize()` once (guard with `std::call_once`). `list_outputs()`/`list_inputs()`: iterate `Pa_GetDeviceCount()`, `Pa_GetDeviceInfo`, build `AudioDeviceInfo{index, name, maxInputChannels, maxOutputChannels}`; include only devices with `maxOutputChannels > 0` (outputs) / `maxInputChannels > 0` (inputs). `open(n_ins, n_out, samplerate, blocksize)`: reject `blocksize % 64 != 0` (`return -1`); `Pa_OpenStream(&stream, in, out, samplerate, blocksize, in?inputDev:null, outDev, pa_callback, this, &info)` selecting `Pa_GetDefaultOutputDevice()` (or the first device) for output and default input if `n_ins`; store `info.outputLatency`/`inputLatency` for the latency getters. `close()`: `Pa_CloseStream`. The C callback is exactly the trampoline above.
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Re-run the Task 2 build line. Expected: PASS (or clean `SKIP` on a device-less host).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add extension/src/core/portaudio_port.h extension/src/core/portaudio_port.cpp extension/tests/audio_portaudio_tests.cpp
-git commit -m "native audio: PortAudioPort (CoreAudio/ALSA) enum + stream + latency (M5 T2)"
-```
-
----
-
-### Task 3: `NativeAudio` — orchestration, `RenderSlot`, RT `render_block`
-
-Wires the port to the instances. Owns the `render_lock`. Its `render_block` is the actual audio-thread body: snapshot slots, `libpd_set_instance` + `libpd_process_float` per slot (under `render_lock`), then `mix_block` into the device output.
+Replace the (Approach-A) `NativeAudio` written during the blocked run with the mix-down-in-callback object. It owns the PortAudio stream + the callback that gathers the synth rings and renders the mix-down instance.
 
 **Files:**
-- Create: `extension/src/core/native_audio.h`
-- Create: `extension/src/core/native_audio.cpp`
-- Test: `extension/tests/native_audio_tests.cpp`
+- Modify: `extension/src/core/native_audio.h` / `native_audio.cpp` (rewrite — the existing file is Approach-A; keep the `AudioPort*` ownership + `mix_block`/`NullPort` fallback, drop the per-slot `render_block` multi-instance loop).
+- Test: `extension/tests/native_audio_mixdown_tests.cpp`
 
 **Interfaces:**
-- Consumes: `AudioPort` (Task 1), `RenderFn`, `mix_block` (Task 1), `libpd_*` (`libpd_set_instance`, `libpd_process_float`, `libpd_blocksize` — from `z_libpd.h`/`m_pd.h`).
-- Produces (for Task 4/5):
-  - `struct RenderSlot { t_pdinstance *pd = nullptr; int n_ins = 0; int n_out = 0; std::vector<float> in_buf; std::vector<float> out_buf; bool active = false; };`
+- Consumes: `AudioPort`/`NullPort`/`mix_block` (T1), `MixInputRing` (T3), `PortAudioPort` (T2, for the real device; tests use `NullPort`), `libpd_*`.
+- Produces (for Tasks 5/6):
   - `class NativeAudio { public:
       NativeAudio(); ~NativeAudio();
-      bool open(AudioPort *p_port, int p_n_ins, int p_n_out, int p_blocksize, int p_samplerate); // takes ownership of p_port; wires render_block
+      bool open(AudioPort *p_port, int p_mix_n_in, int p_mix_n_out, int p_blocksize, int p_samplerate); // owns p_port
       void close();
-      bool is_open() const;
-      AudioPort *port() const;
-      int blocksize() const; int samplerate() const; int n_ins() const; int n_out() const;
-      // Called on the main/control thread when an instance is ready / removed.
-      int  register_instance(t_pdinstance *p_pd, int p_n_ins, int p_n_out);      // returns slot id (>= 0)
-      void set_active(int p_slot, bool p_active);
-      void unregister_instance(int p_slot);
-      void with_render_lock(std::function<void()> p_fn);   // control-op RT guard (spec §6.2)
+      bool is_open() const; AudioPort *port() const;
+      int blocksize() const; int samplerate() const;
+      void set_mixer(t_pdinstance *p_mix_pd, int p_mix_n_in, int p_mix_n_out); // called on main thread before the mixer's start_dsp
+      void register_worker_ring(MixInputRing *p_ring);   // order defines the 16ch layout (ring i -> ch 2i,2i+1)
+      void unregister_worker_ring(MixInputRing *p_ring);
+      void with_mixer_lock(std::function<void()> p_fn);  // the mixer's control ops take this (spec §7.2)
     private:
-      void render_block(float *p_dev_in, float *p_dev_out, int p_frames);        // the RenderFn
-      std::vector<RenderSlot> slots;  std::mutex slots_mu;
-      std::mutex render_lock_;
-      AudioPort *port = nullptr; int blocksize_ = 256; int samplerate_ = 44100; int n_ins_ = 0; int n_out_ = 2; bool open_ = false;
+      void render_block(float *p_dev_in, float *p_dev_out, int p_frames);  // the callback body
+      std::vector<MixInputRing*> rings_; std::mutex rings_mu_;
+      t_pdinstance *mix_pd_ = nullptr; int mix_n_in_=16, mix_n_out_=2; std::atomic<bool> mix_set_{false};
+      std::mutex mix_render_lock_; std::vector<float> mix_in_; std::vector<float> mix_out_;
+      AudioPort *port_=nullptr; int blocksize_=256, samplerate_=44100; bool open_=false;
     };`
-  - The `RenderSlot` in/out buffers are sized `blocksize * n_ins` / `blocksize * n_out` at `register_instance` time (fixed stream blocksize).
 
-- [ ] **Step 1: Write the failing tests (host; NullPort driver)**
+- [ ] **Step 1: Write the failing tests** (host; NullPort + real libpd mix instance)
 
-`extension/tests/native_audio_tests.cpp`:
-1. **Render one instance** — build a real libpd instance on the test thread (`libpd_init(); auto *pd = libpd_new_instance(); libpd_set_instance(pd); libpd_init_audio(0, 2, 44100); ... "pd" "dsp"`), load a sine patch (a `[osc~ 440]`→`*~ 0.2`→`[dac~]` written to a temp file), `NativeAudio na; NullPort port; na.open(&port, 0, 2, 256, 44100);` `int slot = na.register_instance(pd, 0, 2); na.set_active(slot, true);` wait ~150 ms; `CHECK(port.frames_rendered() > 0)` and `CHECK(port.last_out_peak() > 0.1f)` (the sine at 0.2 gain → peak ~0.2). Then `na.set_active(slot, false); na.unregister_instance(slot); na.close();` `libpd_closefile(pd); libpd_free_instance(pd);`
-2. **Input through libpd** — same as (1) but the patch is `[adc~ 1]`→`*~ 50`→`[dac~]`; `na.open(&port, 1, 2, 256, 44100)`; the `NullPort` render callback writes `0.001` into `dev_in`; wait ~150 ms; `CHECK(port.last_out_peak() > 0.04f)` (50 × 0.001). (This pins the `adc~` → `st_soundin` path end-to-end through the extension.)
-3. **Two-instance mix clamps** — two sine patches at gain `1.0` (peak 1.0 each) into a 2-channel mix; wait ~150 ms; `CHECK(port.last_out_peak() <= 1.001f)` (clamped, not 2.0).
-4. **Instance removed mid-render** — register 2 slots, activate both, wait ~100 ms, `unregister_instance(0)`, wait ~100 ms; assert no crash + `port.frames_rendered()` kept rising (the remaining slot still renders). (Pins the slots snapshot-under-lock invariant.)
-5. **with_render_lock serializes** — `port` rendering; from the test thread, `na.with_render_lock([&]{ std::this_thread::sleep_for(50ms); })` × 10; assert no crash and `frames_rendered()` advanced (control op didn't wedge the audio thread).
+`extension/tests/native_audio_mixdown_tests.cpp`:
+1. **Mix-down renders** — build a real libpd mix instance on the test thread: `libpd_init(); auto* mix=libpd_new_instance(); libpd_set_instance(mix); libpd_init_audio(16,2,44100); ...dsp...; libpd_openfile(<16-in/2-out patch>, dir)` where the patch is `[adc~ 1] *~ 1.0 [dac~]` (reads channel 1 → out). `NullPort port; NativeAudio na; na.open(&port,16,2,256,44100);` create a `MixInputRing ring0(2,256,8); na.register_worker_ring(&ring0);` a producer thread pushes `0.5f` blocks into `ring0`; `na.set_mixer(mix,16,2);` wait ~250 ms; `CHECK(port.frames_rendered()>0)` and `CHECK(port.last_out_peak()>0.4f)`. Tear down: `na.close();` then (audio thread joined) `libpd_closefile; libpd_free_instance(mix);`
+2. **16-ch gather** — feed 8 rings; a mix patch `[adc~ 1]` and a second check `[adc~ 16]`. Feed only ring 0 with 0.5 → `[adc~ 1]` output ≈0.5, `[adc~ 16]` output ≈0. Then feed only ring 7 with 0.5 → `[adc~ 16]` ≈0.5, `[adc~ 1]` ≈0. (Proves the ring→channel mapping.)
+3. **set_mixer not called → silence** — open + register a ring fed with 0.5, but do NOT `set_mixer`; wait ~200 ms; `CHECK(port.last_out_peak()==0.0f)` and no crash (callback null-safe).
+4. **with_mixer_lock serializes** — while the test thread holds `na.with_mixer_lock([&]{ sleep 50ms; })` × 5, `port.frames_rendered()` is frozen; after release it resumes. No crash.
+5. **9-concurrent regression** — 8 real synth instances, each on its **own** pthread (a1: `new_instance; set_instance once; init_audio(0,2,44100); dsp; openfile(<sine>); loop process_float(1,nullptr,buf)`), each pushing its 2-ch `buf` into its own `MixInputRing`. 1 mix instance rendered by `NativeAudio` on a `NullPort` (a `[adc~ 1] *~ 0.25 [dac~]`-style patch). Register all 8 rings, `set_mixer(mix)`, run ~600 ms. `CHECK(no crash)` and `port.frames_rendered()>0` and `last_out_peak()>0`. (This ports `spike/mix_repro.c` into the suite — the key multi-instance guard.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Compile (same PortAudio + libpd link line as the spike; `build/cmake-macos/thirdparty/libpd/libs/libpd-multi.a` + PortAudio sources) — expected: FAIL (no `NativeAudio`).
+Compile (same recipe as the spike/mix_repro: c++ for the `.cpp`s + the libpd `-I` dirs + `libpd-multi.a` + PortAudio in the test via `NullPort` which needs no PortAudio link; the mix-down test only needs libpd + `null_port` + `native_audio`):
+`c++ -O2 -DPA_USE_COREAUDIO=1 -I <PA>/include -I extension/thirdparty/libpd/libpd_wrapper -I extension/thirdparty/libpd/pure-data/src -I extension/src extension/tests/native_audio_mixdown_tests.cpp extension/src/core/native_audio.cpp extension/build/cmake-macos/thirdparty/libpd/libs/libpd-multi.a -lpthread -framework CoreAudio -framework CoreFoundation -framework CoreServices -framework AudioToolbox -o /tmp/native_audio_mixdown_tests && /tmp/native_audio_mixdown_tests`
+Expected: FAIL (new `NativeAudio` API / behavior).
 
-- [ ] **Step 3: Implement `NativeAudio`**
+- [ ] **Step 3: Implement `NativeAudio` (mix-down-in-callback)**
 
 `native_audio.cpp`:
-- `open(port, n_ins, n_out, blocksize, samplerate)`: store config, `port->set_render_callback(&NativeAudio::render_block_trampoline, this)` — where the trampoline is a static that casts `this` and calls `render_block(dev_in, dev_out, frames)`. (`AudioPort::set_render_callback` takes a `RenderFn`; add an overload or wrap — see note: `RenderFn` is a raw C function, so use a static trampoline with `void*`.) `port->open(n_ins, n_out, samplerate, blocksize)`; `open_ = true` on success.
-- `render_block(dev_in, dev_out, frames)`: `std::lock_guard<std::mutex> lk(render_lock_);` snapshot the slot list into a local `std::vector<RenderSlot*> active` under `slots_mu` (copy pointers to slots that are `active`); **for each slot:** `libpd_set_instance(slot->pd);` int `ticks = frames / 64;` `int n_out = slot->n_out;` call `libpd_process_float(ticks, slot->n_ins ? (float*)dev_in : nullptr, slot->out_buf.data())`; collect `slot->out_buf` pointers into a `const float* mix_in[]`; after the loop: `mix_block(dev_out, n_out_ /*device ch*/, mix_in, count, frames)`. (When `n_ins_ > 0`, `dev_in` is the shared device input; each slot reads its channels from it via `adc~`.)
-- `register_instance(pd, n_ins, n_out)`: under `slots_mu`, push a `RenderSlot{pd, n_ins, n_out, in_buf(blocksize*n_ins), out_buf(blocksize*n_out), active=false}`; return its index.
-- `with_render_lock(fn)`: `std::lock_guard lk(render_lock_); fn();`
+- `open(port, mix_n_in, mix_n_out, blocksize, samplerate)`: validate args (blocksize%64, samplerate>0, mix_n_out>0); size `mix_in_` (`blocksize*mix_n_in`) + `mix_out_` (`blocksize*mix_n_out`); `port->set_render_callback([this](float*in,float*out,int f){ this->render_block(in,out,f); })`; `port->open(mix_n_in, mix_n_out, samplerate, blocksize)`; `open_=true`. (The device `n_ins` is 0 — the mix-down's input is the gathered rings, not the device; pass 0 to `port->open`'s input count. See note below.)
+- `render_block(dev_in, dev_out, frames)`:
+  ```
+  // gather the 8 rings -> mix_in_ (16ch). Fixed buffers, no alloc.
+  for i, ring in rings_ (snapshot under rings_mu_):
+      int got = ring->gather_latest(&mix_in_[i*frames*2], frames);  // writes 0 if empty
+  // one-shot set_instance on THIS thread (the callback thread)
+  if (mix_pd_ != nullptr && !mix_set_.exchange(true)) libpd_set_instance(mix_pd_);
+  if (mix_pd_ == nullptr) { /* silence */ zero dev_out; return; }
+  std::lock_guard lk(mix_render_lock_);   // serialize with the mixer's control ops
+  int ticks = frames / 64;
+  libpd_process_float(ticks, mix_in_.data(), mix_out_.data());
+  copy mix_out_ -> dev_out (frames * mix_n_out_);
+  ```
+- `set_mixer(mix_pd, n_in, n_out)`: store under a small lock; `mix_set_` stays false until the first callback (the callback sets the instance on its own thread — the control thread must NOT call `set_instance(mix)`; only the callback does).
+- `with_mixer_lock(fn)`: `std::lock_guard lk(mix_render_lock_); fn();`.
+- Note: the PortAudio stream's **device input** is unused (the mix-down's input is the rings). Open the PortAudio stream with **0 device inputs** (`port->open(0, mix_n_out, samplerate, blocksize)`); `mix_n_in` is only used to size `mix_in_` and is the mix instance's `libpd_init_audio` channel count, not the device's.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Re-run the Task 3 build line. Expected: PASS (5/5).
+Re-run the Step 2 command. Expected: PASS (5/5).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add extension/src/core/native_audio.h extension/src/core/native_audio.cpp extension/tests/native_audio_tests.cpp
-git commit -m "native audio: NativeAudio render loop + slots + render_lock (M5 T3)"
+git add extension/src/core/native_audio.h extension/src/core/native_audio.cpp extension/tests/native_audio_mixdown_tests.cpp
+git commit -m "native audio: NativeAudio mix-down render in PortAudio callback (M5 T4)"
 ```
 
 ---
 
-### Task 4: Worker refactor — control thread (native) + `with_audio_lock` seam
+### Task 5: Worker refactor — synth ring sink + mixer control-only
 
-Strip the a1 DSP/pacing loop when `native_audio` is true; keep it for Android. Add a `with_audio_lock` seam so control ops (INIT/LOAD/UNLOAD/STOP) serialize with the audio thread via `NativeAudio::with_render_lock`. Expose the worker's `pd_instance` + channel counts to the instance/server.
+The synth worker keeps the a1 render loop but pushes to its `MixInputRing`; the mixer worker is control-only (the callback renders it); its control ops take `with_mixer_lock`. Android is untouched.
 
 **Files:**
-- Modify: `extension/src/libpd_worker.h` (add `Config.native_audio`, `Config.with_audio_lock`, accessors `pd_instance_ptr()`, `n_ins()`, `n_out()`).
-- Modify: `extension/src/libpd_worker.cpp` (gate the DSP loop; wrap libpd control calls in `with_audio_lock`).
+- Modify: `extension/src/libpd_worker.h` / `libpd_worker.cpp`
 
 **Interfaces:**
-- Consumes: `PdCommandQueue`, `libpd_*` (existing).
-- Produces (for Task 5):
-  - `Config.native_audio = false;` (bool; true → worker is control-only, no DSP loop).
-  - `std::function<void(std::function<void()>)> Config.with_audio_lock;` (control-op RT guard; default = run the fn as-is, no lock).
-  - `t_pdinstance *pd_instance_ptr() const;` (valid after INIT completes; the instance reads it to build its `RenderSlot`).
-  - `int n_ins() const; int n_out() const;`
+- Consumes: `MixInputRing` (T3), `libpd_*` (existing), `PdCommandQueue`.
+- Produces (for Task 6):
+  - `enum class WorkerRole { SYNTH, MIXER, ANDROID };`
+  - `Config` gains: `WorkerRole role = ANDROID;` (default = existing a1/generator behavior), `MixInputRing *worker_ring = nullptr;` (SYNTH), `std::function<void(std::function<void()>)> with_mixer_lock;` (MIXER; default = run fn as-is).
+  - `t_pdinstance *pd_instance_ptr() const;` (valid after INIT).
+- **SYNTH** worker: keep the existing a1 DSP+pacing loop, but replace `config.sink->push_block(...)` with `config.worker_ring->push(out_buffer.data(), blocksize)` (2-ch). Pacing unchanged (paced to samplerate).
+- **MIXER** worker: **no render loop** (the PortAudio callback renders the mix). Wrap its `libpd_*` control ops — INIT (incl. `libpd_init_audio`), LOAD (`openfile`), UNLOAD (`closefile`), and teardown (`closefile`+`free_instance`) — in `config.with_mixer_lock`.
+- **ANDROID** worker: existing a1 DSP+pacing + `sink->push_block` (unchanged).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
-Extend `extension/tests/worker_midi_tests.cpp` (or add `native_worker_tests.cpp`):
-1. **Control-only in native mode** — `LibpdWorker::Config cfg; cfg.instance_id = 1; cfg.samplerate = 44100; cfg.n_out = 2; cfg.native_audio = true;` create worker, `start()`; push INIT (n_ins=0, n_out=2); wait for the result (existing `wait_for_command` pattern). Assert `worker.pd_instance_ptr() != nullptr`. Then push a LOAD of a sine patch; assert the load succeeds. Then **without any audio thread**, push a MESSAGE and assert no crash, and that `worker` did NOT push any audio (there is no sink in native mode — the sink pointer is null/ignored). `request_stop(); join();`. (Pins: native worker does init + load + message, and never renders on its own.)
-2. **with_audio_lock is invoked** — set `cfg.with_audio_lock = [&](std::function<void()> f){ ++lock_calls; f(); };`; push INIT + LOAD; after completion `CHECK(lock_calls >= 2)` (INIT and LOAD each wrapped). (Pins the seam is called around the RT-sensitive libpd ops.)
-3. **Android path still renders (regression)** — `cfg.native_audio = false;` + a `DrySink`; push INIT + dsp-on; wait ~100 ms; `CHECK(sink.blocks_pushed() > 0)`. (Guards the a1 loop still works when native is off.)
+Extend `extension/tests/worker_midi_tests.cpp` (or a new `native_worker_tests.cpp`):
+1. **SYNTH worker pushes to ring** — `Config{role=SYNTH, worker_ring=&ring, samplerate=44100, n_out=2};` start worker; push INIT (0 in / 2 out); push a LOAD of a sine patch; push dsp-on. Wait ~150 ms; `CHECK(ring has blocks)` (a `blocks_pushed()` counter on the ring, or gather returns non-silence). `request_stop(); join();`
+2. **MIXER worker is control-only** — `Config{role=MIXER, with_mixer_lock=[&](auto f){ ++calls; f(); }};` push INIT + LOAD; after completion `CHECK(calls >= 2)` (INIT and LOAD each wrapped in `with_mixer_lock`); and the worker pushed **no** audio (no ring, no sink). (Pins the mixer does not render.)
+3. **ANDROID worker still renders (regression)** — `Config{role=ANDROID, sink=&drySink};` INIT + dsp-on; wait ~100 ms; `CHECK(drySink.blocks_pushed()>0)`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Re-run the `worker_midi_tests` build (CMake target exists). Expected: FAIL (`pd_instance_ptr`/`with_audio_lock` undefined).
+Re-run the worker test build. Expected: FAIL (`role`/`worker_ring`/`with_mixer_lock` undefined).
 
 - [ ] **Step 3: Implement the worker changes**
 
-`libpd_worker.h`: add `bool native_audio = false;` and `std::function<void(std::function<void()>)> with_audio_lock;` to `Config`; add `t_pdinstance *pd_instance_ptr() const { return pd_instance; }`, `int n_ins() const { return config.n_ins; }`, `int n_out() const { return n_out; }` (or store `n_ins` too). A default `with_audio_lock` that just calls the fn is applied at the top of `run()` if `config.with_audio_lock` is null.
-
-`libpd_worker.cpp` `run()`: replace the DSP branch with:
+In `run()`, branch on `config.role`:
 ```
-if (dsp_on.load() && pd_instance != nullptr && patch_handle != nullptr) {
-    if (config.native_audio) {
-        // Native: the audio thread renders; nothing to do here. Idle below.
-    } else {
-        ... existing a1 DSP + pacing block (unchanged) ...
-    }
+bool render = dsp_on.load() && pd_instance && patch_handle;
+if (render && config.role == WorkerRole::SYNTH) {
+    ... existing a1 DSP+pacing block, but push to config.worker_ring instead of config.sink ...
+} else if (render && config.role == WorkerRole::ANDROID) {
+    ... existing a1 DSP+pacing block, push to config.sink (unchanged) ...
+} else {
+    // SYNTH-idle / MIXER (control-only) / not-ready: block on queue.pop(&command, 1000)
 }
 ```
-and in the idle path (no dsp, or native-with-dsp), keep the blocking `queue.pop(&command, 1000)` wait. Wrap the `libpd_*` control calls in `INIT`/`LOAD`/`UNLOAD` and the teardown `libpd_closefile`/`libpd_free_instance` with `config.with_audio_lock([&]{ ... })` (call the default if unset). Keep `libpd_start_message(1)`/`dsp` (they still enable the pd dsp engine; on native the render loop in `NativeAudio` does the actual `process_float`).
+In `execute_command`, wrap the MIXER's RT-sensitive ops in `config.with_mixer_lock([&]{ ... })` (INIT body, LOAD body, UNLOAD body) and the teardown in `run()`'s close-file/free-instance. Apply a default no-op `with_mixer_lock` if unset.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Re-run the worker test build. Expected: PASS (3/3 new + all existing).
+Re-run the worker test build. Expected: PASS (3/3 new + existing).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add extension/src/libpd_worker.h extension/src/libpd_worker.cpp extension/tests/worker_midi_tests.cpp
-git commit -m "native audio: worker becomes control thread when native (a1 kept for Android) (M5 T4)"
+git add extension/src/libpd_worker.h extension/src/libpd_worker.cpp extension/tests/native_worker_tests.cpp
+git commit -m "native audio: worker roles — synth ring sink + mixer control-only (M5 T5)"
 ```
 
 ---
 
-### Task 5: Server `audio_*` API + instance registration + `init()` changes
+### Task 6: Server `audio_*` API + `set_mixer` + instance roles
 
-The GDScript surface. The server owns a `NativeAudio`; instances register their `RenderSlot` with it on init and set active on dsp on/off. `audio_open` validates the block-size + samplerate contract. `init()` in native mode skips the Godot-mix-rate check (audio is native, not via `AudioServer`).
+The GDScript surface. The server owns `NativeAudio`; instances are assigned SYNTH vs MIXER roles.
 
 **Files:**
-- Modify: `extension/src/libpd_server.h` / `libpd_server.cpp` (add `NativeAudio native_audio;`, the `audio_*` methods, `_bind_methods`, wire instance register/unregister to `native_audio`).
-- Modify: `extension/src/libpd_instance.h` / `libpd_instance.cpp` (native branch in `init()`: set `worker.Config.native_audio` + `with_audio_lock`, register `RenderSlot`, register active on dsp on/off; `audio_slot` tracking; skip the mix-rate check in native mode).
-- Test: extend `extension/tests/native_audio_tests.cpp` (or a new `server_audio_tests.cpp`) for the API-level contract.
+- Modify: `extension/src/libpd_server.h` / `libpd_server.cpp`
+- Modify: `extension/src/libpd_instance.h` / `libpd_instance.cpp`
+- Test: `extension/tests/server_audio_tests.cpp`
 
 **Interfaces:**
-- Consumes: `NativeAudio` (Task 3), `PortAudioPort`/`NullPort` (Tasks 1/2), `LibpdWorker` accessors (Task 4).
+- Consumes: `NativeAudio` (T4), `PortAudioPort`/`NullPort` (T1/T2), `MixInputRing` (T3), `LibpdWorker` (T5).
 - Produces (GDScript, via `_bind_methods`):
-  - `bool LibpdServer::audio_open(int p_output_device, int p_input_device, int p_blocksize, int p_samplerate)` — `-1` for either device means default; `0` input device (index) is allowed; returns `true`/`false`. Validates `p_blocksize % 64 == 0` (else `push_error` + `false`) and that any already-`init`ed instance's `samplerate` equals `p_samplerate` (else `push_error` + `false`). Uses `PortAudioPort` on macOS/Linux (`NATIVE_AUDIO`).
+  - `bool LibpdServer::audio_open(int p_blocksize, int p_samplerate, int p_mix_in = 16, int p_mix_out = 2)` — validates `blocksize%64==0` (else `push_error`+false); opens a `PortAudioPort` stream (0 device inputs, `p_mix_out` device outputs) via `native_audio.open(...)`. Under `#ifndef NATIVE_AUDIO` (Android) → returns false.
   - `void LibpdServer::audio_close()`.
-  - `Array LibpdServer::audio_list_output_devices()` — `[{index:int, name:String, max_channels:int}, …]`.
-  - `Array LibpdServer::audio_list_input_devices()`.
-  - `float LibpdServer::audio_output_latency_ms()` / `audio_input_latency_ms()`.
-  - `bool LibpdServer::audio_available()` — true when the native backend is compiled in (`NATIVE_AUDIO`).
-  - Signals (optional, M5.2): `audio_error(int code, String what)`.
+  - `bool LibpdServer::set_mixer(LibpdInstance *p_mix)` — designate the mix-down; after its worker INIT, `native_audio.set_mixer(mix->pd_instance_ptr(), 16, 2)`. Fails if audio not open.
+  - `Array audio_list_output_devices()` / `audio_list_input_devices()` / `float audio_output_latency_ms()` / `bool audio_available()`.
+- `LibpdInstance`:
+  - a new role (default SYNTH; `set_mixer` marks the mixer).
+  - **SYNTH** `init()`: creates its `MixInputRing(2, stream_blocksize, 8)`; sets `worker.Config.role=SYNTH; Config.worker_ring=&ring;`; after INIT success, `server->native_audio.register_worker_ring(&ring)`.
+  - **MIXER** `init()`: sets `worker.Config.role=MIXER; Config.with_mixer_lock=[&](auto f){ server->native_audio.with_mixer_lock(f); };`; its `n_ins` MUST be 16, `n_out` 2 (the mix layout); after INIT, the server's `set_mixer` wires `native_audio.set_mixer(pd,16,2)`.
+  - Native `init()` skips the Godot `AudioServer` mix-rate check (audio is native); records `samplerate`. (Android keeps the existing mix-rate check.)
+  - On `_exit_tree` (SYNTH): `unregister_worker_ring(&ring)` then the worker teardown (ring is safe to drop after the worker stops).
 
-- [ ] **Step 1: Write the failing tests (API contract, device-free)**
+- [ ] **Step 1: Write the failing tests**
 
-In a new `extension/tests/server_audio_tests.cpp` (or extend `native_audio_tests.cpp`), using `NullPort` as the backend so no device is needed — but the server uses `PortAudioPort` under `NATIVE_AUDIO`, so for a device-free host test, add a **test seam**: `LibpdServer` gets a `void _set_audio_port_for_test(std::unique_ptr<godot_libpd::AudioPort> port)` that `audio_open` uses instead of constructing a `PortAudioPort` (production path keeps `PortAudioPort`; the seam is test-only). Tests:
-1. **blocksize not multiple of 64** — `server.audio_open(-1, -1, 100, 44100)` returns `false` (and `audio_error`/`push_error` fired).
-2. **blocksize 64/128/256 accepted** — `audio_open(-1, -1, 128, 44100)` → `true`; `audio_output_latency_ms() >= 0`.
-3. **samplerate mismatch fails** — `audio_open(-1,-1,256,44100)` → `true`; then a `LibpdInstance` `init(48000, 0, 2)` → returns `false` (mismatch) — but the instance is a Godot `Node`, hard to construct in a C++ test. So instead: register a fake slot with `samplerate 48000` via the worker and assert `audio_open(44100)` after it would reject. (If constructing a `LibpdInstance` in the test is impractical, pin this at the `NativeAudio::open` level: `open` rejects if a pre-registered slot's samplerate != stream samplerate — add that check + test it directly on `NativeAudio`.)
-4. **audio_available** — `CHECK(server.audio_available() == true)` under `NATIVE_AUDIO`.
+`extension/tests/server_audio_tests.cpp` (device-free via a test seam `void LibpdServer::_set_audio_port_for_test(std::unique_ptr<AudioPort>)` → `audio_open` uses a `NullPort` when set, else `PortAudioPort`):
+1. **blocksize not a multiple of 64** — `audio_open(100, 44100)` → false.
+2. **audio_open ok** — `audio_open(256, 44100)` → true; `audio_available()==true`; `audio_output_latency_ms()>=0`.
+3. **set_mixer wiring** — create a mixer `LibpdInstance`, `init(44100,16,2)` (SYNTH path first is wrong — set role MIXER via the API), load a mix patch, `set_mixer(it)` → true; a synth `init(44100,0,2)` registers its ring. (If constructing `LibpdInstance` in C++ is impractical, pin the blocksize/samplerate contract + the `NativeAudio` register/set_mixer calls directly.)
+4. **samplerate mismatch** — a synth `init(48000)` while the stream is 44100 fails (or `NativeAudio` rejects it).
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Re-run the server test build. Expected: FAIL (no `audio_*` methods).
+Re-run the server test build. Expected: FAIL (no `audio_*`/`set_mixer`).
 
 - [ ] **Step 3: Implement the server + instance changes**
 
-`libpd_server.h/.cpp`: add `#include "core/native_audio.h"` + `std::unique_ptr<godot_libpd::AudioPort> audio_port_override_;` + `godot_libpd::NativeAudio native_audio;`. Implement `audio_open`: validate blocksize, build the port (`_set_audio_port_for_test` override or `std::make_unique<PortAudioPort>` under `NATIVE_AUDIO`), `native_audio.open(port, in_dev?n_in:0, out_dev?n_out:2, blocksize, samplerate)`; validate pre-registered instances' samplerates; on failure `push_error` + `false`. `audio_close`: `native_audio.close()`. The `list_*`/`latency`/`audio_available` delegate to `native_audio.port()` (or a fresh `PortAudioPort` for enumeration when closed). `_bind_methods`: register `audio_open`, `audio_close`, `audio_list_output_devices`, `audio_list_input_devices`, `audio_output_latency_ms`, `audio_input_latency_ms`, `audio_available` (+ `audio_error` signal if added).
-
-`libpd_instance.cpp`: in `init()`, branch on `#ifdef NATIVE_AUDIO` (or a server-provided `audio_available()`): native → set `worker.Config.native_audio = true;`, `worker.Config.with_audio_lock = [&](auto f){ server->native_audio.with_render_lock(f); };` (capture the server), remove the `AudioServer` mix-rate check (record `samplerate_value = p_samplerate`), and after the INIT command returns success, `audio_slot = server->native_audio.register_instance(worker.pd_instance_ptr(), p_n_ins, p_n_out);`. In `start_dsp()`/`stop_dsp()`, after pushing the command, call `server->native_audio.set_active(audio_slot, true/false);` (guarded by `audio_slot >= 0`). In `_exit_tree`, `native_audio.set_active(audio_slot, false)` + `unregister_instance(audio_slot)`. Keep the a1 path (generator/sink/player) under `#ifndef NATIVE_AUDIO` (Android). Store `int audio_slot = -1;`.
+Per the interfaces above. `_bind_methods` registers `audio_open`, `audio_close`, `set_mixer`, `audio_list_output_devices`, `audio_list_input_devices`, `audio_output_latency_ms`, `audio_available`. Gate native behavior on `#ifdef NATIVE_AUDIO`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Re-run the server test build + the full host `ctest`. Expected: PASS.
+Re-run the server test build + full host `ctest`. Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add extension/src/libpd_server.h extension/src/libpd_server.cpp extension/src/libpd_instance.h extension/src/libpd_instance.cpp extension/tests/server_audio_tests.cpp
-git commit -m "native audio: server audio_* API + instance RenderSlot registration (M5 T5)"
+git commit -m "native audio: server audio_* API + set_mixer + instance roles (M5 T6)"
 ```
 
 ---
 
-### Task 6: CMake — PortAudio vendor + `NATIVE_AUDIO` + test wiring
-
-Build the vendored PortAudio, define `NATIVE_AUDIO` for macOS/Linux, link it into the extension, and register the new test targets.
+### Task 7: CMake — PortAudio in place + `NATIVE_AUDIO` + test targets
 
 **Files:**
-- Modify: `extension/CMakeLists.txt`.
+- Modify: `extension/CMakeLists.txt`
 
-**Interfaces:**
-- Consumes: the vendored PortAudio tree (`thirdparty/libpd/pure-data/portaudio/portaudio/{include, src/common, src/os/unix, src/hostapi/coreaudio, src/hostapi/alsa}`).
-- Produces: a `portaudio` static target + `NATIVE_AUDIO` define + the new `add_test` entries.
+- [ ] **Step 1: Add the PortAudio build + `NATIVE_AUDIO`**
 
-- [ ] **Step 1: Add the PortAudio static library**
-
-In `extension/CMakeLists.txt`, after the RtMidi block, add (guarded by `NATIVE_AUDIO = NOT ANDROID`):
 ```
-set(NATIVE_AUDIO ON)
-if(ANDROID)
-    set(NATIVE_AUDIO OFF)
-endif()
-if(NATIVE_AUDIO)
+if(NOT ANDROID)
+    set(NATIVE_AUDIO ON)
     set(PA_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
     set(PA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(PA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -341,79 +302,76 @@ if(NATIVE_AUDIO)
     target_compile_definitions(godot_libpd PRIVATE NATIVE_AUDIO)
     if(APPLE)
         target_compile_definitions(godot_libpd PRIVATE PA_USE_COREAUDIO=1)
-        target_link_libraries(godot_libpd PRIVATE
-            "-framework CoreAudio" "-framework CoreFoundation"
-            "-framework CoreServices" "-framework AudioToolbox")
+        target_link_libraries(godot_libpd PRIVATE "-framework CoreAudio" "-framework CoreFoundation" "-framework CoreServices" "-framework AudioToolbox")
     else()
         target_compile_definitions(godot_libpd PRIVATE PA_USE_ALSA=1)
         target_link_libraries(godot_libpd PRIVATE asound)
     endif()
 endif()
 ```
-(Add the `portaudio` `add_subdirectory` result to the existing `target_link_libraries(godot_libpd ...)` chain — the block above does it inline.)
 
-- [ ] **Step 2: Wire the new test targets**
+- [ ] **Step 2: Register the new test targets**
 
-Under the existing `if(BUILD_LIBPD_TESTS AND NOT ANDROID)` block, add:
-- `audio_port_tests` (Task 1): `add_executable(audio_port_tests tests/audio_port_tests.cpp)`, include `src`, link `pthread`; `add_test(NAME audio_port_tests ...)`.
-- `audio_portaudio_tests` (Task 2): `add_executable(...) tests/audio_portaudio_tests.cpp src/core/portaudio_port.cpp`, include `src` + the PortAudio `include` dir, link `portaudio pthread` + the platform frameworks/libasound + `PA_USE_*`; `add_test(...)`.
-- `native_audio_tests` (Task 3): `add_executable(...) tests/native_audio_tests.cpp src/core/native_audio.cpp src/core/portaudio_port.cpp`, link `libpd_static portaudio pthread` + frameworks + `NATIVE_AUDIO`/`PA_USE_*`; `add_test(...)`.
-- `server_audio_tests` (Task 5): `add_executable(...) tests/server_audio_tests.cpp src/libpd_server.cpp src/libpd_instance.cpp src/libpd_worker.cpp src/core/native_audio.cpp src/core/portaudio_port.cpp src/core/pd_command_queue.cpp src/core/pd_event_ring.cpp src/core/pd_debug.cpp src/midi_router.cpp src/midi_backend_factory.cpp`, link `godot-cpp libpd_static portaudio pthread` + frameworks + `NATIVE_AUDIO`; `add_test(...)`.
+Under `if(BUILD_LIBPD_TESTS AND NOT ANDROID)`: `mix_input_ring_tests` (T3, pthread); `native_audio_mixdown_tests` (T4: `tests/native_audio_mixdown_tests.cpp src/core/native_audio.cpp` + `libpd_static` + PortAudio + frameworks + `NATIVE_AUDIO`); `native_worker_tests` (T5: worker + ring + `godot-cpp` + `libpd_static` + `NATIVE_AUDIO`); `server_audio_tests` (T6: server+instance+worker+native_audio+portaudio_port + `godot-cpp` + `libpd_static` + PortAudio + `NATIVE_AUDIO`). Each with `add_test(...)`.
 
 - [ ] **Step 3: Build the full extension + run all host tests**
 
-Run: `./extension/build.sh` (or the platform build) then `cd extension/build/cmake-<platform> && ctest --output-on-failure`.
+`./extension/build.sh` then `cd extension/build/cmake-<plat> && ctest --output-on-failure`.
 Expected: **all existing tests pass + the new audio tests pass** (or clean `SKIP` where no device).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add extension/CMakeLists.txt
-git commit -m "native audio: CMake PortAudio vendor + NATIVE_AUDIO + test wiring (M5 T6)"
+git commit -m "native audio: CMake PortAudio in place + NATIVE_AUDIO + test targets (M5 T7)"
 ```
 
 ---
 
-### Task 7: Test app native mode + macOS on-device verification
+### Task 8: Test app — 8 synth + 1 mix-down — + macOS on-device verify
 
-Point the test app at the native backend and prove, on a real Mac, that a `[adc~]`-fed patch renders to speakers (input) and a synth renders (output). This is the acceptance leg (spec §10, M5).
+The acceptance leg (Spec §10, M5). Prove, on a real Mac, that 8 synth instances mix through the mix-down (EQ/FX) to the native speakers.
 
 **Files:**
-- Modify: `test_project/scripts/test_audio.gd` (and/or a new `test_native_audio.gd` + `test_native_audio.tscn`).
+- Create: `test_project/scenes/test_native_mix.tscn` + `test_project/scripts/test_native_mix.gd`
+- Create: `test_project/data/mixdown_16.pd` (the 16-in/2-out EQ+FX mix patch) + `test_project/data/synth.pd` (a 2-ch synth)
 
 **Interfaces:**
-- Consumes: the `Libpd` autoload (`audio_open`, `audio_list_output_devices`, `audio_list_input_devices`, `audio_output_latency_ms`, `audio_available`).
+- Consumes: `Libpd` autoload (`audio_available`, `audio_list_output_devices`, `audio_open`, `set_mixer`, `audio_output_latency_ms`), `LibpdInstance`.
 
-- [ ] **Step 1: Add a native-audio test scene**
+- [ ] **Step 1: Write the mix-down + synth patches**
 
-Create `test_project/scenes/test_native_audio.tscn` + `test_project/scripts/test_native_audio.gd` (GDScript 4.6 — **`#` comments only, no `//`**): on `_ready`, print `Libpd.audio_available()`; if false, `push_error` + return; list output + input devices; `Libpd.audio_open(-1, -1, 256, 44100)`; create two `LibpdInstance` children, `init(44100, 0, 2)`, load a sine patch + a loopback (`[adc~ 1]`→`*~ 50`→`[dac~]`) patch, `start_dsp()` on both; after 2 s, print `Libpd.audio_output_latency_ms()`.
+`mixdown_16.pd`: 16 `[adc~ N]` → per-pair `[+~]` (sum L+R of each pair to a mono bus, optional) → an `[eq4~]`/`[phasor~]`-based overall EQ + a `[samplerate~]`-independent FX (e.g. `[*~]` makeup gain) → `[dac~]`. Keep it simple but real: 16 `adc~` → 8 `+~` (pair-sum) → `[*~ 0.5]` (headroom) → a light `[biquad~]`/`[lp2~]` → `dac~`. `synth.pd`: `[osc~ 220] *~ 0.2 dac~` (2 ch).
 
-- [ ] **Step 2: Build the macOS app + run**
+- [ ] **Step 2: Write the test scene** (GDScript 4.6 — `#` comments only, no `//`)
 
-Rebuild the extension (Task 6), rebuild the macOS arm64 export (the existing custom template), export the test project, run the app, and confirm via console: devices listed, `audio_open` true, both instances dsp-on, latency printed.
-Expected: the app prints the device list + latency; **sine is audible** (output) and **mic-driven sound is audible** (input, through `[adc~]`).
+`test_native_mix.gd`: `_ready`: if `!Libpd.audio_available()` → `push_error`+return. `Libpd.audio_open(256, 44100)` (16-in/2-out default). Create the **mixer** `LibpdInstance` (role=mixer), `init(44100, 16, 2)`, load `mixdown_16.pd`. Create **8** synth `LibpdInstance`s, `init(44100, 0, 2)`, load `synth.pd`. `Libpd.set_mixer(mixer)`. `start_dsp()` on all 9. After 2 s, print `Libpd.audio_output_latency_ms()`; after 5 s, `Libpd.audio_close()`.
 
-- [ ] **Step 3: On-device verification (HARD VERIFICATION RULE)**
+- [ ] **Step 3: Build + export + run on the Mac**
 
-Run the app on the Mac; capture the console log (paste it). Confirm: `audio_available()==true`, `audio_open()==true`, `audio_list_output_devices()` non-empty, `audio_output_latency_ms() < 20.0` (near the spike's ~28 ms floor at block=256, or better). Paste the real command + output.
+Rebuild the extension (Task 7), rebuild the macOS arm64 export (existing custom template), export the test project, run the app. Confirm console: `audio_available()==true`, `audio_open()==true`, `set_mixer()==true`, `audio_output_latency_ms()` printed, **the mixed output is audible** (8 synths through the EQ/FX mix-down).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: On-device verification (HARD VERIFICATION RULE)**
+
+Capture the console log (paste it). Confirm: no crash over the full 5 s, `set_mixer()==true`, latency printed. Paste the real command + output.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add test_project/scenes/test_native_audio.tscn test_project/scripts/test_native_audio.gd
-git commit -m "native audio: test app native mode + macOS verification (M5 T7)"
+git add test_project/scenes/test_native_mix.tscn test_project/scripts/test_native_mix.gd test_project/data/mixdown_16.pd test_project/data/synth.pd
+git commit -m "native audio: test app 8-synth + mix-down + macOS verification (M5 T8)"
 ```
 
 ---
 
 ## Self-Review (writing-plans checklist)
 
-**1. Spec coverage:** §2 (facts) → Global Constraints. §4 Approach A + `pd_this` (4.5) → Task 3 (`render_block` sets instance) + Global Constraints. §4.4 per-thread → Task 3/4. §4.4 worker refactor → Task 4. §5 backends (CoreAudio/ALSA; M6 AAudio out of scope) → Task 2 + Task 6. §6.1 block-size/samplerate contract → Task 1 (`mix_block`), Task 2 (reject 100), Task 5 (`audio_open` validation). §6.2 openfile RT-safety → Task 4 (`with_audio_lock`) + Task 3 (`render_lock`). §6.3 multi-instance mix → Task 1 (`mix_block`) + Task 3 test 3. §6.4 no-device fallback → Task 1 (`NullPort`). §7 API → Task 5. §8 platform matrix → Task 7 (M5 macOS; Linux/Knulli is the same `ALSA` path in Task 2/6, verified in a follow-up). §10 success criteria → Task 7. **Gap flagged:** Linux/Knulli on-device (fbdev, `ALSA`) is not a separate task here — it reuses Task 2's `ALSA` + Task 6's `PA_USE_ALSA`; add a follow-up verification step when a Knulli is in hand (the host `ALSA` unit test already gates the code path).
+**1. Spec coverage:** §2 constraint (multi-instance) → Global Constraints + Task 4 test 5 (9-concurrent). §4 architecture → Task 4 (`NativeAudio` mix-down-in-callback) + Task 5 (worker roles) + Task 3 (rings). §4.3 (mix via mix-down) → Task 4 + Task 8 (`mixdown_16.pd`). §3 API (`audio_*` + `set_mixer`) → Task 6. §4.5 (constraint finding) → carried. §6 components → matches the tasks (MixInputRing T3, NativeAudio T4, worker T5, CMake T7). §6.1 block-size/samplerate → Task 4 (`open` validation) + Task 6 test. §6.2 openfile RT-safety → `mix_render_lock` (T4/T5). §6.4 no-device → `NullPort` (T1) used in T4/T6 tests. §10 success → Task 8. **Gap flagged:** Linux/Knulli on-device is not a separate task — it reuses Task 4/7's `ALSA` path (host-gated), with a follow-up verify on a Knulli.
 
-**2. Step scan:** every step pins one action with a checkable result. `mix_block` body given (Task 1) because the clamp behavior is the whole point; `PortAudioPort`/`NativeAudio` bodies left to the implementer (signatures + the spike-confirmed contract determine them). No "handle edge cases" lines.
+**2. Step scan:** every step pins one action with a checkable result. `NativeAudio::render_block` body given (it's the crux + encodes the no-switching invariant). `MixInputRing` semantics (latest-wins, empty=silence) pinned by tests. Worker role branch given. No "handle edge cases" lines.
 
-**3. Type consistency:** `AudioPort`/`RenderFn`/`AudioDeviceInfo`/`mix_block` (Task 1) → used identically in Tasks 2/3/5/6. `NativeAudio::open/register_instance/set_active/unregister_instance/with_render_lock` (Task 3) → called in Task 4/5. `Config.native_audio`/`with_audio_lock` + `pd_instance_ptr()` (Task 4) → consumed in Task 5. `LibpdServer::audio_open` signature consistent in Task 5/7.
+**3. Type consistency:** `MixInputRing` (T3) → used in T4 (`register_worker_ring`), T5 (`Config.worker_ring`), T6 (instance creates it). `NativeAudio::set_mixer/register_worker_ring/with_mixer_lock` (T4) → called in T5 (`with_mixer_lock`) + T6 (server). `Config.role/worker_ring/with_mixer_lock` + `pd_instance_ptr()` (T5) → consumed in T6. `LibpdServer::audio_open/set_mixer` (T6) → consumed in T8. Consistent.
 
-**4. Review Focus:** all five lines map to a task test (pd_this → T3 test1; blocksize → T2 test4 + T5 test1; samplerate → T5 test3; mix clamp → T1 test3; openfile stall → T4 test + T3 test5; remove-mid-render → T3 test4). Six lines, all covered.
+**4. Review Focus:** no-switching → T4 (render_block sets instance once; reviewer checks no second call). 9-concurrent → T4 test 5 + T7. Ring latest/underrun → T3 tests 1-5. mix_render_lock → T4 test 4 + T5. set_mixer-before-render → T4 test 3. Block-size/samplerate → T6 tests 1/4.
 
-**5. Proportion:** the plan is ~1.5× the spec's §M5 length — it adds the file-level decomposition + test assertions, not a transcript of the code. Bodies appear only where the spec/signature don't determine them (`mix_block` clamp, `render_block` loop, the CMake PortAudio block).
+**5. Proportion:** comparable to the spec's §M5 detail; adds the file-level decomposition + test assertions. Bodies appear only where the invariant/behavior isn't determined by the signature (render_block's set_instance-once + gather + lock; the worker role branch; the CMake PortAudio block). T1/T2 are referenced as done, not re-specced.
