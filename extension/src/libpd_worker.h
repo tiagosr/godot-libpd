@@ -78,6 +78,27 @@ public:
 
 	bool is_running() const;
 
+	/**
+	 * Copy of the current config (M5 Task 6): the instance reads this,
+	 * fixes the role / worker_ring / with_mixer_lock fields, and writes it
+	 * back with update_config_before_start() before the thread starts.
+	 */
+	Config get_config() const {
+		return config;
+	}
+
+	/**
+	 * Replace the config before the thread starts (M5 Task 6): start()
+	 * freezes the config on the worker thread, so per-instance wiring (role,
+	 * SYNTH ring, MIXER lock) must be in place by then. No-op if the thread
+	 * has already started — after that the config is live worker state.
+	 */
+	void update_config_before_start(const Config &p_config) {
+		if (!thread_started.load(std::memory_order_acquire)) {
+			config = p_config;
+		}
+	}
+
 	/** Push a command (thread-safe). */
 	void push_command(const PdCommand &p_command);
 

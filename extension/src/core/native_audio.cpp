@@ -41,6 +41,8 @@ bool NativeAudio::open(AudioPort *p_port, int p_mix_n_in, int p_mix_n_out,
 	}
 	mix_n_in_.store(p_mix_n_in);
 	mix_n_out_.store(p_mix_n_out);
+	open_mix_n_in_ = p_mix_n_in;
+	open_mix_n_out_ = p_mix_n_out;
 	blocksize_ = p_blocksize;
 	samplerate_ = p_samplerate;
 	// Fixed-size staging, sized once — the render path must not allocate.
@@ -51,9 +53,11 @@ bool NativeAudio::open(AudioPort *p_port, int p_mix_n_in, int p_mix_n_out,
 	// guard must start false.
 	mix_pd_.store(nullptr);
 	mix_set_.store(false);
+	mixer_bound_.store(false);
 	{
 		std::lock_guard<std::mutex> lk(rings_mu_);
 		rings_.clear();
+		ring_blocksize_ = 0;
 	}
 	port_ = p_port;
 	port_->set_render_callback([this](float *in, float *out, int frames) {
@@ -80,43 +84,97 @@ void NativeAudio::close() {
 	// hold the only reference into a freed instance).
 	mix_pd_.store(nullptr);
 	mix_set_.store(false);
+	mixer_bound_.store(false);
 	mix_n_in_.store(16);
 	mix_n_out_.store(2);
 	{
 		std::lock_guard<std::mutex> lk(rings_mu_);
 		rings_.clear();
+		ring_blocksize_ = 0;
 	}
 	terminate_portaudio();
 }
 
-void NativeAudio::set_mixer(struct _pdinstance *p_mix_pd, int p_mix_n_in, int p_mix_n_out) {
+bool NativeAudio::set_mixer(struct _pdinstance *p_mix_pd, int p_mix_n_in, int p_mix_n_out) {
+	// The counts must match the open-time layout: the staging buffers are
+	// sized from open(), so a different mix shape would overflow
+	// mix_in_/mix_out_ (invariant #3, T4 review).
+	if (!open_ || p_mix_pd == nullptr ||
+			p_mix_n_in != open_mix_n_in_ || p_mix_n_out != open_mix_n_out_) {
+		return false;
+	}
+	// One binding at a time (M5 Task 6): rebind requires clear_mixer().
+	if (mixer_bound_.exchange(true)) {
+		return false;
+	}
 	// Plain state (atomics) — the actual libpd_set_instance(mix) happens
 	// inside render_block before the first block, because the callback
 	// thread must be the thread that binds AND renders the mix instance.
 	// Channel counts are stored before the pointer, so a callback that
 	// observes the new pointer also observes the new channel counts.
-	if (p_mix_n_in < 0 || p_mix_n_out <= 0) {
-		return;
-	}
 	mix_n_in_.store(p_mix_n_in);
 	mix_n_out_.store(p_mix_n_out);
 	mix_pd_.store(p_mix_pd);
+	return true;
+}
+
+void NativeAudio::clear_mixer() {
+	// Unbind under the render lock (invariant #1, T4 review): a callback
+	// block that loaded the pointer before the clear holds
+	// mix_render_lock_ and finishes that block before this returns;
+	// every later callback loads nullptr and renders silence. The caller
+	// may free the instance once this returns, even while the audio
+	// thread is live — the stop path calls this BEFORE mixer teardown.
+	std::lock_guard<std::mutex> lk(mix_render_lock_);
+	mix_pd_.store(nullptr);
+	// Reset the one-shot so a LATER rebind (possibly another instance)
+	// re-binds on the callback thread.
+	mix_set_.store(false);
+	mixer_bound_.store(false);
+	// Restore the open-time counts: render_block reads them for staging
+	// even before the mixer check (mix_in_ is sized from open()).
+	mix_n_in_.store(open_mix_n_in_);
+	mix_n_out_.store(open_mix_n_out_);
 }
 
 void NativeAudio::register_worker_ring(MixInputRing *p_ring) {
-	// Layout contract: 2ch rings at the stream blocksize (ring i -> mix
-	// channels 2i, 2i+1). A ring registered before open() is validated
-	// against the default blocksize (256).
-	if (p_ring == nullptr || p_ring->blocksize() != blocksize_ || p_ring->channels() != 2) {
+	// Layout contract (M5 Task 6, invariant #4): 2ch rings whose blocksize
+	// divides the stream blocksize — the callback gathers
+	// blocksize()/ring_blocksize() blocks per ring (production case: a
+	// libpd_blocksize() ring under a 256-frame stream). The first
+	// registered ring fixes the mix's ring blocksize (single-size
+	// contract); a different blocksize is rejected. A ring registered
+	// before open() is validated against the default blocksize (256).
+	if (p_ring == nullptr || p_ring->channels() != 2) {
 		return;
 	}
 	std::lock_guard<std::mutex> lk(rings_mu_);
+	const int stream = open_ ? blocksize_ : 256;
+	if (stream % p_ring->blocksize() != 0) {
+		return;
+	}
+	if (ring_blocksize_ != 0 && ring_blocksize_ != p_ring->blocksize()) {
+		return;
+	}
 	for (MixInputRing *r : rings_) {
 		if (r == p_ring) {
 			return; // duplicate
 		}
 	}
+	if (ring_blocksize_ == 0) {
+		ring_blocksize_ = p_ring->blocksize();
+	}
 	rings_.push_back(p_ring);
+}
+
+bool NativeAudio::has_worker_ring(MixInputRing *p_ring) const {
+	std::lock_guard<std::mutex> lk(rings_mu_);
+	for (MixInputRing *r : rings_) {
+		if (r == p_ring) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void NativeAudio::unregister_worker_ring(MixInputRing *p_ring) {
@@ -126,6 +184,12 @@ void NativeAudio::unregister_worker_ring(MixInputRing *p_ring) {
 	// itself is owned by the caller.
 	std::lock_guard<std::mutex> lk(rings_mu_);
 	rings_.erase(std::remove(rings_.begin(), rings_.end(), p_ring), rings_.end());
+	if (rings_.empty()) {
+		// No registered rings: the mix's ring blocksize is unset again, so
+		// the next registration re-establishes it (single-size contract
+		// applies to the concurrently registered rings).
+		ring_blocksize_ = 0;
+	}
 }
 
 void NativeAudio::render_block(float *p_dev_in, float *p_dev_out, int p_frames) {
@@ -134,15 +198,16 @@ void NativeAudio::render_block(float *p_dev_in, float *p_dev_out, int p_frames) 
 	if (p_frames > blocksize_) {
 		p_frames = blocksize_;
 	}
-	const int n_out = mix_n_out_.load();
-	// 1. Gather each worker ring's latest block into mix_in_ (ring i ->
-	//    channels 2i, 2i+1). An empty ring gathers silence (0.0) — a
-	//    worker not yet started contributes zeros, not stale audio. The
-	//    gather holds rings_mu_ so an unregister cannot race it.
+	// 1. Gather each worker ring's latest K blocks into mix_in_ (ring i ->
+	//    channels 2i, 2i+1), K = p_frames / ring_blocksize (M5 Task 6,
+	//    Option B: the rings are pushed at the libpd blocksize, so one
+	//    callback consumes K of them). An empty ring gathers silence (0.0)
+	//    — a worker not yet started contributes zeros, not stale audio.
+	//    The gather holds rings_mu_ so an unregister cannot race it.
 	//
 	//    libpd reads its inBuffer INTERLEAVED per frame
 	//    (inBuffer[f * n_in + c]; the PROCESS macro in z_libpd.c), while
-	//    gather_latest() yields one interleaved stereo block per ring — so
+	//    gather_latest_n() yields K interleaved stereo blocks per ring — so
 	//    each ring's samples are SCATTERED into its two channel columns,
 	//    never copied contiguously (a contiguous block would smear the
 	//    ring's channels across every mix input channel).
@@ -152,26 +217,38 @@ void NativeAudio::render_block(float *p_dev_in, float *p_dev_out, int p_frames) 
 		// Zero first: channels not covered by a registered ring (e.g. a
 		// just-unregistered ring) must contribute silence, not stale audio.
 		std::fill_n(mix_in_.data(), (size_t)p_frames * (size_t)n_in, 0.0f);
+		const int k = ring_blocksize_ > 0 ? p_frames / ring_blocksize_ : 0;
 		int i = 0;
 		for (MixInputRing *r : rings_) {
 			if (2 * i + 1 >= n_in) {
 				break; // defensive: more rings than mix inputs — extras stay silent
 			}
-			r->gather_latest(gather_scratch_.data(), p_frames);
-			const float *s = gather_scratch_.data();
-			const size_t col_l = 2 * (size_t)i;
-			const size_t col_r = col_l + 1;
-			for (int f = 0; f < p_frames; ++f) {
-				mix_in_[(size_t)f * n_in + col_l] = s[2 * f];
-				mix_in_[(size_t)f * n_in + col_r] = s[2 * f + 1];
+			if (k > 0) {
+				// gather_scratch_ holds 2*blocksize_ floats >= K * 2ch * ring
+				// blocksize; gather_latest_n() always writes the full window
+				// (missing older blocks are silence).
+				r->gather_latest_n(gather_scratch_.data(), k);
+				const float *s = gather_scratch_.data();
+				const size_t col_l = 2 * (size_t)i;
+				const size_t col_r = col_l + 1;
+				for (int f = 0; f < p_frames; ++f) {
+					mix_in_[(size_t)f * n_in + col_l] = s[2 * f];
+					mix_in_[(size_t)f * n_in + col_r] = s[2 * f + 1];
+				}
 			}
 			++i;
 		}
 	}
-	// 2. No mixer bound yet (set_mixer not called): contribute silence.
+	// 2. Acquire the render lock BEFORE loading the mixer pointer
+	//    (invariant #1, M5 Task 6): clear_mixer() unbinds under the same
+	//    lock, so a callback that loaded a live pointer holds the lock
+	//    until its process_float finishes — a concurrent clear (and any
+	//    subsequent free of the instance) cannot interleave.
+	std::lock_guard<std::mutex> lk(mix_render_lock_);
 	struct _pdinstance *mix = mix_pd_.load(std::memory_order_acquire);
 	if (mix == nullptr) {
-		std::fill_n(p_dev_out, (size_t)p_frames * (size_t)n_out, 0.0f);
+		// No mixer bound (or cleared): contribute silence.
+		std::fill_n(p_dev_out, (size_t)p_frames * (size_t)mix_n_out_.load(), 0.0f);
 		return;
 	}
 	// 3. One-shot: bind the mix-down on THIS callback thread before its
@@ -180,12 +257,12 @@ void NativeAudio::render_block(float *p_dev_in, float *p_dev_out, int p_frames) 
 	if (!mix_set_.exchange(true)) {
 		libpd_set_instance(mix);
 	}
-	// 4. Serialize with control-plane ops on the mixer (with_mixer_lock).
-	std::lock_guard<std::mutex> lk(mix_render_lock_);
+	// 4. (mix_render_lock_ is already held — see step 2.) Serialize with
+	//    control-plane ops on the mixer (with_mixer_lock).
 	const int ticks = p_frames / 64; // libpd_blocksize() is 64
 	libpd_process_float(ticks, mix_in_.data(), mix_out_.data());
 	// 5. Copy the mix's stereo output to the device output.
-	std::copy_n(mix_out_.data(), (size_t)p_frames * (size_t)n_out, p_dev_out);
+	std::copy_n(mix_out_.data(), (size_t)p_frames * (size_t)mix_n_out_.load(), p_dev_out);
 	(void)p_dev_in; // device inputs unused: mix inputs come from the rings
 }
 

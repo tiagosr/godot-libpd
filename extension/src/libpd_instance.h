@@ -11,6 +11,10 @@
 #include "core/pd_audio_sink_generator.h"
 #include "libpd_worker.h"
 
+#ifdef NATIVE_AUDIO
+#include "core/mix_input_ring.h"
+#endif
+
 namespace godot {
 
 /**
@@ -71,6 +75,25 @@ public:
 	uint64_t debug_blocks_pushed() const;
 	float debug_sink_peak() const;
 
+	// --- Native audio role (M5; #ifdef NATIVE_AUDIO builds only) ---
+	// Set BEFORE init(). SYNTH (default) renders into a MixInputRing gathered
+	// by the mix-down callback; MIXER is the control-only mix-down instance
+	// rendered by the PortAudio callback. Ignored on Android (no NATIVE_AUDIO),
+	// where every instance uses the Godot generator path.
+	enum Role { SYNTH, MIXER };
+	void set_role(int p_role);
+	/// Role as an int (0 = SYNTH, 1 = MIXER) — Godot cannot bind a raw C++
+	/// enum return, so the binding surface is int; `LibpdInstance::Role::MIXER`
+	/// (==1) still compares equal to the return value.
+	int get_role() const;
+	bool is_mixer() const;
+	/// This worker's pd instance — valid after init() (happens-before via the
+	/// INIT promise). The server uses it to bind the NativeAudio mix-down.
+	struct _pdinstance *pd_instance_ptr() const;
+	/// Channel shape recorded at init() (used by set_mixer validation).
+	int init_n_ins() const;
+	int init_n_out() const;
+
 public:
 	void _enter_tree() override;
 	void _exit_tree() override;
@@ -91,6 +114,17 @@ private:
 
 	int64_t instance_id_value = 0;
 	godot_libpd::LibpdWorker worker;
+	// Instance role (M5): SYNTH (default) or MIXER.
+	Role role = Role::SYNTH;
+	// Channel shape recorded at init() (set_mixer validation, invariant #3).
+	int init_n_ins_ = 0;
+	int init_n_out_ = 2;
+#ifdef NATIVE_AUDIO
+	// SYNTH only: the ring the worker pushes rendered blocks into (owned by
+	// this instance; created in init(), freed in _exit_tree after the worker
+	// is joined). The server tracks it for NativeAudio gather/unregister.
+	godot_libpd::MixInputRing *synth_ring = nullptr;
+#endif
 	godot_libpd::GeneratorSink sink;
 	godot::Ref<godot::AudioStreamGenerator> generator;
 	godot::AudioStreamPlayer *player = nullptr; // owned child

@@ -95,6 +95,8 @@ void LibpdInstance::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_parameter", "path", "value"), &LibpdInstance::set_parameter);
 	ClassDB::bind_method(D_METHOD("send_midi", "channel", "pitch", "velocity"), &LibpdInstance::send_midi);
 
+	ClassDB::bind_method(D_METHOD("set_role", "role"), &LibpdInstance::set_role);
+	ClassDB::bind_method(D_METHOD("get_role"), &LibpdInstance::get_role);
 	ClassDB::bind_method(D_METHOD("get_instance_id"), &LibpdInstance::instance_id);
 	ClassDB::bind_method(D_METHOD("get_samplerate"), &LibpdInstance::samplerate);
 	ClassDB::bind_method(D_METHOD("is_patch_loaded"), &LibpdInstance::patch_loaded);
@@ -102,6 +104,7 @@ void LibpdInstance::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_debug_blocks_pushed"), &LibpdInstance::debug_blocks_pushed);
 	ClassDB::bind_method(D_METHOD("get_debug_sink_peak"), &LibpdInstance::debug_sink_peak);
 
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "role"), "set_role", "get_role");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "instance_id"), "", "get_instance_id");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "samplerate"), "", "get_samplerate");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "patch_loaded"), "", "is_patch_loaded");
@@ -120,6 +123,13 @@ void LibpdInstance::_enter_tree() {
 }
 
 void LibpdInstance::_exit_tree() {
+#ifdef NATIVE_AUDIO
+	// MIXER: unbind the mix-down BEFORE the worker frees the instance
+	// (invariant #1) so the PortAudio callback can't render a freed instance.
+	if (is_mixer() && LibpdServer::get_singleton() != nullptr) {
+		LibpdServer::get_singleton()->audio_unbind_mixer(this);
+	}
+#endif
 	// Synchronous teardown (spec §5): stop, join, then the pd instance is
 	// freed on the worker thread.
 	if (worker.is_running()) {
@@ -136,6 +146,17 @@ void LibpdInstance::_exit_tree() {
 		sink.set_playback(godot::Ref<godot::AudioStreamGeneratorPlayback>());
 		player = nullptr; // avoid dangling after the tree frees it
 	}
+#ifdef NATIVE_AUDIO
+	// SYNTH: the worker is joined above (no more ring pushes); unregister the
+	// ring with the server, then free it.
+	if (!is_mixer() && synth_ring != nullptr) {
+		if (LibpdServer::get_singleton() != nullptr) {
+			LibpdServer::get_singleton()->audio_unregister_ring(this, synth_ring);
+		}
+		delete synth_ring;
+		synth_ring = nullptr;
+	}
+#endif
 	if (LibpdServer::get_singleton() != nullptr) {
 		// Forgets the instance in the router (unroute + drop the output
 		// queue registration) before the worker and its queue are
@@ -145,6 +166,12 @@ void LibpdInstance::_exit_tree() {
 }
 
 void LibpdInstance::_process(double p_delta) {
+#ifdef NATIVE_AUDIO
+	// Native audio: the worker -> ring -> PortAudio-callback path; there is no
+	// Godot generator to pump (the a1 sink is unused on these builds).
+	(void)p_delta;
+	return;
+#endif
 	// Main-thread pump: move worker-rendered audio into the Godot generator.
 	if (dsp_running.load()) {
 		sink.pump();
@@ -156,6 +183,35 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 		return false; // double init
 	}
 
+	samplerate_value = p_samplerate;
+	init_n_ins_ = p_n_ins;
+	init_n_out_ = p_n_out;
+#ifdef NATIVE_AUDIO
+	// Native audio (M5): the worker renders into a MixInputRing (SYNTH) or is
+	// control-only (MIXER, rendered by the PortAudio callback). No Godot
+	// generator, and no AudioServer mix-rate requirement (audio is native).
+	{
+		godot_libpd::LibpdWorker::Config cfg = worker.get_config();
+		cfg.samplerate = p_samplerate;
+		cfg.n_ins = p_n_ins;
+		cfg.n_out = p_n_out;
+		if (is_mixer()) {
+			cfg.role = godot_libpd::LibpdWorker::WorkerRole::MIXER;
+			cfg.with_mixer_lock = [](std::function<void()> p_fn) {
+				if (LibpdServer::get_singleton() != nullptr) {
+					LibpdServer::get_singleton()->audio_with_mixer_lock(p_fn);
+				} else {
+					p_fn();
+				}
+			};
+		} else {
+			cfg.role = godot_libpd::LibpdWorker::WorkerRole::SYNTH;
+			synth_ring = new godot_libpd::MixInputRing(2, libpd_blocksize(), 8);
+			cfg.worker_ring = synth_ring;
+		}
+		worker.update_config_before_start(cfg);
+	}
+#else
 	// Fail-fast: the instance sample rate must match the AudioServer mix rate,
 	// otherwise the generator would resample/garble audio (spec §10).
 	const int mix_rate = (int)std::lround(godot::AudioServer::get_singleton()->get_mix_rate());
@@ -164,7 +220,6 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 				" != AudioServer mix rate " + itos(mix_rate));
 		return false;
 	}
-	samplerate_value = p_samplerate;
 
 	// Godot-native audio sink (4.6 AudioStreamGenerator + playback pump).
 	generator.instantiate();
@@ -179,6 +234,7 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 	}
 
 	sink.setup(p_samplerate, p_n_out);
+#endif
 
 	worker.start();
 
@@ -197,6 +253,13 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 		return false;
 	}
 	initialized = true;
+#ifdef NATIVE_AUDIO
+	// Register the SYNTH ring with the server so the NativeAudio mix-down
+	// gathers it (a no-op until the server's audio_open()).
+	if (!is_mixer() && synth_ring != nullptr && LibpdServer::get_singleton() != nullptr) {
+		LibpdServer::get_singleton()->audio_register_ring(this, synth_ring);
+	}
+#endif
 	return true;
 }
 
@@ -309,6 +372,7 @@ int LibpdInstance::start_dsp() {
 		return (int)Error::ERR_INVALID_DATA;
 	}
 
+#ifndef NATIVE_AUDIO
 	// Start the Godot playback and bind the generator playback to the sink
 	// (main thread only; the sink pumps into it from _process).
 	if (player == nullptr && generator.is_valid()) {
@@ -324,6 +388,7 @@ int LibpdInstance::start_dsp() {
 		gen_pb = pb; // templated operator= casts via Object::cast_to
 		sink.set_playback(gen_pb);
 	}
+#endif
 
 	worker.set_dsp(true);
 	dsp_running = true;
@@ -345,10 +410,12 @@ int LibpdInstance::stop_dsp() {
 	worker.set_dsp(false);
 	dsp_running = false;
 	mlog((uint32_t)worker.instance_id(), "[main] stop_dsp");
+#ifndef NATIVE_AUDIO
 	if (player != nullptr) {
 		sink.set_playback(godot::Ref<godot::AudioStreamGeneratorPlayback>());
 		player->stop();
 	}
+#endif
 	if (LibpdServer::get_singleton() != nullptr) {
 		godot_libpd::PdEvent e;
 		e.instance_id = worker.instance_id();
@@ -405,6 +472,33 @@ int64_t LibpdInstance::instance_id() const {
 
 int LibpdInstance::samplerate() const {
 	return samplerate_value;
+}
+
+void LibpdInstance::set_role(int p_role) {
+	if (initialized.load()) {
+		return; // the role is fixed at init() time (the worker config freezes then)
+	}
+	role = (p_role == 1) ? Role::MIXER : Role::SYNTH;
+}
+
+int LibpdInstance::get_role() const {
+	return (int)role;
+}
+
+bool LibpdInstance::is_mixer() const {
+	return role == Role::MIXER;
+}
+
+struct _pdinstance *LibpdInstance::pd_instance_ptr() const {
+	return worker.pd_instance_ptr();
+}
+
+int LibpdInstance::init_n_ins() const {
+	return init_n_ins_;
+}
+
+int LibpdInstance::init_n_out() const {
+	return init_n_out_;
 }
 
 bool LibpdInstance::patch_loaded() const {

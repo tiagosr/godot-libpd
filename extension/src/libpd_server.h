@@ -11,6 +11,15 @@
 #include "core/pd_event_ring.h"
 #include "midi_router.h"
 
+#ifdef NATIVE_AUDIO
+#include <memory>
+
+#include "core/audio_port.h"
+#include "core/mix_input_ring.h"
+#include "core/native_audio.h"
+#include "core/portaudio_port.h"
+#endif
+
 namespace godot {
 
 class LibpdInstance;
@@ -121,6 +130,76 @@ public:
 	/// Get the hotplug re-enumeration cadence in seconds.
 	double midi_get_poll_interval() const;
 
+	// ------------------------------------------------------------------
+	// Native audio (M5) — the server owns the NativeAudio mix-down.
+	// NativeAudio owns the STREAM; the server owns the AudioPort object
+	// (invariant #5 from the T4 review: exactly one stream owner, and
+	// NativeAudio only borrows the port). #ifndef NATIVE_AUDIO (Android)
+	// keeps the API surface with stubs: audio_open() returns false and
+	// the instance workers use the Godot generator path.
+	// ------------------------------------------------------------------
+
+	/// Open the mix-down stream: p_blocksize frames (multiple of 64) at
+	/// p_samplerate; the device gets 0 inputs / p_mix_out outputs, and the
+	/// mix-down instance bound via set_mixer() is rendered with p_mix_in
+	/// inputs (the SYNTH worker rings) / p_mix_out outputs. False (and
+	/// push_error) if already open, the arguments are invalid, or the
+	/// stream fails to open.
+	bool audio_open(int p_blocksize, int p_samplerate, int p_mix_in = 16, int p_mix_out = 2);
+	/// Close the stream (stops the PortAudio callback FIRST, then drops the
+	/// mixer binding and rings — the mixer instance is safe to free
+	/// afterwards, invariant #1). The mix designation survives; a still-
+	/// alive mix instance re-binds on the next audio_open().
+	void audio_close();
+	/// Designate the mix-down instance. Fails (false + push_error) if audio
+	/// is not open, p_mix is null, not the MIXER role, not initialized, its
+	/// channel shape differs from the open-time mix shape, or a different
+	/// mixer is already bound (Idempotent when p_mix is the current one).
+	bool set_mixer(LibpdInstance *p_mix);
+	/// Unbind p_instance as the mix-down, under the render lock (invariant
+	/// #1) — called from the instance's _exit_tree BEFORE its worker stops,
+	/// so the audio thread may still be live.
+	void audio_unbind_mixer(LibpdInstance *p_instance);
+	/// Run p_fn serialized against the PortAudio callback's mix render
+	/// (forwards to NativeAudio::with_mixer_lock; runs p_fn as-is when no
+	/// native audio is present). MIXER worker control ops use this.
+	template <typename F>
+	void audio_with_mixer_lock(F &&p_fn) {
+		if (native_audio_ != nullptr) {
+			native_audio_->with_mixer_lock(std::forward<F>(p_fn));
+		} else {
+			p_fn();
+		}
+	}
+	/// True when this build has the native audio path compiled in (false on
+	/// Android, where the Godot generator path is used).
+	bool audio_available() const;
+	/// Output latency in ms of the open stream (0.0 when closed).
+	float audio_output_latency_ms();
+	/// Audio devices with an output side: {index, name, max_channels}.
+	Array audio_list_output_devices();
+	/// Audio devices with an input side: {index, name, max_channels}.
+	Array audio_list_input_devices();
+
+	/// True when the mix-down stream is open (C++ accessor, unbound).
+	bool audio_is_open() const;
+	/// Stream blocksize while open (C++ accessor, unbound).
+	int audio_blocksize() const;
+	/// Stream samplerate while open (C++ accessor, unbound).
+	int audio_samplerate() const;
+
+	/// Track a SYNTH instance's ring for re-registration on the next
+	/// audio_open(); registers it with NativeAudio right away when open.
+	/// (Internal — called from LibpdInstance init/teardown.)
+	void audio_register_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring);
+	/// Stop tracking p_ring and unregister it from NativeAudio when open.
+	/// (Internal — called from LibpdInstance teardown.)
+	void audio_unregister_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring);
+
+	/// Test seam (host tests cannot open a real device): audio_open() uses
+	/// p_port instead of a PortAudioPort. Must be set while audio is closed.
+	void _set_audio_port_for_test(std::unique_ptr<godot_libpd::AudioPort> p_port);
+
 	void _process(double p_delta) override;
 
 protected:
@@ -173,6 +252,33 @@ private:
 	std::vector<PortEvent> pending_port_events_;
 	// Backs the midi_port_poll_interval property; forwarded to the router.
 	double midi_port_poll_interval_ = 0.5;
+
+#ifdef NATIVE_AUDIO
+	// Native audio state (M5). All audio_* calls run on the main thread;
+	// audio_mutex additionally guards tracked_rings_ (which the instance
+	// init/teardown touch).
+	std::unique_ptr<godot_libpd::NativeAudio> native_audio_;
+	// Server-owned PortAudio stream (created on first audio_open). NativeAudio
+	// only borrows the port — exactly one object owns the stream lifecycle.
+	std::unique_ptr<godot_libpd::PortAudioPort> audio_port_;
+	// Test seam replacement for audio_port_ (e.g. a NullPort); owned here.
+	std::unique_ptr<godot_libpd::AudioPort> audio_test_port_;
+	std::mutex audio_mutex;
+	bool audio_open_ = false;
+	int audio_blocksize_ = 0;
+	int audio_samplerate_ = 0;
+	// Channel counts as of audio_open() — the mix staging buffers are sized
+	// from them, so set_mixer validates against them (invariant #3).
+	int open_mix_n_in_ = 16;
+	int open_mix_n_out_ = 2;
+	// The designated mix-down instance (nullptr = none). Survives audio_close
+	// so a still-alive instance re-binds on the next audio_open; nulled by
+	// audio_unbind_mixer on the instance's _exit_tree.
+	LibpdInstance *mixer_instance_ = nullptr;
+	// SYNTH rings to (re)register on audio_open — instance init may happen
+	// before the stream opens, and NativeAudio::close() drops all rings.
+	std::vector<std::pair<LibpdInstance *, godot_libpd::MixInputRing *>> tracked_rings_;
+#endif
 };
 
 } // namespace godot

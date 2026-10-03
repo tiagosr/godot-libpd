@@ -62,6 +62,48 @@ public:
 		return blocksize_;
 	}
 
+	/**
+	 * Consumer (M5 Task 6, Option B): copy the latest p_n_blocks blocks,
+	 * OLDEST-FIRST, into p_dst — each block is blocksize() * channels()
+	 * floats, so p_dst must hold p_n_blocks * blocksize() * channels()
+	 * floats and is ALWAYS fully written: positions without a pushed block
+	 * (the ring has not filled that far) stay silence (0.0).
+	 *
+	 * Returns min(p_n_blocks, blocks available, num_blocks()): 0 if nothing
+	 * has been pushed. Same mutex as gather_latest(); the critical section
+	 * is one counter read plus up to p_n_blocks block copies.
+	 *
+	 * Used by the PortAudio callback to gather the stream blocksize worth
+	 * of frames (K = stream_blocksize / ring_blocksize) per render from a
+	 * ring that is pushed at the libpd blocksize.
+	 */
+	int gather_latest_n(float *p_dst, int p_n_blocks) const {
+		if (p_dst == nullptr || p_n_blocks <= 0) {
+			return 0;
+		}
+		const int n = std::min(p_n_blocks, num_blocks_); // window capped at ring depth
+		// Zero the whole window first: the render path scatters whatever is
+		// here unconditionally, so missing blocks must be silence, never stale.
+		std::fill_n(p_dst, static_cast<size_t>(n) * slot_samples(), 0.0f);
+		std::lock_guard<std::mutex> lock(mutex_);
+		const int available =
+				count_ >= static_cast<uint64_t>(num_blocks_) ? num_blocks_ : static_cast<int>(count_);
+		if (available == 0) {
+			return 0;
+		}
+		const int copy = std::min(n, available);
+		// Newest block sits in slot (count_ - 1) % num_blocks_; the oldest
+		// block of the requested window sits `copy - 1` slots before it.
+		const int oldest_slot = static_cast<int>(((count_ - static_cast<uint64_t>(copy)) % static_cast<uint64_t>(num_blocks_)));
+		const int base = n - copy; // missing OLDER slots (0..base-1) stay silence
+		for (int i = 0; i < copy; ++i) {
+			const int slot = (oldest_slot + i) % num_blocks_;
+			std::copy_n(storage_.data() + static_cast<size_t>(slot) * slot_samples(),
+					slot_samples(), p_dst + static_cast<size_t>(base + i) * slot_samples());
+		}
+		return copy;
+	}
+
 	int channels() const {
 		return channels_;
 	}

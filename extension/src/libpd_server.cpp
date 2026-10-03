@@ -62,6 +62,12 @@ LibpdServer::LibpdServer() {
 }
 
 LibpdServer::~LibpdServer() {
+	// Native audio first (M5): stop the PortAudio callback and drop the mix
+	// binding before anything else goes. By normal exit the mix instance has
+	// already unbound itself (_exit_tree -> audio_unbind_mixer); this only
+	// joins the audio thread and clears state — it never frees the instance.
+	audio_close();
+
 	// Shutdown order (spec §7): stop routing, then stop the router (close
 	// all ports + join the MIDI I/O thread); instance workers tear down
 	// independently. By normal exit the instances have already
@@ -130,7 +136,328 @@ void LibpdServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("midi_set_poll_interval", "seconds"), &LibpdServer::midi_set_poll_interval);
 	ClassDB::bind_method(D_METHOD("midi_get_poll_interval"), &LibpdServer::midi_get_poll_interval);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "midi_port_poll_interval"), "midi_set_poll_interval", "midi_get_poll_interval");
+
+	// Native audio (M5). Bound in both builds: on Android (no NATIVE_AUDIO)
+	// the implementations are stubs (audio_open -> false, lists -> empty),
+	// so the GDScript surface is stable across platforms.
+	ClassDB::bind_method(D_METHOD("audio_open", "blocksize", "samplerate", "mix_in", "mix_out"), &LibpdServer::audio_open, DEFVAL(16), DEFVAL(2));
+	ClassDB::bind_method(D_METHOD("audio_close"), &LibpdServer::audio_close);
+	ClassDB::bind_method(D_METHOD("set_mixer", "mix"), &LibpdServer::set_mixer);
+	ClassDB::bind_method(D_METHOD("audio_list_output_devices"), &LibpdServer::audio_list_output_devices);
+	ClassDB::bind_method(D_METHOD("audio_list_input_devices"), &LibpdServer::audio_list_input_devices);
+	ClassDB::bind_method(D_METHOD("audio_output_latency_ms"), &LibpdServer::audio_output_latency_ms);
+	ClassDB::bind_method(D_METHOD("audio_available"), &LibpdServer::audio_available);
 }
+
+#ifdef NATIVE_AUDIO
+
+bool LibpdServer::audio_open(int p_blocksize, int p_samplerate, int p_mix_in, int p_mix_out) {
+	if (audio_open_) {
+		UtilityFunctions::push_error("audio_open: audio is already open");
+		return false;
+	}
+	// NativeAudio::open enforces the same contract on the port side; these
+	// checks fail fast on the control side with a precise message.
+	if (p_blocksize <= 0 || p_blocksize % 64 != 0) {
+		UtilityFunctions::push_error(vformat("audio_open: blocksize %d must be a positive multiple of 64 (libpd processes in %d-frame ticks)", p_blocksize, 64));
+		return false;
+	}
+	if (p_samplerate <= 0 || p_mix_in < 0 || p_mix_out <= 0) {
+		UtilityFunctions::push_error(vformat("audio_open: invalid arguments (samplerate=%d, mix_in=%d, mix_out=%d)", p_samplerate, p_mix_in, p_mix_out));
+		return false;
+	}
+	if (native_audio_ == nullptr) {
+		native_audio_ = std::make_unique<godot_libpd::NativeAudio>();
+	}
+	// Port ownership: the server owns the AudioPort object; NativeAudio only
+	// borrows it (invariant #5). A test port set via _set_audio_port_for_test
+	// (host tests: NullPort) takes precedence.
+	godot_libpd::AudioPort *port = nullptr;
+	if (audio_test_port_ != nullptr) {
+		port = audio_test_port_.get();
+	} else {
+		if (audio_port_ == nullptr) {
+			audio_port_ = std::make_unique<godot_libpd::PortAudioPort>();
+		}
+		port = audio_port_.get();
+	}
+	if (!native_audio_->open(port, p_mix_in, p_mix_out, p_blocksize, p_samplerate)) {
+		UtilityFunctions::push_error(vformat("audio_open: failed to open the audio stream (%d frames @ %d Hz)", p_blocksize, p_samplerate));
+		return false;
+	}
+	audio_open_ = true;
+	audio_blocksize_ = p_blocksize;
+	audio_samplerate_ = p_samplerate;
+	open_mix_n_in_ = p_mix_in;
+	open_mix_n_out_ = p_mix_out;
+	// Re-register rings tracked from instance inits that happened BEFORE the
+	// stream opened (NativeAudio::open() starts with no rings), then restore
+	// the mixer binding for a still-alive mix instance.
+	std::vector<godot_libpd::MixInputRing *> rings;
+	{
+		std::lock_guard<std::mutex> lock(audio_mutex);
+		rings.reserve(tracked_rings_.size());
+		for (const auto &entry : tracked_rings_) {
+			rings.push_back(entry.second);
+		}
+	}
+	for (godot_libpd::MixInputRing *ring : rings) {
+		native_audio_->register_worker_ring(ring);
+	}
+	if (mixer_instance_ != nullptr && mixer_instance_->pd_instance_ptr() != nullptr) {
+		native_audio_->set_mixer(mixer_instance_->pd_instance_ptr(), open_mix_n_in_, open_mix_n_out_);
+	}
+	return true;
+}
+
+void LibpdServer::audio_close() {
+	if (!audio_open_ || native_audio_ == nullptr) {
+		return;
+	}
+	// Invariant #1 (T4 review): close() stops the PortAudio callback (joins
+	// the audio thread) BEFORE dropping the mixer binding and rings — the
+	// mix instance is safe to free after this returns. The designation
+	// (mixer_instance_) survives so the instance re-binds on the next open.
+	native_audio_->close();
+	audio_open_ = false;
+	audio_blocksize_ = 0;
+}
+
+bool LibpdServer::set_mixer(LibpdInstance *p_mix) {
+	if (p_mix == nullptr) {
+		UtilityFunctions::push_error("set_mixer: instance is null");
+		return false;
+	}
+	if (!audio_open_) {
+		UtilityFunctions::push_error("set_mixer: audio is not open (audio_open first)");
+		return false;
+	}
+	if (p_mix->get_role() != LibpdInstance::Role::MIXER) {
+		UtilityFunctions::push_error("set_mixer: instance is not the MIXER role (set_role before init)");
+		return false;
+	}
+	if (p_mix->pd_instance_ptr() == nullptr) {
+		UtilityFunctions::push_error("set_mixer: instance is not initialized (init before set_mixer)");
+		return false;
+	}
+	// Invariant #3 (T4 review): the mix staging buffers are sized from the
+	// open-time shape — a differently shaped mix instance would overflow them.
+	if (p_mix->init_n_ins() != open_mix_n_in_ || p_mix->init_n_out() != open_mix_n_out_) {
+		UtilityFunctions::push_error(vformat("set_mixer: instance shape (%d in / %d out) != open-time mix shape (%d in / %d out)", p_mix->init_n_ins(), p_mix->init_n_out(), open_mix_n_in_, open_mix_n_out_));
+		return false;
+	}
+	if (mixer_instance_ == p_mix) {
+		return true; // already designated — idempotent
+	}
+	if (mixer_instance_ != nullptr) {
+		UtilityFunctions::push_error("set_mixer: a different mixer is already bound (the old mix instance must be unbound/freed first)");
+		return false;
+	}
+	if (!native_audio_->set_mixer(p_mix->pd_instance_ptr(), open_mix_n_in_, open_mix_n_out_)) {
+		UtilityFunctions::push_error("set_mixer: NativeAudio rejected the binding (see its validation contract)");
+		return false;
+	}
+	mixer_instance_ = p_mix;
+	return true;
+}
+
+void LibpdServer::audio_unbind_mixer(LibpdInstance *p_instance) {
+	if (p_instance == nullptr || mixer_instance_ != p_instance) {
+		return;
+	}
+	// Invariant #1: unbind UNDER the render lock before the instance stops
+	// its worker — the audio thread may still be live.
+	if (native_audio_ != nullptr) {
+		native_audio_->clear_mixer();
+	}
+	mixer_instance_ = nullptr;
+}
+
+bool LibpdServer::audio_available() const {
+	return true;
+}
+
+float LibpdServer::audio_output_latency_ms() {
+	if (!audio_open_ || native_audio_ == nullptr) {
+		return 0.0f;
+	}
+	const godot_libpd::AudioPort *port = native_audio_->port();
+	return port != nullptr ? (float)port->output_latency_ms() : 0.0f;
+}
+
+Array LibpdServer::audio_list_output_devices() {
+	// Listing works on a closed stream, so fall back to a probe port when the
+	// stream is not open (the test port, else a fresh PortAudioPort).
+	godot_libpd::AudioPort *port = nullptr;
+	if (audio_open_ && native_audio_ != nullptr && native_audio_->port() != nullptr) {
+		port = native_audio_->port();
+	} else if (audio_test_port_ != nullptr) {
+		port = audio_test_port_.get();
+	} else {
+		if (audio_port_ == nullptr) {
+			audio_port_ = std::make_unique<godot_libpd::PortAudioPort>();
+		}
+		port = audio_port_.get();
+	}
+	Array out;
+	for (const auto &dev : port->list_outputs()) {
+		Dictionary d;
+		d["index"] = dev.index;
+		d["name"] = String(dev.name.c_str());
+		d["max_channels"] = dev.max_out;
+		out.push_back(d);
+	}
+	return out;
+}
+
+Array LibpdServer::audio_list_input_devices() {
+	godot_libpd::AudioPort *port = nullptr;
+	if (audio_open_ && native_audio_ != nullptr && native_audio_->port() != nullptr) {
+		port = native_audio_->port();
+	} else if (audio_test_port_ != nullptr) {
+		port = audio_test_port_.get();
+	} else {
+		if (audio_port_ == nullptr) {
+			audio_port_ = std::make_unique<godot_libpd::PortAudioPort>();
+		}
+		port = audio_port_.get();
+	}
+	Array out;
+	for (const auto &dev : port->list_inputs()) {
+		Dictionary d;
+		d["index"] = dev.index;
+		d["name"] = String(dev.name.c_str());
+		d["max_channels"] = dev.max_in;
+		out.push_back(d);
+	}
+	return out;
+}
+
+bool LibpdServer::audio_is_open() const {
+	return audio_open_;
+}
+
+int LibpdServer::audio_blocksize() const {
+	return audio_blocksize_;
+}
+
+int LibpdServer::audio_samplerate() const {
+	return audio_samplerate_;
+}
+
+void LibpdServer::audio_register_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring) {
+	(void)p_instance;
+	if (p_ring == nullptr) {
+		return;
+	}
+	// Track for the re-open path (audio_close drops all registered rings),
+	// then register right away when the stream is live.
+	{
+		std::lock_guard<std::mutex> lock(audio_mutex);
+		for (const auto &entry : tracked_rings_) {
+			if (entry.second == p_ring) {
+				return; // already tracked (defensive: one ring per instance)
+			}
+		}
+		tracked_rings_.push_back({p_instance, p_ring});
+	}
+	if (audio_open_ && native_audio_ != nullptr) {
+		native_audio_->register_worker_ring(p_ring);
+	}
+}
+
+void LibpdServer::audio_unregister_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring) {
+	(void)p_instance;
+	if (p_ring == nullptr) {
+		return;
+	}
+	if (audio_open_ && native_audio_ != nullptr) {
+		native_audio_->unregister_worker_ring(p_ring);
+	}
+	std::lock_guard<std::mutex> lock(audio_mutex);
+	tracked_rings_.erase(std::remove_if(tracked_rings_.begin(), tracked_rings_.end(),
+			[p_ring](const auto &entry) { return entry.second == p_ring; }),
+		tracked_rings_.end());
+}
+
+void LibpdServer::_set_audio_port_for_test(std::unique_ptr<godot_libpd::AudioPort> p_port) {
+	if (audio_open_) {
+		UtilityFunctions::push_error("_set_audio_port_for_test: audio is open — close it first");
+		return;
+	}
+	audio_test_port_ = std::move(p_port);
+}
+
+#else // !NATIVE_AUDIO (Android: Godot generator path only)
+
+bool LibpdServer::audio_open(int p_blocksize, int p_samplerate, int p_mix_in, int p_mix_out) {
+	(void)p_blocksize;
+	(void)p_samplerate;
+	(void)p_mix_in;
+	(void)p_mix_out;
+	UtilityFunctions::push_error("audio_open: native audio is not available in this build");
+	return false;
+}
+
+void LibpdServer::audio_close() {
+	// No native stream on this platform.
+}
+
+bool LibpdServer::set_mixer(LibpdInstance *p_mix) {
+	(void)p_mix;
+	UtilityFunctions::push_error("set_mixer: native audio is not available in this build");
+	return false;
+}
+
+void LibpdServer::audio_unbind_mixer(LibpdInstance *p_instance) {
+	(void)p_instance;
+}
+
+bool LibpdServer::audio_available() const {
+	return false;
+}
+
+float LibpdServer::audio_output_latency_ms() {
+	return 0.0f;
+}
+
+Array LibpdServer::audio_list_output_devices() {
+	UtilityFunctions::push_error("audio_list_output_devices: native audio is not available in this build");
+	return Array();
+}
+
+Array LibpdServer::audio_list_input_devices() {
+	UtilityFunctions::push_error("audio_list_input_devices: native audio is not available in this build");
+	return Array();
+}
+
+bool LibpdServer::audio_is_open() const {
+	return false;
+}
+
+int LibpdServer::audio_blocksize() const {
+	return 0;
+}
+
+int LibpdServer::audio_samplerate() const {
+	return 0;
+}
+
+void LibpdServer::audio_register_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring) {
+	(void)p_instance;
+	(void)p_ring;
+}
+
+void LibpdServer::audio_unregister_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring) {
+	(void)p_instance;
+	(void)p_ring;
+}
+
+void LibpdServer::_set_audio_port_for_test(std::unique_ptr<godot_libpd::AudioPort> p_port) {
+	(void)p_port;
+}
+
+#endif // NATIVE_AUDIO
 
 bool LibpdServer::instance_registered(int64_t p_instance_id) const {
 	std::lock_guard<std::mutex> lock(midi_mutex);

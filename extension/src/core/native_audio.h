@@ -15,10 +15,11 @@
  * - THIS class owns the PortAudio stream and its callback. The callback
  *   renders ONLY the mix-down instance: it binds the mix instance with a
  *   one-shot `set_instance` before its first block, gathers the latest
- *   block from each registered `MixInputRing` into the mix inputs
- *   (ring i -> channels 2i, 2i+1, in the interleaved per-frame layout
- *   libpd's process expects), runs `libpd_process_float`, and copies the
- *   mix's `mix_n_out_` channels to the device output.
+ *   K = blocksize()/ring_blocksize() blocks from each registered
+ *   `MixInputRing` into the mix inputs (ring i -> channels 2i, 2i+1, in
+ *   the interleaved per-frame layout libpd's process expects), runs
+ *   `libpd_process_float`, and copies the mix's `mix_n_out_` channels to
+ *   the device output.
  * - The control thread never RENDERS the mixer; only this callback does.
  *   `set_mixer()` is pure state; control-plane ops on the mixer (e.g.
  *   libpd_openfile) are serialized against the callback via
@@ -36,6 +37,7 @@
  * for the device-free test harness).
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -92,15 +94,33 @@ public:
 	 * first block (one-shot guard), because the callback thread must be
 	 * the thread that renders the mix instance.
 	 *
-	 * Contract: call at most once per open() with the instance that will
-	 * live until close(); while the audio thread is live, only the callback
-	 * may call `libpd_set_instance(mix)` (any other thread switching pd_this
+	 * Validation (M5 Task 6, invariant #3 from the T4 review): rejected
+	 * (returns false, nothing bound) if audio is not open, p_mix_pd is
+	 * null, the channel counts differ from the open-time layout (the
+	 * staging buffers are sized from open() — a different shape would
+	 * overflow them), or a mixer is already bound (call clear_mixer()
+	 * first; after close() the binding is dropped automatically).
+	 * Returns true when the binding is in effect.
+	 *
+	 * Contract: while the audio thread is live, only the callback may
+	 * call `libpd_set_instance(mix)` (any other thread switching pd_this
 	 * to a live instance it doesn't render corrupts pd state). After
-	 * close() has joined the audio thread, the owner may bind and free the
-	 * instance — but must bind BEFORE `libpd_closefile` (see the teardown
-	 * caveat in the file header). Rebinding requires close() + open() first.
+	 * close() has joined the audio thread, the owner may bind and free
+	 * the instance — but must bind BEFORE `libpd_closefile` (see the
+	 * teardown caveat in the file header).
 	 */
-	void set_mixer(struct _pdinstance *p_mix_pd, int p_mix_n_in, int p_mix_n_out);
+	bool set_mixer(struct _pdinstance *p_mix_pd, int p_mix_n_in, int p_mix_n_out);
+
+	/**
+	 * Unbind the mix-down instance (M5 Task 6, invariant #1 from the T4
+	 * review). Unbinds under `mix_render_lock_`, so any callback block
+	 * that already loaded the pointer finishes before this returns; every
+	 * later callback renders silence. The caller may free the instance
+	 * once this returns, even while the audio thread is still live — the
+	 * stop path must call this BEFORE tearing down the mixer instance.
+	 * Safe to call when no mixer is bound.
+	 */
+	void clear_mixer();
 
 	/**
 	 * Run p_fn under `mix_render_lock_` — the lock the audio callback
@@ -117,10 +137,19 @@ public:
 	/**
 	 * Register a worker's 2ch ring for gathering (ring i -> mix input
 	 * channels 2i, 2i+1, in registration order). Rejected (ignored): null
-	 * pointers, rings whose blocksize differs from the stream's, and
-	 * duplicates. The ring must stay alive while registered.
+	 * pointers, non-2ch rings, rings whose blocksize does not divide the
+	 * stream blocksize (M5 Task 6, invariant #4: the callback gathers
+	 * blocksize()/ring_blocksize() blocks per ring — the production case
+	 * is a libpd_blocksize() ring under a 256-frame stream), and a second
+	 * ring blocksize once the first ring has fixed the mix's ring
+	 * blocksize (single-size contract). A ring registered before open()
+	 * is validated against the default stream blocksize (256). The ring
+	 * must stay alive while registered.
 	 */
 	void register_worker_ring(MixInputRing *p_ring);
+
+	/** True if p_ring is currently registered (test/teardown helper). */
+	bool has_worker_ring(MixInputRing *p_ring) const;
 
 	/**
 	 * Remove a ring. Safe while the audio thread is mid-block: the
@@ -146,24 +175,33 @@ private:
 	std::atomic<int> mix_n_in_{16};
 	std::atomic<int> mix_n_out_{2};
 	std::atomic<bool> mix_set_{false}; // one-shot: set_instance happened
-	std::mutex mix_render_lock_;      // held around the mix process_float
+	std::atomic<bool> mixer_bound_{false}; // set_mixer succeeded; clear_mixer releases
+	std::mutex mix_render_lock_;      // held around the mix process_float AND the unbind
 
 	// Fixed-size staging buffers, sized at open() — no allocation in the
 	// render path (real-time safety).
 	std::vector<float> mix_in_;
 	std::vector<float> mix_out_;
 
-	// Per-ring scratch for the gather: gather_latest() returns one
-	// interleaved 2ch block (2*blocksize floats), which render_block then
-	// scatters into the two channel columns of mix_in_ (libpd reads its
-	// inBuffer interleaved per frame: inBuffer[f * n_in + c]).
+	// Per-ring scratch for the gather: gather_latest_n() writes up to K
+	// interleaved 2ch blocks (K * ring_blocksize * 2 = at most
+	// 2*blocksize_ floats), which render_block then scatters into the two
+	// channel columns of mix_in_ (libpd reads its inBuffer interleaved per
+	// frame: inBuffer[f * n_in + c]).
 	std::vector<float> gather_scratch_;
 
 	// Worker rings to gather (registration order). Written under rings_mu_
 	// (control thread) and snapshotted under the same lock per block
-	// (audio thread).
+	// (audio thread). ring_blocksize_ is the blocksize fixed by the FIRST
+	// registered ring (0 = none) — all registered rings must match it.
 	std::vector<MixInputRing *> rings_;
-	std::mutex rings_mu_;
+	mutable std::mutex rings_mu_;
+	int ring_blocksize_ = 0;
+
+	// Channel counts as of open(): size the fixed staging buffers and
+	// validate set_mixer() against them (invariant #3).
+	int open_mix_n_in_ = 16;
+	int open_mix_n_out_ = 2;
 
 	AudioPort *port_ = nullptr; // NOT owned
 	int blocksize_ = 256;
