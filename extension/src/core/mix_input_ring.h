@@ -53,13 +53,18 @@ public:
 	 */
 	int gather_latest(float *p_dst, int p_frames) const {
 		std::lock_guard<std::mutex> lock(mutex_);
+		// Write at most p_frames * channels_ samples: the caller's buffer
+		// (e.g. a real-time device callback) may hold FEWER frames than this
+		// ring's blocksize, and a full block copy would overflow it.
+		const int frames = std::min(p_frames, blocksize_);
 		if (count_ == 0) {
-			std::fill_n(p_dst, static_cast<size_t>(p_frames) * static_cast<size_t>(channels_), 0.0f);
+			std::fill_n(p_dst, static_cast<size_t>(frames) * static_cast<size_t>(channels_), 0.0f);
 			return 0;
 		}
 		const size_t slot = (count_ - 1) % static_cast<size_t>(num_blocks_);
-		std::copy_n(storage_.data() + slot * slot_samples(), slot_samples(), p_dst);
-		return blocksize_;
+		std::copy_n(storage_.data() + slot * slot_samples(),
+				static_cast<size_t>(frames) * static_cast<size_t>(channels_), p_dst);
+		return frames;
 	}
 
 	/**

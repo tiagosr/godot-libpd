@@ -1,28 +1,31 @@
-// Unit tests for M5 Task 6 — server audio API + per-instance ring wiring.
+// Unit tests for M5 Task 6 + Task 8 rework — server audio API +
+// per-instance ring wiring + dedicated mix render thread.
 //
 // Option B (supervisor-approved): the per-instance MixInputRing blocksize is
 // libpd_blocksize() (64 in this vendored build) — what the worker pushes per
 // tick — and the PortAudio stream blocksize (e.g. 256) is a multiple of it.
-// The callback gathers the latest K = stream_blocksize / ring_blocksize
-// blocks per ring (MixInputRing::gather_latest_n, oldest-first) instead of
-// one block. This file pins that contract:
+// The DEDICATED mix render thread gathers the latest K = stream_blocksize /
+// ring_blocksize blocks per ring (MixInputRing::gather_latest_n,
+// oldest-first) each stream block; the real-time callback only DRAINS the
+// stereo mix-output ring (latest block, silence when unbound — no libpd,
+// no lock). This file pins that contract:
 //
 //   1. gather_latest_n — deterministic ordering / zero-fill / return value
 //      (pure ring logic, no threads).
 //   2. NativeAudio::open blocksize validation (multiple of libpd_blocksize).
 //   3. NativeAudio::set_mixer channel-count validation + one-binding
 //      contract + clear_mixer rebind (invariants #1 and #3 from the T4/T5
-//      reviews).
+//      reviews) + has_mixer() state.
 //   4. register_worker_ring divisibility contract (invariant #4): a 64-frame
 //      ring registers into a 256-frame stream; non-divisors and a second
 //      ring blocksize are rejected.
 //   5. K-gather end-to-end: 64-frame pushes render full-rate 256-frame
 //      blocks (no stretching, no starvation).
 //   6. Full production SYNTH path: real LibpdWorker -> MixInputRing(64)
-//      -> NativeAudio(256) -> mix instance -> NullPort.
-//   7. Invariant #1: clear_mixer() unbinds under the render lock, so the
-//      mixer instance can be freed while the audio thread is still live —
-//      the callback renders silence afterwards instead of a dangling
+//      -> NativeAudio(256) -> mix instance on the dedicated mix thread.
+//   7. Invariant #1: clear_mixer() stops + joins the mix render thread,
+//      so the mixer instance can be freed while the audio thread is still
+//      live — the drain renders silence afterwards instead of a dangling
 //      pointer.
 //
 // The LibpdServer / LibpdInstance Godot nodes cannot be constructed in a
@@ -123,8 +126,9 @@ static PdInstance init_pd_instance(int p_n_in, int p_n_out, const char *p_patch)
 
 /**
  * Tear down a test-thread instance. In test 7 this runs WHILE the audio
- * thread is live — legal only because clear_mixer() has already unbound
- * the instance from the callback under the render lock (invariant #1).
+ * (drain) thread is live — legal only because clear_mixer() has stopped
+ * and joined the mix render thread, so no thread references the instance
+ * anymore (invariant #1, Task 8 rework).
  */
 static void pd_instance_teardown(PdInstance &p_inst) {
 	if (p_inst.pd == nullptr) {
@@ -303,6 +307,7 @@ static void test_set_mixer_validation() {
 
 	// Not open yet: rejected.
 	CHECK(!na.set_mixer(mix.pd, 16, 2));
+	CHECK(!na.has_mixer());
 
 	CHECK(na.open(&port, 16, 2, 256, 44100));
 
@@ -310,22 +315,28 @@ static void test_set_mixer_validation() {
 	CHECK(!na.set_mixer(mix.pd, 32, 2));
 	CHECK(!na.set_mixer(mix.pd, 16, 4));
 	CHECK(!na.set_mixer(nullptr, 16, 2));
-	// Nothing bound yet: the callback renders silence.
+	// Nothing bound yet: the drain renders silence.
 	sleep_ms(100);
 	CHECK(port.last_out_peak() == 0.0f);
 
-	// Correct counts: accepted — the callback now renders the mix.
+	// Correct counts: accepted — the mix render thread now renders the mix
+	// and the drain delivers it.
 	CHECK(na.set_mixer(mix.pd, 16, 2));
+	CHECK(na.has_mixer());
 	sleep_ms(200);
 	CHECK(port.frames_rendered() > 5);
 	CHECK(port.last_out_peak() > 0.05f); // the sine renders through the mix
 
 	// One binding at a time: rebind rejected while bound.
 	CHECK(!na.set_mixer(mix.pd, 16, 2));
+	CHECK(na.has_mixer());
 
-	// clear_mixer() unbinds; rebinding the same instance is allowed again.
+	// clear_mixer() unbinds (stops + joins the mix thread); rebinding the
+	// same instance is allowed again.
 	na.clear_mixer();
+	CHECK(!na.has_mixer());
 	CHECK(na.set_mixer(mix.pd, 16, 2));
+	CHECK(na.has_mixer());
 	sleep_ms(100);
 	CHECK(port.frames_rendered() > 10);
 	CHECK(port.last_out_peak() > 0.05f); // rendering resumed after rebind
@@ -470,10 +481,10 @@ static void test_synth_worker_end_to_end() {
 			(unsigned long long)blocks, (double)port.last_out_peak());
 }
 
-// 7. Invariant #1 (T4 review): the stop path must clear the mixer binding
-//    UNDER the render lock before the mixer instance is freed. With the
-//    callback still live, clear_mixer() + free must not touch a dangling
-//    pointer; the callback then renders silence.
+// 7. Invariant #1 (T4 review, Task 8 rework): the stop path must clear the
+//    mixer binding (stop + join the mix render thread) BEFORE the mixer
+//    instance is freed. With the drain thread still live, clear_mixer() +
+//    free must not touch a dangling pointer; the drain renders silence.
 static void test_invariant1_clear_before_teardown() {
 	write_patch("na_t6_invar1.pd", kSinePatch);
 	PdInstance mix = init_pd_instance(16, 2, "na_t6_invar1.pd");
@@ -483,21 +494,22 @@ static void test_invariant1_clear_before_teardown() {
 	CHECK(na.open(&port, 16, 2, 256, 44100));
 	CHECK(na.set_mixer(mix.pd, 16, 2));
 
-	// The callback is rendering the mix (self-contained sine, no rings).
+	// The mix thread is rendering the mix (self-contained sine, no rings).
 	sleep_ms(250);
 	const uint64_t blocks_before = port.frames_rendered();
 	CHECK(blocks_before > 5);
 	CHECK(port.last_out_peak() > 0.05f);
 
-	// Unbind under the render lock, THEN free the instance while the audio
-	// thread is still live. A callback that loaded the pointer before the
-	// clear finishes that one block (instance still alive); any later
-	// callback sees nullptr and renders silence.
+	// Stop + join the mix render thread, THEN free the instance while the
+	// audio (drain) thread is still live. After the join no thread
+	// references the instance; the drain sees the unpublish (nullptr)
+	// and renders silence.
 	na.clear_mixer();
+	CHECK(!na.has_mixer());
 	pd_instance_teardown(mix);
 
 	sleep_ms(250);
-	CHECK(port.frames_rendered() > blocks_before); // callback still running
+	CHECK(port.frames_rendered() > blocks_before); // drain still running
 	CHECK(port.last_out_peak() == 0.0f);           // silence after unbind
 
 	na.close();

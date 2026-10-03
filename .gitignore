@@ -401,3 +401,9 @@ extension/build/
 dist/
 probes/rtmidi_probe_macos
 probes/rtmidi_probe_linux
+
+### Extension build + test outputs ###
+*.dylib
+extension/tests/native_audio_mixdown
+extension/tests/server_audio
+spike/native_audio/rtbuild/
