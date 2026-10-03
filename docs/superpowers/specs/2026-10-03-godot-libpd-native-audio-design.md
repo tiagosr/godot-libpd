@@ -1,6 +1,6 @@
 # godot-libpd v2 (M5/M6): Native audio backends (a2) + audio input — Design
 
-Status: proposed
+Status: proposed (Approach A + PortAudio spike validated on macOS 2026-10-03 — see §2 facts and §4.5)
 Supersedes nothing; extends `2026-09-27-godot-libpd-gdextension-design.md`
 (the v1 spec listed "native audio backends a2: CoreAudio / OpenSL ES / ALSA"
 and "audio input / microphone capture" as v2 items, and left the sink behind
@@ -21,7 +21,7 @@ audio backend, to unlock the three capabilities v1 deliberately deferred:
 - **Reduced latency** — one clock (the device callback) instead of a
   self-paced worker thread + a ~250 ms ring buffer + a per-frame main-thread
   pump + a float→Vector2 conversion.
-- **Audio input** — `[audioin~]` works: device capture feeds
+- **Audio input** — `[adc~]` works: device capture feeds
   `libpd_process_float(ticks, in, out)`'s `in`.
 
 Backends, split by what is available in the vendored PortAudio:
@@ -32,7 +32,7 @@ Backends, split by what is available in the vendored PortAudio:
   so Approach A works on the RG DS. Until M6 lands, Android keeps the v1
   `AudioStreamGenerator` sink — no audio regression.
 
-Success: a patch with `[audioin~]`→`[audioout~]` (or any synth) renders in
+Success: a patch with `[adc~]`→`[dac~]` (or any synth) renders in
 real time on macOS and the Knulli with no ring buffer; a chosen block size
 (e.g. 128) is honored; measured round-trip latency drops from the v1
 ~10–20 ms+ to the device-block + driver floor; the `audio_open()` block-size
@@ -122,7 +122,7 @@ Libpd.audio_latency_estimate_ms() -> float      # device-block + driver floor
 # ---- per instance (LibpdInstance) — v1 signature, now wired to the stream ----
 LibpdInstance.init(samplerate: int = 44100, n_ins: int = 0, n_out: int = 2) -> bool
     # samplerate MUST equal Libpd.audio_sample_rate() (fail-fast, §7.1).
-    # n_ins > 0 → instance reads the device input ([audioin~]).
+    # n_ins > 0 → instance reads the device input ([adc~]).
 ```
 
 Semantics:
@@ -137,7 +137,7 @@ Semantics:
 - **Input:** `audio_open(..., input_index >= 0)` enables capture. Every
   instance with `n_ins > 0` reads the *same* device input (the stream's input
   buffer); instances with `n_ins == 0` contribute no input. This matches
-  "[audioin~] reads the hardware" — there is no per-instance input routing.
+  "[adc~] reads the hardware" — there is no per-instance input routing.
 - **Sample rate:** one rate for the whole stream. Instances must match it
   (fail-fast); no built-in resampling (out of scope, §1).
 - **Device selection:** by index from `audio_list_*`. `-1`/`0` = the
@@ -166,6 +166,7 @@ Real-time audio thread  (NEW, owned by LibpdServer; the ONLY thread that
     for each active instance i (server registry, fixed order):
         if i is not ready (no patch / dsp off): continue   (contributes 0)
         lock   i.audio_mutex               (brief — one render block)
+        libpd_set_instance(i)              (pd_this is THREAD-LOCAL — §4.5)
         remap  dev_in  -> i.in_buf         (§4.4, zero-copy when n_ins==dev_in_ch)
         libpd_process_float(ticks, i.in_buf, i.out_buf)    # renders i
         dev_out[] += i.out_buf               (mix; scale to avoid overflow)
@@ -198,6 +199,14 @@ Invariants:
 - **No cross-thread libpd.** For a given pd instance, `libpd_process_float`
   (audio thread) and every control op (control thread) are serialized by
   `i.audio_mutex`. Two threads never touch one instance simultaneously.
+- **`pd_this` is thread-local (spike-confirmed).** pd's current-instance
+  pointer is a `PERTHREAD` global (`m_class.c:34`), so an instance is only
+  visible to the thread that `libpd_set_instance()`d it. **Every thread that
+  calls `libpd_*` for instance i must call `libpd_set_instance(i)` first** —
+  the audio thread does it per-instance inside the render loop (§4.5), the
+  control thread does it once per command batch. This is why v1 worked
+  (`set_instance` + `process_float` on the same worker thread) and why a
+  naive "`process_float` on the audio thread" segfaults in `sys_lock`.
 - **Real-time discipline.** The audio thread does only: a lock, one
   `libpd_process_float` per instance, a mix, an unlock. No allocation, no
   I/O, no Godot/MIDI calls, nothing that can block. (Enforced by code
@@ -242,6 +251,34 @@ for its own `n_ins`/`n_out`. The audio thread copies the first
 case (`n_ins==device_in_ch`, `n_out==2`) is a straight copy / zero-copy
 input pass. Input is always shared (the same device `in` feeds every
 instance); output is per-instance then mixed.
+
+### 4.5 Per-thread instance selection + spike results
+
+**`libpd_set_instance` must be called on every thread before any
+`libpd_*` call** (see the invariant above). Concretely:
+- audio thread: `libpd_set_instance(i)` per instance, inside the render
+  loop (it is cheap — it sets a thread-local pointer).
+- control thread: `libpd_set_instance(i)` at the start of each command it
+  executes (batch the queue drain per instance, set once).
+- output hooks (fire on the audio thread during `process_float`): `pd_this`
+  is already set to the instance being rendered, so `libpd_get_instancedata()`
+  resolves to that instance's context with no extra work.
+
+**Spike results (macOS, vendored PortAudio 19.7.0 + `libpd-multi.a`,
+`spike/native_audio/`):**
+- Approach A works: a sine patch rendered in the callback at exactly its
+  designed peak; a running `adc~`-fed mix drove the output (input → libpd →
+  output confirmed).
+- Block-size control works: requested 128 → callback `framesPerBuffer==128`,
+  device output latency 22.7 ms; requested 256 → `framesPerBuffer==256`,
+  28.5 ms. Floor ≈ device latency + one buffer (2.9 ms @128 / 5.8 ms @256).
+- The one real bug found: calling `libpd_process_float` on the audio thread
+  without `libpd_set_instance` segfaulted in pd's `sys_lock` (thread-local
+  `pd_this` was null). Setting it per-thread fixed it — the core of Approach A.
+- Build notes for the plan: PortAudio's CoreAudio backend needs
+  `-framework AudioToolbox` (not just CoreAudio) and `-DPA_USE_COREAUDIO=1`
+  so `pa_unix_hostapis.c` registers it. The audio input object in this pd
+  build is **`adc~`** (1-indexed); there is no `audioin~` class.
 
 ## 5. Backends & platform matrix
 
@@ -363,14 +400,14 @@ Modified:
 2. **macOS integration (automated, host):** open the stream (built-in output,
    blocksize 128), load a synth patch, assert `blocks_rendered` advances and
    peak > 0 through the NullBackend-instrumented path or a loopback; a
-   `[audioin~]`→`[audioout~]` patch with the built-in mic proves the **input**
+   `[adc~]`→`[dac~]` patch with the built-in mic proves the **input**
    path (peak > 0 on the output ring).
 3. **Knulli on-device (manual):** run the app, `audio_open(blocksize=128)`;
    verify sound from the 3.5 mm jack, confirm `audio_blocksize()==128`, and
    record the observed latency floor (the §9 "is the Knulli codec the
    bottleneck" question — 8 kHz mono caps real latency).
 4. **RG DS on-device (M6, manual):** same app; the aaudio backend renders a
-   synth + a `[audioin~]`→`[audioout~]` loopback; confirm no OpenSL path and
+   synth + a `[adc~]`→`[dac~]` loopback; confirm no OpenSL path and
    a lower latency than v1's a1 sink.
 5. **Test app** (`test_project/scenes/test_audio_native.tscn` + script):
    device lists, `audio_open` with a block-size slider (128/256/512/1024),
