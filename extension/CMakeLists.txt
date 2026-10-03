@@ -92,6 +92,39 @@ elseif(NOT ANDROID AND MIDI_BACKEND STREQUAL "rtmidi")
 endif()
 
 # ---------------------------------------------------------------------------
+# Native audio (M5): vendored PortAudio built in place (the pd-bundled copy
+# has no CMakeLists; compile its C sources directly). macOS (CoreAudio) +
+# Linux (ALSA); OFF on Android, which keeps the a1 Godot-generator path
+# until M6. NATIVE_AUDIO compiles the mix-down render path into the extension.
+# ---------------------------------------------------------------------------
+set(NATIVE_AUDIO OFF)
+if(NOT ANDROID)
+    set(NATIVE_AUDIO ON)
+    set(PA_ROOT thirdparty/libpd/pure-data/portaudio/portaudio)
+    file(GLOB PA_COMMON_SOURCES ${PA_ROOT}/src/common/*.c)
+    file(GLOB PA_UNIX_SOURCES ${PA_ROOT}/src/os/unix/*.c)
+    if(APPLE)
+        file(GLOB PA_HOST_SOURCES ${PA_ROOT}/src/hostapi/coreaudio/*.c)
+        set(PA_HOST_DEFINE PA_USE_COREAUDIO=1)
+    else()
+        file(GLOB PA_HOST_SOURCES ${PA_ROOT}/src/hostapi/alsa/*.c)
+        set(PA_HOST_DEFINE PA_USE_ALSA=1)
+    endif()
+    add_library(portaudio_lib STATIC
+        ${PA_COMMON_SOURCES} ${PA_UNIX_SOURCES} ${PA_HOST_SOURCES})
+    target_include_directories(portaudio_lib PUBLIC
+        ${PA_ROOT}/include ${PA_ROOT}/src ${PA_ROOT}/src/common)
+    target_compile_definitions(portaudio_lib PRIVATE ${PA_HOST_DEFINE})
+    if(APPLE)
+        target_link_libraries(portaudio_lib PRIVATE
+            "-framework CoreAudio" "-framework CoreFoundation"
+            "-framework CoreServices" "-framework AudioToolbox")
+    else()
+        target_link_libraries(portaudio_lib PRIVATE asound)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # The GDExtension
 # ---------------------------------------------------------------------------
 add_library(godot_libpd SHARED
@@ -151,6 +184,23 @@ if(RTMIDI_HOST)
         target_link_libraries(godot_libpd PRIVATE asound)
     endif()
     target_compile_definitions(godot_libpd PRIVATE RTMIDI_HOST_ENABLED)
+endif()
+
+# M5 native audio: the mix-down render path (PortAudio callback) + the
+# PortAudio stream object. NATIVE_AUDIO is OFF on Android (a1 generator).
+if(NATIVE_AUDIO)
+    target_sources(godot_libpd PRIVATE
+        src/core/native_audio.cpp
+        src/core/portaudio_port.cpp)
+    target_link_libraries(godot_libpd PRIVATE portaudio_lib)
+    target_compile_definitions(godot_libpd PRIVATE NATIVE_AUDIO)
+    if(APPLE)
+        target_link_libraries(godot_libpd PRIVATE
+            "-framework CoreAudio" "-framework CoreFoundation"
+            "-framework CoreServices" "-framework AudioToolbox")
+    else()
+        target_link_libraries(godot_libpd PRIVATE asound)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -323,4 +373,74 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     )
     target_link_libraries(multi_instance_midi_tests PRIVATE libpd_static godot-cpp pthread)
     add_test(NAME multi_instance_midi_tests COMMAND $<TARGET_FILE:multi_instance_midi_tests>)
+
+    # M5 native audio. Pure (no godot-cpp): libpd + the core C++ + PortAudio.
+    if(NATIVE_AUDIO)
+        # T3: per-synth-worker ring (Option B: gather_latest_n). No libpd.
+        add_executable(mix_input_ring_tests
+            tests/mix_input_ring_tests.cpp
+        )
+        target_include_directories(mix_input_ring_tests PRIVATE src)
+        target_link_libraries(mix_input_ring_tests PRIVATE pthread)
+        add_test(NAME mix_input_ring_tests COMMAND $<TARGET_FILE:mix_input_ring_tests>)
+
+        # T4: mix-down render in the PortAudio callback + 9-concurrent guard.
+        add_executable(native_audio_mixdown_tests
+            tests/native_audio_mixdown_tests.cpp
+            src/core/native_audio.cpp
+        )
+        target_include_directories(native_audio_mixdown_tests PRIVATE
+            src
+            thirdparty/libpd/libpd_wrapper
+            thirdparty/libpd/libpd_wrapper/util
+            thirdparty/libpd/pure-data/src
+        )
+        target_compile_definitions(native_audio_mixdown_tests PRIVATE NATIVE_AUDIO)
+        target_link_libraries(native_audio_mixdown_tests PRIVATE libpd_static portaudio_lib pthread)
+        if(APPLE)
+            target_link_libraries(native_audio_mixdown_tests PRIVATE
+                "-framework CoreAudio" "-framework CoreFoundation"
+                "-framework CoreServices" "-framework AudioToolbox")
+        endif()
+        add_test(NAME native_audio_mixdown_tests COMMAND $<TARGET_FILE:native_audio_mixdown_tests>)
+
+        # T5: worker roles (SYNTH ring sink / MIXER control-only / ANDROID).
+        add_executable(native_worker_tests
+            tests/native_worker_tests.cpp
+            src/libpd_worker.cpp
+            src/core/pd_command_queue.cpp
+            src/core/pd_debug.cpp
+        )
+        target_include_directories(native_worker_tests PRIVATE
+            src
+            thirdparty/libpd/libpd_wrapper
+            thirdparty/libpd/libpd_wrapper/util
+        )
+        target_compile_definitions(native_worker_tests PRIVATE NATIVE_AUDIO)
+        target_link_libraries(native_worker_tests PRIVATE libpd_static pthread)
+        add_test(NAME native_worker_tests COMMAND $<TARGET_FILE:native_worker_tests>)
+
+        # T6: server audio API + ring wiring (Option B end-to-end, NullPort).
+        add_executable(server_audio_tests
+            tests/server_audio_tests.cpp
+            src/core/native_audio.cpp
+            src/libpd_worker.cpp
+            src/core/pd_command_queue.cpp
+            src/core/pd_debug.cpp
+        )
+        target_include_directories(server_audio_tests PRIVATE
+            src
+            thirdparty/libpd/libpd_wrapper
+            thirdparty/libpd/libpd_wrapper/util
+            thirdparty/libpd/pure-data/src
+        )
+        target_compile_definitions(server_audio_tests PRIVATE NATIVE_AUDIO)
+        target_link_libraries(server_audio_tests PRIVATE libpd_static portaudio_lib pthread)
+        if(APPLE)
+            target_link_libraries(server_audio_tests PRIVATE
+                "-framework CoreAudio" "-framework CoreFoundation"
+                "-framework CoreServices" "-framework AudioToolbox")
+        endif()
+        add_test(NAME server_audio_tests COMMAND $<TARGET_FILE:server_audio_tests>)
+    endif()
 endif()
