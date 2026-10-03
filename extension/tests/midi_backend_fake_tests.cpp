@@ -161,7 +161,14 @@ public:
 			return PollResult::FATAL;
 		}
 		while (!it->second.empty()) {
-			p_push(it->second.front());
+			const uint32_t w = it->second.front();
+			// Fake words are status-first short events or 4-byte sysex words
+			// (PortMIDI layout); infer the valid-byte count the way the read
+			// stage needs it. (No running-status-pair delivery via this double
+			// today; add per-word counts if that is ever exercised.)
+			const uint8_t b0 = static_cast<uint8_t>(w & 0xFF);
+			const int count = (b0 < 0x80 || b0 == 0xF0) ? 4 : midi_short_bytes(b0);
+			p_push(w, count);
 			it->second.pop_front();
 		}
 		return PollResult::OK;

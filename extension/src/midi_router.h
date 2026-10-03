@@ -109,7 +109,7 @@ struct MidiReadStage {
 	 * are pushed via p_push (e.g. ByteRing::push) in wire order.
 	 */
 	template <typename Fn>
-	void feed(uint32_t p_message, Fn p_push) {
+	void feed(uint32_t p_message, int p_count, Fn p_push) {
 		const uint8_t b[4] = {
 				static_cast<uint8_t>(p_message & 0xFF),
 				static_cast<uint8_t>((p_message >> 8) & 0xFF),
@@ -118,12 +118,16 @@ struct MidiReadStage {
 		};
 		if (in_sysex || b[0] == 0xF0) {
 			in_sysex = true;
-			feed_sysex_word(b, p_push);
+			feed_sysex_word(b, p_count, p_push);
 			return;
 		}
-		// Short event: status + 0-2 data bytes, low byte first.
-		const int n = pm_short_bytes(b[0]);
-		for (int i = 0; i < n; ++i) {
+		// Short event OR running-status continuation: push exactly
+		// p_count bytes. The count is authoritative — a word may start
+		// with a data byte (running-status continuation, or the tail of a
+		// message chopped across a word boundary), in which case
+		// pm_short_bytes(b[0]) would wrongly return 1 and truncate
+		// b[1..count-1].
+		for (int i = 0; i < p_count; ++i) {
 			p_push(b[i]);
 		}
 	}
@@ -140,26 +144,7 @@ struct MidiReadStage {
 	 * RT reset, ...) — NOT 2-byte messages.
 	 */
 	static int pm_short_bytes(uint8_t p_status) {
-		if (p_status < 0x80) {
-			return 1; // not expected for short events; safe default
-		}
-		const uint8_t type = p_status & 0xF0;
-		if (type == 0xC0 || type == 0xD0) {
-			return 2; // program change, channel aftertouch
-		}
-		if (type == 0xF0) {
-			if (p_status == 0xF2) {
-				return 3; // song position pointer
-			}
-			if (p_status >= 0xF4) {
-				return 1; // F4..F7: single-byte system common
-			}
-			return 2; // F1 (MTC quarter frame), F3 (song select)
-		}
-		if (type == 0xF8) {
-			return 1; // realtime F8..FF
-		}
-		return 3; // 0x80..0xBF (channel), 0xE0 (pitch bend)
+		return midi_short_bytes(p_status);
 	}
 
 	/**
@@ -186,20 +171,20 @@ private:
 	// only the bytes present in this word are emitted; data (< 0x80) ->
 	// one running-status continuation byte.
 	template <typename Fn>
-	void feed_sysex_word(const uint8_t *p_b, Fn p_push) {
-		for (int k = 0; k < 4; ++k) {
+	void feed_sysex_word(const uint8_t *p_b, int p_count, Fn p_push) {
+		for (int k = 0; k < p_count; ++k) {
 			p_push(p_b[k]);
 			if (p_b[k] != 0xF7) {
 				continue;
 			}
 			in_sysex = false;
 			const int first = k + 1;
-			if (first >= 4 || p_b[first] == 0) {
-				return; // zero padding after the F7
+			if (first >= p_count || p_b[first] == 0) {
+				return; // no valid bytes after the F7 (zero padding)
 			}
 			if (p_b[first] >= 0x80) {
 				const int need = pm_short_bytes(p_b[first]);
-				int have = 4 - first;
+				int have = p_count - first;
 				if (need < have) {
 					have = need;
 				}

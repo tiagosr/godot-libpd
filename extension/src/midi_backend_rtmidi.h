@@ -59,17 +59,20 @@ namespace rtmidi_seam {
 
 // Chops a complete RtMidi message byte vector into <= 4-byte words
 // (low byte first — the MidiBackend::WordPush layout) and pushes each
-// via p_push. p_len <= 0 is a no-op. A 5-byte message yields words
-// {b0..b3} then {b4}: the read stage reassembles the stream exactly
-// (it only cares about <= 4 bytes per word).
+// WITH ITS VALID BYTE COUNT. p_len <= 0 is a no-op. A 5-byte message
+// yields words {b0..b3}(count 4) then {b4}(count 1); the read stage
+// reassembles the stream exactly because each word carries its count
+// (a data-first continuation word is not truncated).
 inline void chop_to_words(const uint8_t *p_bytes, int p_len,
 		const MidiBackend::WordPush &p_push) {
 	for (int i = 0; i < p_len; i += 4) {
 		uint32_t word = 0;
+		int count = 0;
 		for (int j = 0; j < 4 && i + j < p_len; ++j) {
 			word |= static_cast<uint32_t>(p_bytes[i + j]) << (8 * j);
+			++count;
 		}
-		p_push(word);
+		p_push(word, count);
 	}
 }
 
@@ -128,23 +131,23 @@ public:
 	WordRing(WordRing &&) = delete;
 	WordRing &operator=(WordRing &&) = delete;
 
-	void push(uint32_t p_word) {
+	void push(uint32_t p_word, int p_count) {
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (words_.size() >= static_cast<size_t>(cap_)) {
 			overflow_ = true; // drop
 			return;
 		}
-		words_.push_back(p_word);
+		words_.push_back({p_word, p_count});
 	}
 
 	// Drains all pending words via p_take. Returns true if any push
 	// overflowed since the last drain (sticky until reported).
-	bool drain(const std::function<void(uint32_t)> &p_take) {
+	bool drain(const std::function<void(uint32_t, int)> &p_take) {
 		std::lock_guard<std::mutex> lock(mutex_);
 		const bool overflowed = overflow_;
 		overflow_ = false;
-		for (const uint32_t w : words_) {
-			p_take(w);
+		for (const auto &wc : words_) {
+			p_take(wc.first, wc.second);
 		}
 		words_.clear();
 		return overflowed;
@@ -159,7 +162,7 @@ public:
 
 private:
 	std::mutex mutex_;
-	std::deque<uint32_t> words_;
+	std::deque<std::pair<uint32_t, int>> words_;
 	int cap_ = 0;
 	bool overflow_ = false;
 };

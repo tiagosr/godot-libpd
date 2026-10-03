@@ -58,19 +58,23 @@ static uint32_t word(std::initializer_list<uint8_t> p_bytes) {
 	return w;
 }
 
-// Feed one word; return the stream bytes the stage emitted.
-static std::vector<uint8_t> feed_word(MidiReadStage &p_stage, uint32_t p_word) {
+// Feed one word with an explicit valid-byte count; return the stream.
+static std::vector<uint8_t> feed_word(MidiReadStage &p_stage, uint32_t p_word,
+		int p_count) {
 	std::vector<uint8_t> out;
-	p_stage.feed(p_word, [&out](uint8_t b) { out.push_back(b); });
+	p_stage.feed(p_word, p_count, [&out](uint8_t b) { out.push_back(b); });
 	return out;
 }
 
-// Feed a list of words; return the accumulated stream.
+// Feed a list of (word, valid-byte count) pairs; return the accumulated
+// stream. The count is the number of real bytes in the word (short
+// events carry midi_short_bytes(status); sysex words are full 4-byte
+// chunks; running-status data words carry their data bytes).
 static std::vector<uint8_t> feed_words(MidiReadStage &p_stage,
-		std::initializer_list<uint32_t> p_words) {
+		std::initializer_list<std::pair<uint32_t, int>> p_words) {
 	std::vector<uint8_t> out;
-	for (uint32_t w : p_words) {
-		p_stage.feed(w, [&out](uint8_t b) { out.push_back(b); });
+	for (const auto &wc : p_words) {
+		p_stage.feed(wc.first, wc.second, [&out](uint8_t b) { out.push_back(b); });
 	}
 	return out;
 }
@@ -100,32 +104,32 @@ static void expect_stream(const char *p_what, int p_line,
 static void test_short_event_regression() {
 	MidiReadStage s;
 	expect_stream("note on", __LINE__,
-			feed_word(s, word({0x90, 0x3C, 0x64})), {0x90, 0x3C, 0x64});
+			feed_word(s, word({0x90, 0x3C, 0x64}), 3), {0x90, 0x3C, 0x64});
 	expect_stream("note off", __LINE__,
-			feed_word(s, word({0x80, 0x3C, 0x40})), {0x80, 0x3C, 0x40});
+			feed_word(s, word({0x80, 0x3C, 0x40}), 3), {0x80, 0x3C, 0x40});
 	expect_stream("cc", __LINE__,
-			feed_word(s, word({0xB0, 0x7B, 0x07})), {0xB0, 0x7B, 0x07});
+			feed_word(s, word({0xB0, 0x7B, 0x07}), 3), {0xB0, 0x7B, 0x07});
 	expect_stream("poly", __LINE__,
-			feed_word(s, word({0xA0, 0x3C, 0x20})), {0xA0, 0x3C, 0x20});
+			feed_word(s, word({0xA0, 0x3C, 0x20}), 3), {0xA0, 0x3C, 0x20});
 	expect_stream("pitch bend", __LINE__,
-			feed_word(s, word({0xE0, 0x00, 0x40})), {0xE0, 0x00, 0x40});
+			feed_word(s, word({0xE0, 0x00, 0x40}), 3), {0xE0, 0x00, 0x40});
 	// 2-byte events: the zero padding must NOT be emitted.
 	expect_stream("program change", __LINE__,
-			feed_word(s, word({0xC0, 0x40, 0x00, 0x00})), {0xC0, 0x40});
+			feed_word(s, word({0xC0, 0x40, 0x00, 0x00}), 2), {0xC0, 0x40});
 	expect_stream("channel aftertouch", __LINE__,
-			feed_word(s, word({0xD0, 0x20, 0x00, 0x00})), {0xD0, 0x20});
+			feed_word(s, word({0xD0, 0x20, 0x00, 0x00}), 2), {0xD0, 0x20});
 	// System common: MTC quarter frame (2), song position (3), song
 	// select (2).
 	expect_stream("mtc quarter frame", __LINE__,
-			feed_word(s, word({0xF1, 0x78, 0x00, 0x00})), {0xF1, 0x78});
+			feed_word(s, word({0xF1, 0x78, 0x00, 0x00}), 2), {0xF1, 0x78});
 	expect_stream("song position", __LINE__,
-			feed_word(s, word({0xF2, 0x00, 0x40})), {0xF2, 0x00, 0x40});
+			feed_word(s, word({0xF2, 0x00, 0x40}), 3), {0xF2, 0x00, 0x40});
 	expect_stream("song select", __LINE__,
-			feed_word(s, word({0xF3, 0x00, 0x00, 0x00})), {0xF3, 0x00});
+			feed_word(s, word({0xF3, 0x00, 0x00, 0x00}), 2), {0xF3, 0x00});
 	// Realtime: always one byte.
-	expect_stream("clock", __LINE__, feed_word(s, word({0xF8, 0x00, 0x00, 0x00})), {0xF8});
-	expect_stream("active sense", __LINE__, feed_word(s, word({0xFE})), {0xFE});
-	expect_stream("reset", __LINE__, feed_word(s, word({0xFF})), {0xFF});
+	expect_stream("clock", __LINE__, feed_word(s, word({0xF8, 0x00, 0x00, 0x00}), 1), {0xF8});
+	expect_stream("active sense", __LINE__, feed_word(s, word({0xFE}), 1), {0xFE});
+	expect_stream("reset", __LINE__, feed_word(s, word({0xFF}), 1), {0xFF});
 }
 
 // ---------------------------------------------------------------------------
@@ -170,12 +174,12 @@ static void test_f4_f7_single_byte() {
 	CHECK(MidiReadStage::pm_short_bytes(0xE0) == 3);
 	CHECK(MidiReadStage::pm_short_bytes(0x00) == 1); // safe default
 	// Through the stage: exactly one byte out per word.
-	expect_stream("tune request", __LINE__, feed_word(s, word({0xF4})), {0xF4});
-	expect_stream("end of cable", __LINE__, feed_word(s, word({0xF5})), {0xF5});
-	expect_stream("rt reset", __LINE__, feed_word(s, word({0xF6})), {0xF6});
+	expect_stream("tune request", __LINE__, feed_word(s, word({0xF4}), 1), {0xF4});
+	expect_stream("end of cable", __LINE__, feed_word(s, word({0xF5}), 1), {0xF5});
+	expect_stream("rt reset", __LINE__, feed_word(s, word({0xF6}), 1), {0xF6});
 	// A bare F7 outside sysex is a realtime-adjacent system-common
 	// one-byte message, not a sysex terminator: emitted once.
-	expect_stream("stray f7", __LINE__, feed_word(s, word({0xF7})), {0xF7});
+	expect_stream("stray f7", __LINE__, feed_word(s, word({0xF7}), 1), {0xF7});
 	CHECK(!s.in_sysex);
 }
 
@@ -187,9 +191,9 @@ static void test_multi_word_sysex() {
 	MidiReadStage s;
 	CHECK(!s.in_sysex);
 	std::vector<uint8_t> stream = feed_words(s, {
-		word({0xF0, 0x01, 0x02, 0x03}),
-		word({0x04, 0x05, 0x06, 0x07}),
-		word({0x08, 0x09, 0xF7, 0x00}),
+		{word({0xF0, 0x01, 0x02, 0x03}), 4},
+		{word({0x04, 0x05, 0x06, 0x07}), 4},
+		{word({0x08, 0x09, 0xF7, 0x00}), 4},
 	});
 	CHECK(!s.in_sysex); // completed
 	expect_stream("multi word", __LINE__, stream,
@@ -201,7 +205,7 @@ static void test_f7_at_word_positions() {
 	{
 		MidiReadStage s;
 		expect_stream("f7 last", __LINE__,
-				feed_words(s, {word({0xF0, 0x01, 0x02, 0x03}), word({0x04, 0x05, 0x06, 0xF7})}),
+				feed_words(s, {{word({0xF0, 0x01, 0x02, 0x03}), 4}, {word({0x04, 0x05, 0x06, 0xF7}), 4}}),
 				{0xF0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xF7});
 		CHECK(!s.in_sysex);
 	}
@@ -210,7 +214,7 @@ static void test_f7_at_word_positions() {
 	{
 		MidiReadStage s;
 		expect_stream("f7 first", __LINE__,
-				feed_words(s, {word({0xF0, 0x01, 0x02, 0x03}), word({0xF7, 0x00, 0x00, 0x00})}),
+				feed_words(s, {{word({0xF0, 0x01, 0x02, 0x03}), 4}, {word({0xF7, 0x00, 0x00, 0x00}), 4}}),
 				{0xF0, 0x01, 0x02, 0x03, 0xF7});
 	}
 	// F7 in the middle (byte 2) of a word: stops after it; byte 3 is
@@ -218,14 +222,14 @@ static void test_f7_at_word_positions() {
 	{
 		MidiReadStage s;
 		expect_stream("f7 middle", __LINE__,
-				feed_words(s, {word({0xF0, 0x01, 0xF7, 0x00})}),
+				feed_words(s, {{word({0xF0, 0x01, 0xF7, 0x00}), 4}}),
 				{0xF0, 0x01, 0xF7});
 	}
 	// Zero-length sysex (F0 F7) in one word.
 	{
 		MidiReadStage s;
 		expect_stream("zero length", __LINE__,
-				feed_words(s, {word({0xF0, 0xF7, 0x00, 0x00})}),
+				feed_words(s, {{word({0xF0, 0xF7, 0x00, 0x00}), 4}}),
 				{0xF0, 0xF7});
 	}
 }
@@ -241,17 +245,17 @@ static void test_f7_then_next_event() {
 	// arrives as later words.
 	MidiReadStage s;
 	expect_stream("f7 then status", __LINE__,
-			feed_words(s, {word({0xF0, 0x01, 0xF7, 0x90})}),
+			feed_words(s, {{word({0xF0, 0x01, 0xF7, 0x90}), 4}}),
 			{0xF0, 0x01, 0xF7, 0x90});
 	expect_stream("note data", __LINE__,
-			feed_words(s, {word({0x3C}), word({0x64})}),
+			feed_words(s, {{word({0x3C}), 1}, {word({0x64}), 1}}),
 			{0x3C, 0x64});
 
 	// F7 first byte + a complete 2-byte short event (program change) in
 	// the same word.
 	MidiReadStage s2;
 	expect_stream("f7 then program change", __LINE__,
-			feed_words(s2, {word({0xF0, 0xF7, 0xC0, 0x40})}),
+			feed_words(s2, {{word({0xF0, 0xF7, 0xC0, 0x40}), 4}}),
 			{0xF0, 0xF7, 0xC0, 0x40});
 
 	// F7 mid-word + data byte (< 0x80): exactly one running-status
@@ -259,7 +263,7 @@ static void test_f7_then_next_event() {
 	// padding.
 	MidiReadStage s3;
 	expect_stream("f7 then running data", __LINE__,
-			feed_words(s3, {word({0xF0, 0x01, 0xF7, 0x3C})}),
+			feed_words(s3, {{word({0xF0, 0x01, 0xF7, 0x3C}), 4}}),
 			{0xF0, 0x01, 0xF7, 0x3C});
 }
 
@@ -290,9 +294,11 @@ static void test_sysex_then_notes_end_to_end() {
 	MidiReadStage s;
 	// Sysex F0 01 02 03 04 05 F7 (F7 mid-word, rest padding), then
 	// note on 60/100 and note off on channel 0.
-	for (uint32_t w : {word({0xF0, 0x01, 0x02, 0x03}), word({0x04, 0x05, 0xF7, 0x00}),
-			word({0x90, 0x3C, 0x64}), word({0x80, 0x3C, 0x00})}) {
-		s.feed(w, [&framer](uint8_t b) { framer.feed(b); });
+	for (const auto &wc : {std::pair<uint32_t, int>{word({0xF0, 0x01, 0x02, 0x03}), 4},
+			std::pair<uint32_t, int>{word({0x04, 0x05, 0xF7, 0x00}), 4},
+			std::pair<uint32_t, int>{word({0x90, 0x3C, 0x64}), 3},
+			std::pair<uint32_t, int>{word({0x80, 0x3C, 0x00}), 3}}) {
+		s.feed(wc.first, wc.second, [&framer](uint8_t b) { framer.feed(b); });
 	}
 	CHECK(sink.sysex_count == 1);
 	CHECK(sink.truncated_count == 0);
@@ -323,19 +329,63 @@ static void test_sysex_then_notes_end_to_end() {
 
 static void test_sysex_state_and_reset() {
 	MidiReadStage s;
-	feed_word(s, word({0xF0, 0x01, 0x02, 0x03}));
+	feed_word(s, word({0xF0, 0x01, 0x02, 0x03}), 4);
 	CHECK(s.in_sysex); // pending after the first word
 	// Port close / buffer-overflow reset drops the pending state; the
 	// next word is treated as a fresh short event.
 	s.reset();
 	CHECK(!s.in_sysex);
 	expect_stream("after reset", __LINE__,
-			feed_word(s, word({0x90, 0x3C, 0x64})), {0x90, 0x3C, 0x64});
+			feed_word(s, word({0x90, 0x3C, 0x64}), 3), {0x90, 0x3C, 0x64});
 
 	// A completed sysex leaves the state clear.
 	MidiReadStage s2;
-	feed_word(s2, word({0xF0, 0xF7}));
+	feed_word(s2, word({0xF0, 0xF7}), 2);
 	CHECK(!s2.in_sysex);
+}
+
+// ---------------------------------------------------------------------------
+// Running status preserved across the 4-byte word boundary: a
+// running-status pair (a status byte + a second data-only event) is
+// chopped by the backend into two words, with the 5th wire byte landing
+// in the tail of the second (data-first) word. Before the count-based
+// read stage, that byte was truncated (a data-first word was sized to a
+// single byte), silently breaking the second note.
+// ---------------------------------------------------------------------------
+
+static void test_running_status_split_across_words() {
+	// Wire stream (running status): 0x90 0x3C 0x64 | 0x3D 0x50
+	// (note-on 60/100, then note-on 61/80 with the status implied).
+	// Chopped to 4-byte words: {90,3C,64,3D} count=4, then {50} count=1.
+	MidiReadStage s;
+	std::vector<uint8_t> stream = feed_words(s, {
+		{word({0x90, 0x3C, 0x64, 0x3D}), 4},
+		{word({0x50}), 1},
+	});
+	// The pristine running-status stream is preserved: b4 (0x50) is NOT
+	// dropped -- the stream is 0x90 0x3C 0x64 0x3D 0x50.
+	expect_stream("running status preserved", __LINE__, stream,
+			{0x90, 0x3C, 0x64, 0x3D, 0x50});
+
+	// ...and the framer decodes it to two note-ons (the second with the
+	// running status applied). Wire the read stage straight into the
+	// framer (feed_words would accumulate into a throwaway vector).
+	TestSink sink;
+	MidiFramer framer(sink);
+	MidiReadStage s2;
+	for (const auto &wc : {std::pair<uint32_t, int>{word({0x90, 0x3C, 0x64, 0x3D}), 4},
+			std::pair<uint32_t, int>{word({0x50}), 1}}) {
+		s2.feed(wc.first, wc.second, [&framer](uint8_t b) { framer.feed(b); });
+	}
+	CHECK(sink.shorts.size() == 2);
+	if (sink.shorts.size() == 2) {
+		CHECK(sink.shorts[0].kind == MidiKind::NOTE_ON);
+		CHECK(sink.shorts[0].d1 == 0x3C);
+		CHECK(sink.shorts[0].d2 == 0x64);
+		CHECK(sink.shorts[1].kind == MidiKind::NOTE_ON);
+		CHECK(sink.shorts[1].d1 == 0x3D);
+		CHECK(sink.shorts[1].d2 == 0x50);
+	}
 }
 
 int main() {
@@ -346,6 +396,7 @@ int main() {
 	test_f7_then_next_event();
 	test_sysex_then_notes_end_to_end();
 	test_sysex_state_and_reset();
+	test_running_status_split_across_words();
 
 	if (failures > 0) {
 		std::printf("%d MIDI READ STAGE CHECKS FAILED\n", failures);

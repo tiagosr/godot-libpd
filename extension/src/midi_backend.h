@@ -37,6 +37,35 @@
 #include <string>
 #include <vector>
 
+// Number of bytes a MIDI short message occupies given its STATUS byte
+// (0x80..0xFF). Shared by the RtMidi word-chopper, the PortMIDI backend
+// (to report each PmEvent's valid byte count), and the MidiReadStage.
+// Mirrors the vendored PortMIDI pm_midi_length() table (F1 -> 2 bytes,
+// F2 -> 3 bytes). A non-status byte (< 0x80) returns 1 as a safe
+// default (it is never a status, so the caller treats it as sysex).
+inline int midi_short_bytes(uint8_t p_status) {
+	if (p_status < 0x80) {
+		return 1; // not expected for short events; safe default
+	}
+	const uint8_t type = p_status & 0xF0;
+	if (type == 0xC0 || type == 0xD0) {
+		return 2; // program change, channel aftertouch
+	}
+	if (type == 0xF0) {
+		if (p_status == 0xF2) {
+			return 3; // song position pointer
+		}
+		if (p_status >= 0xF4) {
+			return 1; // F4..F7: single-byte system common
+		}
+		return 2; // F1 (MTC quarter frame), F3 (song select)
+	}
+	if (type == 0xF8) {
+		return 1; // realtime F8..FF
+	}
+	return 3; // 0x80..0xBF (channel), 0xE0 (pitch bend)
+}
+
 namespace godot_libpd {
 
 // Backend result codes (kept godot-free so the interface header stays
@@ -65,8 +94,12 @@ public:
 	using PortHandle = int;
 	static constexpr PortHandle NO_HANDLE = -1;
 
-	// Receives one <= 4-byte word (low byte first).
-	using WordPush = std::function<void(uint32_t)>;
+	// Receives one <= 4-byte word (low byte first) with its VALID byte
+	// count. The count is authoritative: a word may carry fewer than 4
+	// bytes (zero-padded) and may be a running-status continuation (a
+	// data byte in the low position), so the reader cannot re-derive the
+	// length from the word alone.
+	using WordPush = std::function<void(uint32_t, int)>;
 
 	enum class PollResult {
 		OK, // words pushed (possibly none).

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using godot_libpd::MidiBackend;
@@ -35,8 +36,18 @@ static int g_failures = 0;
 
 static std::vector<uint32_t> collect(const uint8_t *bytes, int len) {
 	std::vector<uint32_t> words;
-	chop_to_words(bytes, len, [&](uint32_t w) { words.push_back(w); });
+	chop_to_words(bytes, len, [&](uint32_t w, int) { words.push_back(w); });
 	return words;
+}
+
+// Same as collect() but keeps each word's valid-byte count (what the
+// read stage relies on to avoid truncating data-first continuation
+// words — the running-status regression).
+static std::vector<std::pair<uint32_t, int>> collect_counts(const uint8_t *bytes,
+		int len) {
+	std::vector<std::pair<uint32_t, int>> out;
+	chop_to_words(bytes, len, [&](uint32_t w, int c) { out.push_back({w, c}); });
+	return out;
 }
 
 static void test_chop() {
@@ -94,6 +105,41 @@ static void test_chop() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// chop_to_words valid-byte counts: the read stage relies on these to
+// avoid truncating a data-first continuation word (running status).
+// ---------------------------------------------------------------------------
+
+static void test_chop_counts() {
+	// Running-status pair: 0x90 0x3C 0x64 | 0x3D 0x50. The 5th wire byte
+	// (0x50) lands in the tail of a data-first word; the counts MUST be
+	// 4 and 1, otherwise the read stage truncates 0x50 and the second
+	// note is broken.
+	const uint8_t pair[5] = {0x90, 0x3C, 0x64, 0x3D, 0x50};
+	auto wc = collect_counts(pair, 5);
+	CHECK(wc.size() == 2);
+	if (wc.size() == 2) {
+		CHECK(wc[0].first == 0x3D643C90);
+		CHECK(wc[0].second == 4);
+		CHECK(wc[1].first == 0x50);
+		CHECK(wc[1].second == 1);
+	}
+	// A 3-byte note-on is one word with count 3 (no padding).
+	const uint8_t note_on[3] = {0x90, 0x45, 0x7F};
+	auto w = collect_counts(note_on, 3);
+	CHECK(w.size() == 1);
+	if (w.size() == 1) {
+		CHECK(w[0].second == 3);
+	}
+	// A full 4-byte word has count 4.
+	const uint8_t four[4] = {0x01, 0x02, 0x03, 0x04};
+	auto f = collect_counts(four, 4);
+	CHECK(f.size() == 1);
+	if (f.size() == 1) {
+		CHECK(f[0].second == 4);
+	}
+}
+
 static void test_filtered_position() {
 	// Raw order: 0 = in+out, 1 = input only, 2 = output only,
 	// 3 = in+out.
@@ -140,10 +186,10 @@ static void test_word_ring() {
 	// Basic push/drain order.
 	{
 		WordRing ring(8);
-		ring.push(0xAA);
-		ring.push(0xBB);
+		ring.push(0xAA, 1);
+		ring.push(0xBB, 1);
 		std::vector<uint32_t> got;
-		CHECK(!ring.drain([&](uint32_t w) { got.push_back(w); }));
+		CHECK(!ring.drain([&](uint32_t w, int) { got.push_back(w); }));
 		CHECK(got.size() == 2);
 		if (got.size() == 2) {
 			CHECK(got[0] == 0xAA);
@@ -151,7 +197,7 @@ static void test_word_ring() {
 		}
 		// Second drain: empty, no overflow.
 		got.clear();
-		CHECK(!ring.drain([&](uint32_t w) { got.push_back(w); }));
+		CHECK(!ring.drain([&](uint32_t w, int) { got.push_back(w); }));
 		CHECK(got.empty());
 	}
 	// Overflow is reported on the first drain after a drop, then the
@@ -159,38 +205,38 @@ static void test_word_ring() {
 	// port's read state on the report, the port stays open).
 	{
 		WordRing ring(2);
-		ring.push(1);
-		ring.push(2);
-		ring.push(3); // dropped (cap 2) — overflow flag set
+		ring.push(1, 1);
+		ring.push(2, 1);
+		ring.push(3, 1); // dropped (cap 2) — overflow flag set
 		std::vector<uint32_t> got;
-		CHECK(ring.drain([&](uint32_t w) { got.push_back(w); })); // overflow
+		CHECK(ring.drain([&](uint32_t w, int) { got.push_back(w); })); // overflow
 		CHECK(got.size() == 2);
 		if (got.size() == 2) {
 			CHECK(got[0] == 1);
 			CHECK(got[1] == 2);
 		}
-		CHECK(!ring.drain([](uint32_t) {})); // flag cleared after report
-		ring.push(4);
-		ring.push(5);
-		ring.push(6); // dropped
+		CHECK(!ring.drain([](uint32_t, int) {})); // flag cleared after report
+		ring.push(4, 1);
+		ring.push(5, 1);
+		ring.push(6, 1); // dropped
 		got.clear();
-		CHECK(ring.drain([&](uint32_t w) { got.push_back(w); })); // overflow
+		CHECK(ring.drain([&](uint32_t w, int) { got.push_back(w); })); // overflow
 		CHECK(got.size() == 2);
 		if (got.size() == 2) {
 			CHECK(got[0] == 4);
 			CHECK(got[1] == 5);
 		}
-		CHECK(!ring.drain([](uint32_t) {}));
+		CHECK(!ring.drain([](uint32_t, int) {}));
 	}
 	// Reset clears pending words and the flag.
 	{
 		WordRing ring(2);
-		ring.push(1);
-		ring.push(2);
-		ring.push(3); // overflow
+		ring.push(1, 1);
+		ring.push(2, 1);
+		ring.push(3, 1); // overflow
 		ring.reset();
 		std::vector<uint32_t> got;
-		CHECK(!ring.drain([&](uint32_t w) { got.push_back(w); }));
+		CHECK(!ring.drain([&](uint32_t w, int) { got.push_back(w); }));
 		CHECK(got.empty());
 	}
 	// Producer/consumer under concurrent threads (the RtMidi
@@ -204,7 +250,7 @@ static void test_word_ring() {
 		std::atomic<bool> producer_done{false};
 		auto producer = std::thread([&] {
 			for (int i = 0; i < kTotal; ++i) {
-				ring.push(static_cast<uint32_t>(i));
+				ring.push(static_cast<uint32_t>(i), 1);
 			}
 			producer_done = true;
 		});
@@ -216,7 +262,7 @@ static void test_word_ring() {
 			// this drain empty) means everything that will come has
 			// been taken.
 			const bool more =
-					ring.drain([&](uint32_t) { ++count; });
+					ring.drain([&](uint32_t, int) { ++count; });
 			if (more) {
 				++overflows;
 			}
@@ -232,6 +278,7 @@ static void test_word_ring() {
 
 int main() {
 	test_chop();
+	test_chop_counts();
 	test_filtered_position();
 	test_word_ring();
 	if (g_failures == 0) {

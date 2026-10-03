@@ -624,7 +624,7 @@ void RtMidiAndroidBackend::input_callback(double p_time,
 		return;
 	}
 	rtmidi_seam::chop_to_words(p_bytes->data(), static_cast<int>(p_bytes->size()),
-			[p_ring = ring](uint32_t w) { p_ring->push(w); });
+			[p_ring = ring](uint32_t w, int count) { p_ring->push(w, count); });
 }
 
 MidiError RtMidiAndroidBackend::open_impl(int p_index, int p_buffer_events,
@@ -831,7 +831,7 @@ MidiError RtMidiAndroidBackend::write_locked(PortHandle p_handle,
 			return MidiError::OK;
 		}
 		rtmidi_seam::chop_to_words(p_bytes, p_len,
-				[&](uint32_t w) { loopback_ring_.push(w); });
+				[&](uint32_t w, int count) { loopback_ring_.push(w, count); });
 		return MidiError::OK;
 	}
 	auto it = out_ports_.find(p_handle);

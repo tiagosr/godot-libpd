@@ -295,8 +295,8 @@ void MidiRouter::io_loop() {
 			const int pid = entry.first;
 			Port *port = entry.second;
 			const MidiBackend::PollResult result = backend_->poll_input(
-					port->backend_handle, [&](uint32_t word) {
-						port->read_stage.feed(word, [&](uint8_t byte) {
+					port->backend_handle, [&](uint32_t word, int count) {
+						port->read_stage.feed(word, count, [&](uint8_t byte) {
 							port->ring.push(byte);
 						});
 					});

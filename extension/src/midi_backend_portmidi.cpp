@@ -158,7 +158,13 @@ MidiBackend::PollResult PortMidiBackend::poll_input(PortHandle p_handle, const W
 		return PollResult::FATAL;
 	}
 	for (int i = 0; i < n; ++i) {
-		p_push(events[i].message);
+		const uint8_t b0 = static_cast<uint8_t>(events[i].message & 0xFF);
+		// PortMIDI re-inserts running status (full-form), so short events
+		// are always status-first -> midi_short_bytes(b0) is exact. Sysex
+		// arrives as 4-byte PmEvents (F0-start or data-first continuation),
+		// which the read stage reassembles; report the full word (4).
+		const int count = (b0 < 0x80 || b0 == 0xF0) ? 4 : midi_short_bytes(b0);
+		p_push(events[i].message, count);
 	}
 	return PollResult::OK;
 }

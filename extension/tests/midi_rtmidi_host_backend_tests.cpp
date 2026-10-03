@@ -104,7 +104,7 @@ int main() {
 	check(backend.write(out_handle, note, 3) == MidiError::OK, "write note");
 	Collector col;
 	backend.poll_input(in_handle,
-			[&col](uint32_t w) { col.push(w); });
+			[&col](uint32_t w, int) { col.push(w); });
 	check(col.words.size() == 1, "note delivered as one word");
 	if (col.words.size() == 1) {
 		const uint32_t w = col.words[0];
@@ -119,7 +119,7 @@ int main() {
 			"write_sysex full F0..F7");
 	col = Collector();
 	backend.poll_input(in_handle,
-			[&col](uint32_t w) { col.push(w); });
+			[&col](uint32_t w, int) { col.push(w); });
 	check(col.words.size() == 2, "sysex delivered as two words");
 	if (col.words.size() == 2) {
 		check((col.words[0] & 0xff) == 0xF0 &&
