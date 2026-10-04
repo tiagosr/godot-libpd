@@ -1,9 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace godot_libpd {
@@ -31,6 +35,77 @@ public:
 			 storage_(static_cast<size_t>(p_num_blocks) * static_cast<size_t>(p_blocksize) *
 					 static_cast<size_t>(p_channels), 0.0f) {}
 
+	// ── Kick/done sequencer (callback-driven transport, M5 T9) ────────────
+	// The PortAudio callback is the single clock: it kicks the owning synth
+	// worker to render one block, then waits for that worker to finish before
+	// gathering. The kick side uses a condition variable so the worker wakes
+	// RELIABLY (a bounded-sleep poll loses a race under load and can leave the
+	// callback blocked in wait_done forever). done is a plain atomic the
+	// callback polls (the worker is fast; the callback is the sole waiter).
+	//
+	//   kick_seq_  (callback -> worker): the tick to render; advanced under kick_mu_
+	//   done_seq_  (worker   -> callback): written after the worker pushes
+	//
+	// kick() is called by the callback thread; wait_for_kick() by the owning
+	// worker thread; wait_done() by the callback thread. The sequencer is
+	// independent of the audio storage above (push/gather are unchanged).
+
+	/** Callback thread: request a render of the owning worker, tagged with the
+	 * current tick #p_target. Wakes the worker's condition variable. */
+	void kick(int p_target) {
+		{
+			std::lock_guard<std::mutex> lock(kick_mu_);
+			kick_seq_.store(p_target, std::memory_order_release);
+		}
+		kick_cv_.notify_one();
+	}
+
+	/// Wake any thread blocked in wait_for_kick() (e.g. on stop). Re-checks the
+	/// predicate, which includes the stop flag.
+	void wakeup() {
+		kick_cv_.notify_all();
+	}
+
+	/**
+	 * Worker thread: block until the callback kicks (kick_seq_ advances past
+	 * done_seq_) or p_stop is set. Returns the kick target to render, or -1 if
+	 * p_stop is set. This is the ONLY place the worker waits for a kick — no
+	 * self-pacing, no software clock.
+	 */
+	int wait_for_kick(const std::atomic<bool> &p_stop) {
+		std::unique_lock<std::mutex> lock(kick_mu_);
+		kick_cv_.wait(lock, [&] {
+			return p_stop.load(std::memory_order_relaxed) ||
+				   kick_seq_.load(std::memory_order_relaxed) >
+				   done_seq_.load(std::memory_order_relaxed);
+		});
+		if (p_stop.load(std::memory_order_relaxed)) {
+			return -1;
+		}
+		return kick_seq_.load(std::memory_order_relaxed);
+	}
+
+	/** Worker thread: signal that kick #p_target is done (block pushed). */
+	void signal_done(int p_target) {
+		done_seq_.store(p_target, std::memory_order_release);
+	}
+
+	/**
+	 * Callback thread: block until the owning worker has completed kick
+	 * #p_target (i.e. done_seq_ >= p_target) OR p_closing is set. Plain bounded
+	 * sleep — the worker is fast and the callback is the sole waiter; a
+	 * per-worker deadline guard is a documented later step. The p_closing flag
+	 * makes the wait abortable: when the audio is being closed the workers are
+	 * stopped and will not signal done, so an unbounded wait would hang the
+	 * audio thread (and hence the close() join) forever.
+	 */
+	void wait_done(int p_target, const std::atomic<bool> &p_closing) const {
+		while (!p_closing.load(std::memory_order_acquire) &&
+				done_seq_.load(std::memory_order_acquire) < p_target) {
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+	}
+
 	/**
 	 * Producer (synth worker thread): copy one p_frames-frame block
 	 * (p_frames * channels() floats) into the next slot. p_frames must
@@ -42,6 +117,7 @@ public:
 		const size_t samples = static_cast<size_t>(p_frames) * static_cast<size_t>(channels_);
 		const size_t slot = count_ % static_cast<size_t>(num_blocks_);
 		std::copy_n(p_block, samples, storage_.data() + slot * slot_samples());
+		last_push_ = std::chrono::steady_clock::now();
 		++count_;
 	}
 
@@ -121,7 +197,44 @@ public:
 		return num_blocks_;
 	}
 
+	/**
+	 * The stream (mix) blocksize the consuming callback renders each tick —
+	 * set by NativeAudio::register_worker_ring. A kick-driven SYNTH worker
+	 * renders mix_blocksize()/blocksize() blocks per kick so the gather sees a
+	 * CONTIGUOUS window of `mix_blocksize` frames (not one fresh block plus
+	 * stale ones from earlier ticks, which sounds like an atonal hum with
+	 * discontinuities). 0 until registered; the worker treats 0 as "render one
+	 * block" (the unregistered / default case).
+	 */
+	int mix_blocksize() const {
+		return mix_blocksize_;
+	}
+	void set_mix_blocksize(int p_mix_blocksize) {
+		mix_blocksize_ = p_mix_blocksize;
+	}
+
+	/**
+	 * DIAGNOSTIC: milliseconds since the most recent push (how stale the newest
+	 * block is). -1 if nothing has been pushed yet. A healthy ring pushed at the
+	 * libpd blocksize pace reads well under one block period (~1.45 ms at 44.1k/
+	 * 64); a large value means the producer is falling behind the consumer.
+	 */
+	double lag_ms() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (count_ == 0) {
+			return -1.0;
+		}
+		return std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - last_push_).count();
+	}
+
 private:
+	std::mutex kick_mu_;            // guards kick_seq_ (and the kick cv)
+	std::condition_variable kick_cv_; // signaled when kick_seq_ advances
+	std::atomic<int> kick_seq_{0}; // callback -> worker: "render block #kick_seq_"
+	std::atomic<int> done_seq_{0}; // worker   -> callback: "rendered up to #done_seq_"
+	int mix_blocksize_ = 0; // stream blocksize the gather needs (0 until registered)
+
 	size_t slot_samples() const {
 		return static_cast<size_t>(blocksize_) * static_cast<size_t>(channels_);
 	}
@@ -132,6 +245,7 @@ private:
 	std::vector<float> storage_; // num_blocks * blocksize * channels floats
 	mutable std::mutex mutex_;   // guards count_ (and thus the newest-slot index)
 	uint64_t count_ = 0;         // total pushes so far; newest slot = (count_ - 1) % num_blocks_
+	std::chrono::steady_clock::time_point last_push_{}; // DIAGNOSTIC: newest push time
 };
 
 } // namespace godot_libpd

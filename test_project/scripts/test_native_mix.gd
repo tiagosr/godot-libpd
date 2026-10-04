@@ -14,16 +14,28 @@ var synth_notes: Array = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0, 523.25, 
 var instances: Array = []
 var mixer: LibpdInstance = null
 var started := false
+var n_synth: int = 8
 
 func _ready() -> void:
+	var env: String = OS.get_environment("NM_SYNTHS")
+	if env != "":
+		var ns: int = int(env)
+		if ns >= 0 and ns <= 8:
+			n_synth = ns
+	print("[native_mix] n_synth=%d" % n_synth)
+	var blocksize: int = 256
+	var envb: String = OS.get_environment("NM_BLOCK")
+	if envb != "":
+		var bs: int = int(envb)
+		if bs > 0 and bs % 64 == 0:
+			blocksize = bs
+	print("[native_mix] blocksize=%d" % blocksize)
 	print("[native_mix] ready")
 	if not Libpd.server.audio_available():
 		push_error("[native_mix] audio_available() == false; cannot run the native mix test")
 		return
-	# Open the mix-down stream: 256-frame blocks at 44100 Hz, 16 mix inputs /
-	# 2 device outputs (the 16 inputs are the 8 stereo synth rings).
-	if not Libpd.server.audio_open(256, 44100):
-		push_error("[native_mix] audio_open(256, 44100) failed")
+	if not Libpd.server.audio_open(blocksize, 44100):
+		push_error("[native_mix] audio_open(%d, 44100) failed" % blocksize)
 		return
 
 	# The mix-down instance: role MIXER (control-only worker; rendered by the
@@ -31,8 +43,13 @@ func _ready() -> void:
 	mixer = LibpdInstance.new()
 	mixer.set_role(1) # ROLE_MIXER
 	add_child(mixer)
-	if not mixer.init(44100, 16, 2):
-		push_error("[native_mix] mixer.init(44100, 16, 2) failed")
+	var mix_in: int = 16
+	var envin: String = OS.get_environment("NM_MIX_IN")
+	if envin != "":
+		mix_in = int(envin)
+	print("[native_mix] mixer in_channels=%d" % mix_in)
+	if not mixer.init(44100, mix_in, 2):
+		push_error("[native_mix] mixer.init failed")
 		return
 	if mixer.load_patch("res://data/mixdown_16.pd") != Error.OK:
 		push_error("[native_mix] mixer.load_patch(mixdown_16.pd) failed")
@@ -40,7 +57,7 @@ func _ready() -> void:
 
 	# 8 synth instances: role SYNTH (default), 0 in / 2 out, each into its own
 	# ring; each plays a different note.
-	for i in 8:
+	for i in n_synth:
 		var s: LibpdInstance = LibpdInstance.new()
 		add_child(s)
 		if not s.init(44100, 0, 2):
@@ -55,6 +72,9 @@ func _ready() -> void:
 	if not Libpd.server.set_mixer(mixer):
 		push_error("[native_mix] set_mixer(mixer) failed")
 		return
+	Libpd.server.instance_print.connect(func(id, text):
+		print("ID: ", id, " - ", text)
+	)
 
 	mixer.start_dsp()
 	for s in instances:

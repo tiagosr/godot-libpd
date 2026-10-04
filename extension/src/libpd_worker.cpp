@@ -13,6 +13,14 @@ namespace godot_libpd {
 
 namespace {
 
+// Callback-driven synth kick (M5 T9): the owning SYNTH worker idles in
+// SYNTH_IDLE_SLEEP_US steps while waiting for the PortAudio callback to kick
+// it. This bounds the wakeup latency the callback waits on. Confirmed 200 µs
+// for the first cut; the documented tunable for portable (low-power) targets
+// (shorten it, or replace the bounded sleep with a futex/eventfd shim) is
+// this single constant.
+constexpr int SYNTH_IDLE_SLEEP_US = 200;
+
 // One timeline line for instance p_id (global ms base, see pd_debug.h).
 void wlog(uint32_t p_id, const char *p_fmt, ...) {
 	char msg[224];
@@ -131,6 +139,30 @@ LibpdWorker::~LibpdWorker() {
 	join();
 }
 
+namespace {
+std::once_flag g_pd_globals_once;
+}
+
+void LibpdWorker::init_pd_globals_once() {
+	std::call_once(g_pd_globals_once, [] {
+		const int err = libpd_init();
+		if (err != 0) {
+			std::fprintf(stderr, "godot-libpd: libpd_init() failed (%d)\n", err);
+		}
+	});
+}
+
+void LibpdWorker::adopt_precreated_instance(t_pdinstance *p_pd, int p_samplerate, int p_n_out) {
+	// Records the main-thread-created instance so the worker adopts it (INIT) and
+	// tears it down (run) on its own thread. The worker never creates it.
+	pd_instance = p_pd;
+	samplerate = p_samplerate;
+	n_out = p_n_out;
+	blocksize = libpd_blocksize();
+	out_buffer.resize((size_t)blocksize * (size_t)n_out);
+	has_precreated_instance_ = true;
+}
+
 void LibpdWorker::start() {
 	if (thread_started) {
 		return;
@@ -151,6 +183,12 @@ void LibpdWorker::request_stop() {
 	PdCommand stop;
 	stop.opcode = PdCommand::STOP_THREAD;
 	queue.push(stop);
+	// Kick-loop workers (SYNTH) block on the ring's condition variable, not
+	// the command queue — nudge it so wait_for_kick() re-checks stop_requested
+	// and exits (a kick will not arrive once the mixer is unbound).
+	if (config.worker_ring != nullptr) {
+		config.worker_ring->wakeup();
+	}
 }
 
 void LibpdWorker::join() {
@@ -248,8 +286,9 @@ void LibpdWorker::run() {
 			break;
 		}
 
-		// 2) dsp block + pacing (M5 Task 5: MIXER never renders — the
-		//    PortAudio callback renders the mix instance, not the worker).
+		// 2) dsp block. MIXER never renders (the PortAudio callback renders the
+		//    mix instance). SYNTH renders WHEN KICKED by the callback (M5 T9,
+		//    no self-pacing); ANDROID/a1 render self-paced.
 		if (dsp_on.load() && pd_instance != nullptr && patch_handle != nullptr &&
 				config.role != WorkerRole::MIXER) {
 			if (!last_dsp_branch) {
@@ -258,31 +297,72 @@ void LibpdWorker::run() {
 			}
 			const int bs = libpd_blocksize();
 			const int frames = bs * n_out;
-			if ((int)out_buffer.size() >= frames) {
-				libpd_process_float(1, nullptr, out_buffer.data());
-				if (config.role == WorkerRole::SYNTH) {
-					// Hand the block to the mix-down's per-worker ring.
-					if (config.worker_ring != nullptr) {
-						config.worker_ring->push(out_buffer.data(), bs);
-					}
-				} else if (config.sink != nullptr) {
-					config.sink->push_block(out_buffer.data(), bs, n_out);
+			if (config.role == WorkerRole::SYNTH && config.worker_ring != nullptr) {
+				// ── SYNTH (M5 T9): render WHEN KICKED by the callback. The
+				//    PortAudio callback is the single clock — no software clock,
+				//    no sleep_until. Block on the ring's condition variable until
+				//    the callback advances kick_seq_ (reliable wakeup, no poll).
+				MixInputRing *ring = config.worker_ring;
+				const int target = ring->wait_for_kick(stop_requested);
+				if (target < 0) {
+					// stop_requested was set: exit the loop.
+					break;
 				}
+				// Kicked: render the FULL stream window the callback will gather
+				// (mix_blocksize frames == K ring-blocks), pushing each block to the
+				// ring, so the gather sees a CONTIGUOUS window — not one fresh block
+				// plus stale blocks from earlier ticks (an atonal hum + discontinuities).
+				// K = mix_blocksize / ring_blocksize (0 or unregistered -> 1 block).
+				const int k = ring->mix_blocksize() > ring->blocksize()
+						? ring->mix_blocksize() / ring->blocksize()
+						: 1;
+				const auto t_render_start = steady_clock::now();
+				if ((int)out_buffer.size() >= frames) {
+					for (int i = 0; i < k; ++i) {
+						libpd_process_float(1, nullptr, out_buffer.data());
+						ring->push(out_buffer.data(), bs);
+					}
+				}
+				const auto t_render_done = steady_clock::now();
+				if (std::getenv("RDIAG") != nullptr && (dsp_blocks % 50) == 1) {
+					const double render_ms =
+							duration_cast<nanoseconds>(t_render_done - t_render_start).count() / 1e6;
+						fprintf(stderr, "[rdiag] synth id=%lld render+push=%.4f ms\n",
+								(long long)config.instance_id, render_ms);
+					}
+				ring->signal_done(target);
+				dsp_blocks++;
+			} else {
+				// ── ANDROID/a1: self-paced (existing behavior, unchanged).
+				const auto t_render_start = steady_clock::now();
+				if ((int)out_buffer.size() >= frames) {
+					libpd_process_float(1, nullptr, out_buffer.data());
+					if (config.sink != nullptr) {
+						config.sink->push_block(out_buffer.data(), bs, n_out);
+					}
+				}
+				const auto t_render_done = steady_clock::now();
+				if (std::getenv("RDIAG") != nullptr && (dsp_blocks % 50) == 1) {
+					const double render_ms =
+							duration_cast<nanoseconds>(t_render_done - t_render_start).count() / 1e6;
+						fprintf(stderr, "[rdiag] synth id=%lld render+push=%.4f ms\n",
+								(long long)config.instance_id, render_ms);
+					}
+				// Pacing: sleep to the next tick (self-clock, a1/Android only).
+				const auto period = duration_cast<nanoseconds>(
+						duration<double>((double)bs / (double)samplerate));
+				next_tick += period;
+				const auto now = steady_clock::now();
+				if (next_tick <= now) {
+					// Fell behind: resync, don't spiral.
+					next_tick = now + period / 2;
+				} else {
+					std::this_thread::sleep_until(next_tick);
+				}
+				dsp_blocks++;
 			}
-			dsp_blocks++;
 			if ((dsp_blocks % 1000) == 1) {
 				wlog(config.instance_id, "dsp blocks=%llu", (unsigned long long)dsp_blocks);
-			}
-			// 3) Pacing: sleep to the next tick.
-			const auto period = duration_cast<nanoseconds>(
-					duration<double>((double)bs / (double)samplerate));
-			next_tick += period;
-			const auto now = steady_clock::now();
-			if (next_tick <= now) {
-				// Fell behind: resync, don't spiral.
-				next_tick = now + period / 2;
-			} else {
-				std::this_thread::sleep_until(next_tick);
 			}
 		} else {
 			// 3) Idle: block for a command or the stop signal.
@@ -334,16 +414,24 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			// concurrently, so the whole INIT body runs under with_mixer_lock
 			// (Task 4 finding). SYNTH/ANDROID: runs as-is (existing path).
 			with_lock([&] {
-				wlog(config.instance_id, "INIT: libpd_new_instance start");
-				{
-					static std::once_flag pd_globals_once;
-					std::call_once(pd_globals_once, [] {
-						const int err = libpd_init();
-						if (err != 0) {
-							std::fprintf(stderr, "godot-libpd: libpd_init() failed (%d)\n", err);
-						}
-					});
+				if (has_precreated_instance_) {
+					// MIXER, T8 root-cause fix: the instance was created on the MAIN
+					// thread (option A). Adopt it on THIS thread (thread-local pd_this)
+					// and install the worker's hooks; libpd_new_instance / init_audio /
+					// dsp-on already happened on the main thread. The worker renders
+					// nothing (MIXER) but owns the teardown (closefile/free_instance).
+					wlog(config.instance_id, "INIT: adopting pre-created instance");
+					libpd_set_instance(pd_instance);
+					blocksize = libpd_blocksize();
+					out_buffer.resize((size_t)blocksize * n_out);
+					libpd_set_printhook(c_printhook);
+					install_midi_output_hooks(this);
+					wlog(config.instance_id, "INIT: done (adopted, blocksize=%d)", blocksize);
+					fulfill(0);
+					return;
 				}
+				wlog(config.instance_id, "INIT: libpd_new_instance start");
+				init_pd_globals_once();
 				pd_instance = libpd_new_instance();
 				wlog(config.instance_id, "INIT: libpd_new_instance done (null=%d)", pd_instance == nullptr);
 				if (pd_instance == nullptr) {
@@ -425,10 +513,24 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 				}
 				pos = (sp == std::string::npos) ? rest.size() : sp + 1;
 			}
-			if (argc == 0 && p_command.args.empty()) {
-				libpd_message(p_command.path.c_str(), "", 0, nullptr);
+			// Send with the correct pd message type so the [r ...] receiver
+			// forwards the RIGHT thing to its outlets. libpd_message(recv, "")
+			// goes through receive_anything() -> outlet_anything(), which
+			// forwards an empty-selector typedmess that audio objects (osc~,
+			// dac~, ...) reject with "error: <obj>: no method for ''". Use the
+			// typed entry points: bang (no args), float/symbol (one arg), or
+			// list (multiple args).
+			const char *recv = p_command.path.c_str();
+			if (argc == 0) {
+				libpd_bang(recv);
+			} else if (argc == 1) {
+				if (atoms[0].a_type == A_FLOAT) {
+					libpd_float(recv, atoms[0].a_w.w_float);
+				} else {
+					libpd_symbol(recv, atoms[0].a_w.w_symbol->s_name);
+				}
 			} else {
-				libpd_message(p_command.path.c_str(), "", argc, atoms);
+				libpd_list(recv, argc, atoms);
 			}
 			return;
 		}

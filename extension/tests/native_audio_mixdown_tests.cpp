@@ -1,15 +1,13 @@
-// Unit tests for NativeAudio (M5 Task 8 rework) — the dedicated mix render
-// thread + real-time ring drain.
+// Unit tests for NativeAudio (mix-in-PortAudio-callback model, validated by
+// the 9-instance proof) — the real-time callback renders the mix-down.
 //
 // The invariant under test: each libpd instance's libpd_process_float runs on
-// exactly ONE thread that called libpd_set_instance(it) exactly ONCE. The
-// mix-down instance renders on NativeAudio's DEDICATED mix render thread
-// (paced to real time); the PortAudio callback (driven here by NullPort) does
-// no libpd work — it only drains the stereo mix-output ring (latest block,
-// silence when unbound). Every synth instance is rendered on its own pinned
+// exactly ONE thread that called libpd_set_instance(it). The mix-down instance
+// renders on the real-time callback thread (driven here by NullPort): bind
+// (libpd_set_instance), gather the worker rings, process one block, and copy
+// to the device buffer. Every synth instance is rendered on its own pinned
 // worker thread and pushes its 64-frame blocks into its own MixInputRing
-// (the last test: 8 of them, porting
-// spike/native_audio/mixdown_multi.c).
+// (the last test: 8 of them, porting spike/native_audio/mixdown_multi.c).
 //
 // Real libpd instances throughout: each instance is created and init'd on the
 // test thread (new_instance / set_instance / init_audio / dsp on / openfile)
@@ -145,9 +143,15 @@ static std::thread start_ring_feeder(MixInputRing &p_ring, std::atomic<bool> &p_
 		float p_value = 0.5f) {
 	return std::thread([&p_ring, &p_stop, p_value]() {
 		std::vector<float> block(64 * 2, p_value);
-		while (!p_stop.load(std::memory_order_relaxed)) {
+		while (true) {
+			// Kick-driven (M5 T9): block on the ring's CV until the callback
+			// kicks this ring (reliable wakeup; no self-pacing).
+			const int target = p_ring.wait_for_kick(p_stop);
+			if (target < 0) {
+				break;
+			}
 			p_ring.push(block.data(), 64);
-			std::this_thread::sleep_for(std::chrono::microseconds(1450));
+			p_ring.signal_done(target);
 		}
 	});
 }
@@ -185,6 +189,7 @@ static void test_mixdown_renders() {
 	CHECK(port.output_latency_ms() > 0.0);
 
 	stop.store(true);
+	ring0.wakeup();
 	feeder.join();
 	na.close(); // joins the NullPort audio thread + the mix render thread
 	CHECK(!na.is_open());
@@ -221,14 +226,26 @@ static float measure_one_ring(const char *p_tag, int p_adc_channel, int p_ring_i
 	}
 
 	std::atomic<bool> stop{false};
-	std::thread feeder = start_ring_feeder(*rings[p_ring_index], stop);
+	// Kick transport (M5 T9): every registered ring is kicked + waited on by
+	// the callback, so EVERY ring needs a feeder that answers the kick —
+	// the target ring carries the 0.5 signal, the rest are silent.
+	std::vector<std::thread> feeders;
+	for (int i = 0; i < (int)rings.size(); i++) {
+		const float v = (i == p_ring_index) ? 0.5f : 0.0f;
+		feeders.push_back(start_ring_feeder(*rings[i], stop, v));
+	}
 	CHECK(na.set_mixer(mix.pd, 16, 2));
 	CHECK(na.has_mixer());
 	sleep_ms(300);
 
 	const float peak = port.last_out_peak();
 	stop.store(true);
-	feeder.join();
+	for (auto &r : rings) {
+		r->wakeup();
+	}
+	for (auto &f : feeders) {
+		f.join();
+	}
 	na.close();
 	CHECK(!na.has_mixer());
 	pd_instance_teardown(mix);
@@ -270,6 +287,7 @@ static void test_no_mixer_is_silence() {
 	CHECK(port.last_out_peak() == 0.0f);
 
 	stop.store(true);
+	ring0.wakeup();
 	feeder.join();
 	na.close();
 	std::printf("no_mixer_is_silence done (frames=%llu, peak=%.3f)\n",
@@ -277,21 +295,16 @@ static void test_no_mixer_is_silence() {
 }
 
 /**
- * 4: with_mixer_lock serializes the MIX THREAD's process_float with control
- * ops — while the control thread holds the lock, the mix-down's output is
- * FROZEN (no new block is pushed), but the real-time DRAIN keeps rendering
- * (frames advance, latest block repeated). After release the mix resumes and
- * the output follows the input again.
- *
- * The feeder ramps its value up over time, so a frozen mix produces a
- * constant drained peak while a live one keeps climbing.
+ * 4: with_mixer_lock serializes the real-time callback's mix render with
+ * control ops — while the control thread holds mix_render_lock_, the
+ * callback's render blocks on it (it binds + processes the mix under that
+ * lock), so the NullPort STALLS (frames don't advance); after release the
+ * callback resumes and frames advance again.
  */
 static void test_with_mixer_lock_serializes() {
 	char text[512];
 	std::snprintf(text, sizeof(text), kAdcPatchTemplate, 1);
 	write_patch("na_t4_lock.pd", text);
-	// Small instance: the test only needs a non-null mixer so the mix thread
-	// renders (the null-mixer path returns before the lock).
 	PdInstance mix = init_pd_instance(2, 2, "na_t4_lock.pd");
 	CHECK(mix.file_handle != nullptr);
 
@@ -300,63 +313,53 @@ static void test_with_mixer_lock_serializes() {
 	CHECK(na.open(&port, 2, 2, 256, 44100));
 	CHECK(na.set_mixer(mix.pd, 2, 2));
 
-	// Ramping feeder: 0.1 rising ~0.002 per 64-frame block at worker pace.
 	MixInputRing ring0(2, 64, 8);
 	na.register_worker_ring(&ring0);
 	std::atomic<bool> stop{false};
 	std::thread feeder([&ring0, &stop]() {
-		std::vector<float> block(64 * 2, 0.0f);
-		uint64_t i = 0;
-		while (!stop.load(std::memory_order_relaxed)) {
-			const float v = 0.1f + 0.002f * (float)i;
-			std::fill(block.begin(), block.end(), v);
+		std::vector<float> block(64 * 2, 0.5f);
+		while (true) {
+			// Kick-driven (M5 T9): block on the ring's CV until kicked.
+			const int target = ring0.wait_for_kick(stop);
+			if (target < 0) {
+				break;
+			}
 			ring0.push(block.data(), 64);
-			++i;
-			std::this_thread::sleep_for(std::chrono::microseconds(1450));
+			ring0.signal_done(target);
 		}
 	});
 
-	// Wait until the mix is actually rendering (the mix thread has pushed
-	// and the drain has delivered a non-silent block).
+	// Wait until the callback is actually rendering ([adc~ 1] *~ 1.0 -> 0.5).
 	int waited = 0;
-	while (port.last_out_peak() < 0.05f && waited < 1000) {
+	while (port.last_out_peak() < 0.4f && waited < 1000) {
 		sleep_ms(10);
 		waited += 10;
 	}
-	CHECK(port.last_out_peak() >= 0.05f);
-	sleep_ms(300); // steady state: the mix follows the ramp
+	CHECK(port.last_out_peak() >= 0.4f);
 
+	// While the control thread holds the lock, the callback's render blocks
+	// on mix_render_lock_, so the NullPort stalls (frames don't advance);
+	// after release it resumes.
 	const uint64_t f0 = port.frames_rendered();
-	bool frozen = true;
-	float held_peak = 0.0f;
+	uint64_t f_during = 0;
 	{
-		// While the control thread holds the lock, the mix thread's
-		// process_float cannot run, so the drained peak must NOT move —
-		// while the real-time drain KEEPS rendering (frames advance).
 		na.with_mixer_lock([&]() {
-			sleep_ms(120);
-			const float p0 = port.last_out_peak();
-			const float p1 = port.last_out_peak();
-			held_peak = p0;
-			if (std::fabs(p1 - p0) > 0.02f) {
-				frozen = false; // the mix advanced while the lock was held
-			}
+			sleep_ms(150);
+			f_during = port.frames_rendered();
 		});
 	}
-	CHECK(frozen);
+	CHECK(f_during - f0 < 5); // stalled while the lock was held
 	const uint64_t f1 = port.frames_rendered();
-	CHECK(f1 - f0 >= 10); // the drain rendered ~20 blocks through the hold
-
-	sleep_ms(150); // after release the mix must resume + catch up the ramp
-	CHECK(port.frames_rendered() > f1);
-	CHECK(port.last_out_peak() - held_peak > 0.08f);
+	sleep_ms(120); // resume
+	CHECK(port.frames_rendered() - f1 >= 5); // advanced after release
 
 	stop.store(true);
+	ring0.wakeup();
 	feeder.join();
 	na.close();
 	pd_instance_teardown(mix);
-	std::printf("with_mixer_lock_serializes done (frames=%llu)\n",
-			(unsigned long long)port.frames_rendered());
+	std::printf("with_mixer_lock_serializes done (stalled=%llu, resumed=%llu)\n",
+			(unsigned long long)(f_during - f0), (unsigned long long)(port.frames_rendered() - f1));
 }
 
 /** One a1 synth worker: pinned thread, its own instance, set_instance ONCE. */
@@ -385,10 +388,16 @@ static void *synth_worker_main(void *p_arg) {
 	std::snprintf(patch, sizeof(patch), "na_t4_synth%d.pd", w->id);
 	libpd_openfile(patch, "/tmp");
 	std::vector<float> buf(64 * 2, 0.0f);
-	while (!w->stop->load(std::memory_order_relaxed)) {
+	while (true) {
+		// Kick-driven (M5 T9): block on the ring's CV until the callback
+		// kicks this worker (reliable wakeup; no self-pacing).
+		const int target = w->ring->wait_for_kick(*w->stop);
+		if (target < 0) {
+			break;
+		}
 		libpd_process_float(1, nullptr, buf.data()); // 1 tick = one 64-frame block
 		w->ring->push(buf.data(), 64);
-		std::this_thread::sleep_for(std::chrono::microseconds(1451));
+		w->ring->signal_done(target);
 	}
 	return nullptr;
 }
@@ -439,6 +448,9 @@ static void test_nine_concurrent_regression() {
 	CHECK(port.last_out_peak() > 0.02f); // ring0's sine reaches [adc~ 1] *~ 0.25
 
 	stop.store(true);
+	for (auto &r : rings) {
+		r->wakeup();
+	}
 	for (auto &w : workers) {
 		pthread_join(w.thread, nullptr);
 	}

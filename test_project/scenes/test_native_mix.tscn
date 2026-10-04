@@ -1,6 +1,6 @@
-[gd_scene load_steps=2 format=3 uid="uid://bm5_native_mix"]
+[gd_scene format=3 uid="uid://core1upd6g8oh"]
 
-[ext_resource type="Script" path="res://scripts/test_native_mix.gd" id="1_mix"]
+[ext_resource type="Script" uid="uid://be0d4cuiu6ken" path="res://scripts/test_native_mix.gd" id="1_mix"]
 
-[node name="TestNativeMix" type="Node"]
+[node name="TestNativeMix" type="Node" unique_id=1888475521]
 script = ExtResource("1_mix")

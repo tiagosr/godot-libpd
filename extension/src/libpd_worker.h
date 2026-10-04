@@ -99,6 +99,24 @@ public:
 		}
 	}
 
+	/**
+	 * Initialise the global pd state exactly once (process-lifetime). Safe
+	 * from any thread; the MIXER mix-down is created on the main thread
+	 * (T8 root-cause fix) and the first worker INIT also needs it, so this is
+	 * shared rather than inline in execute_command.
+	 */
+	static void init_pd_globals_once();
+
+	/**
+	 * Adopt a pd instance that was already created on the calling (main) thread
+	 * (MIXER, T8 root-cause fix: the mix-down must be created on the main
+	 * thread, not the MIXER worker, or the cross-thread create->render path
+	 * corrupts the heap). The worker only records it + installs its hooks on
+	 * its own thread; it does NOT call libpd_new_instance / libpd_init_audio.
+	 * Must be called before the worker thread processes the INIT command.
+	 */
+	void adopt_precreated_instance(t_pdinstance *p_pd, int p_samplerate, int p_n_out);
+
 	/** Push a command (thread-safe). */
 	void push_command(const PdCommand &p_command);
 
@@ -186,6 +204,9 @@ private:
 	int n_out = 2;
 	int samplerate = 44100;
 	std::chrono::steady_clock::time_point next_tick{};
+	// True when the instance was created on the main thread (MIXER) and the
+	// worker only adopts it. The INIT command then skips new_instance/init_audio.
+	bool has_precreated_instance_ = false;
 };
 
 } // namespace godot_libpd

@@ -1,1 +1,11 @@
 native_audio_spike
+# T8 root-cause repro build artifacts + scratch sources (not committed)
+mix_cb_repro_asan
+mix_cb_repro2_asan
+mix_cb_repro3_asan
+dylibtest/
+# scratch repro sources
+mix_cb_repro.cpp
+mix_cb_repro2.cpp
+mix_cb_repro3.cpp
+rt_repro.cpp

@@ -151,9 +151,14 @@ static std::thread start_ring_feeder(MixInputRing &p_ring, std::atomic<bool> &p_
 		float p_value = 0.5f) {
 	return std::thread([&p_ring, &p_stop, p_value]() {
 		std::vector<float> block(64 * 2, p_value);
-		while (!p_stop.load(std::memory_order_relaxed)) {
+		while (true) {
+			// Kick-driven (M5 T9): block on the ring's CV until kicked.
+			const int target = p_ring.wait_for_kick(p_stop);
+			if (target < 0) {
+				break;
+			}
 			p_ring.push(block.data(), 64);
-			std::this_thread::sleep_for(std::chrono::microseconds(1450));
+			p_ring.signal_done(target);
 		}
 	});
 }
@@ -411,6 +416,7 @@ static void test_k_gather_end_to_end() {
 	std::thread feeder = start_ring_feeder(ring, stop);
 	sleep_ms(300);
 	stop = true;
+	ring.wakeup();
 	feeder.join();
 
 	const uint64_t blocks = port.frames_rendered();
@@ -465,6 +471,29 @@ static void test_synth_worker_end_to_end() {
 	worker.set_dsp(true);
 
 	sleep_ms(400);
+
+	// Frequency-continuity check (M5 T9 fix): the worker renders K blocks per
+	// kick, so the gathered window must be a CONTIGUOUS slice of the 200 Hz
+	// sine — not one fresh block plus 3 stale blocks from earlier ticks (an
+	// atonal, discontinuous hum). A clean 200 Hz sine over 256 frames (~5.8 ms)
+	// has ~1.16 periods -> ~2 zero-crossings on a channel; a discontinuous
+	// gather has far more. So the count must stay small.
+	{
+		std::vector<float> window(2 * 256, 0.0f);
+		ring.gather_latest_n(window.data(), 4); // K = 256 / 64 = 4 blocks
+		int zero_crossings = 0;
+		for (int f = 1; f < 256; ++f) {
+			const float a = window[2 * f - 2]; // left channel, frame f-1
+			const float b = window[2 * f];     // left channel, frame f
+			if ((a < 0.0f && b >= 0.0f) || (a >= 0.0f && b < 0.0f)) {
+				++zero_crossings;
+			}
+		}
+		CHECK(zero_crossings >= 1);   // real audio, not silence
+		CHECK(zero_crossings <= 5);   // contiguous 200 Hz sine, not an atonal hum
+		std::printf("  [freq-continuity] zero_crossings=%d (expect ~2 for 200Hz/256f)\n",
+				zero_crossings);
+	}
 
 	const uint64_t blocks = port.frames_rendered();
 	CHECK(blocks > 20);

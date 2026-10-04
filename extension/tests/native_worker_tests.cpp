@@ -189,9 +189,12 @@ static void test_synth_worker_pushes_to_ring() {
 	CHECK(load_patch(worker, patch.path) == 0);
 	worker.set_dsp(true);
 
-	// The worker paces one 64-frame tick every 64/44100 s (~1.45 ms), so
-	// ~100 blocks land in 150 ms.
-	sleep_ms(150);
+	// Kick-driven (M5 T9): the worker blocks on the ring's condition variable
+	// and renders exactly one 64-frame block per kick (no self-pacing). Kick,
+	// wait for the worker to finish its block, then gather.
+	std::atomic<bool> closing{false};
+	ring.kick(1);
+	ring.wait_done(1, closing);
 
 	std::vector<float> dst(2 * bs, 0.0f);
 	CHECK(ring.gather_latest(dst.data(), bs) == bs);

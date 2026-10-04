@@ -139,8 +139,7 @@ public:
 	bool has_worker_ring(MixInputRing *p_ring) const;
 
 private:
-	void mix_render_loop(); // dedicated, real-time-paced mix render thread
-	void render_block(float *p_dev_in, float *p_dev_out, int p_frames); // AudioPort callback: ring drain only
+	void render_block(float *p_dev_in, float *p_dev_out, int p_frames); // AudioPort callback: renders the mix-down
 
 	AudioPort *port_ = nullptr;
 
@@ -170,23 +169,21 @@ private:
 	struct _pdinstance *mix_pd_ = nullptr;
 	std::atomic<bool> mixer_bound_{false}; // set_mixer() accepted / clear_mixer() released
 
-	// Stereo mix-output ring: the mix render thread pushes each rendered
-	// stream block; the real-time callback drains it (latest block,
-	// silence when unbound). C++17 std::atomic_load/atomic_store on the
-	// shared_ptr: the callback loads a local copy that keeps the ring
-	// alive for its gather even if clear_mixer() unpublishes mid-drain —
-	// no use-after-free, no lock on the real-time path.
-	std::shared_ptr<MixInputRing> mix_out_ring_;
+	// Set by close() BEFORE the audio port is stopped, so the real-time
+	// callback's wait_done() can abort if the synth workers stop first (they
+	// will not signal done once stopped, and an unbounded wait would hang the
+	// audio thread — and hence the close() join — forever).
+	std::atomic<bool> closing_{false};
 
-	// The dedicated mix render thread + its stop flag (mix_render_loop
-	// paces itself: one stream block per blocksize_/samplerate_).
-	std::thread mix_render_thread_;
-	std::atomic<bool> mix_running_{false};
-
-	// Serializes the mix render thread's libpd_process_float with the
-	// MIXER worker's control-plane ops (with_mixer_lock) — and nothing
-	// else: the real-time drain path takes NO lock (Task 8 rework).
+	// Serializes the real-time callback's mix render (render_block) with the
+	// MIXER worker's control-plane ops (with_mixer_lock) and with
+	// clear_mixer()'s unbind, so a freed mix instance is never rendered.
 	std::mutex mix_render_lock_;
+
+	// Callback-driven synth kick (M5 T9): monotonic tick counter, incremented
+	// by render_block under mix_render_lock_ (callback thread only, no atomics
+	// needed). Each ring's kick_seq_ is set to this value to request a render.
+	int tick_seq_ = 0;
 };
 
 } // namespace godot_libpd

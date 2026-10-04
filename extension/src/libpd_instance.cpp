@@ -204,6 +204,31 @@ bool LibpdInstance::init(int p_samplerate, int p_n_ins, int p_n_out) {
 					p_fn();
 				}
 			};
+			// Option A (T8 root-cause fix): create the mix-down instance on the
+			// MAIN thread, not the MIXER worker. Cross-thread create->render
+			// (worker creates, the PortAudio callback renders) was the heap-
+			// corruption trigger; creating on the main thread + rendering on the
+			// callback (mode-0 repro) is stable. The worker adopts this instance
+			// (INIT) and owns the teardown (closefile/free_instance).
+			godot_libpd::LibpdWorker::init_pd_globals_once();
+			t_pdinstance *mix_pd = libpd_new_instance();
+			if (mix_pd == nullptr) {
+				_emit_failure(-1, "mix-down: libpd_new_instance failed");
+				return false;
+			}
+			libpd_set_instance(mix_pd);
+			const int err = libpd_init_audio(p_n_ins, p_n_out, p_samplerate);
+			if (err != 0) {
+				libpd_free_instance(mix_pd);
+				_emit_failure(-1, "mix-down: libpd_init_audio failed");
+				return false;
+			}
+			// Enable pd's dsp for this instance. The worker never calls
+			// libpd_process_float for MIXER — the PortAudio callback does.
+			libpd_start_message(1);
+			libpd_add_float(1.0f);
+			libpd_finish_message("pd", "dsp");
+			worker.adopt_precreated_instance(mix_pd, p_samplerate, p_n_out);
 		} else {
 			cfg.role = godot_libpd::LibpdWorker::WorkerRole::SYNTH;
 			synth_ring = new godot_libpd::MixInputRing(2, libpd_blocksize(), 8);
