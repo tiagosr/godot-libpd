@@ -1,10 +1,16 @@
 # godot-libpd v2 (M5/M6): Native audio backends (a2) + audio input — Design
 
-Status: proposed, **architecture revised 2026-10-03** (Approach A's single
-shared RT thread is infeasible for multi-instance — pd global state breaks on
-`pd_this` switching; revised to per-instance workers + a mix-down instance
-rendered in the PortAudio callback; repro-validated at 9 concurrent instances).
-See §2 constraints, §4, §4.5, §10.
+Status: **M5 (macOS + Linux) COMPLETE — verified 2026-10-04** (commit
+ed2fe5c6e1): 8 kick-driven SYNTH workers + mix-down rendered in the PortAudio
+callback, clean summed chord, no crackle, no heap corruption, no atonal hum.
+M6 (Android AAudio) pending. Architecture revised 2026-10-03 (Approach A's
+single shared RT thread is infeasible for multi-instance — pd global state
+breaks on `pd_this` switching; revised to per-instance workers + a mix-down
+instance rendered in the PortAudio callback; repro-validated at 9 concurrent
+instances). Crackle fixed 2026-10-04 by making the PortAudio callback the
+single clock (callback-driven synth kick; see
+`2026-10-04-godot-libpd-callback-driven-synth-kick.md`). See §2 constraints,
+§4, §4.5, §10.
 Supersedes nothing; extends `2026-09-27-godot-libpd-gdextension-design.md`
 (the v1 spec listed "native audio backends a2: CoreAudio / OpenSL ES / ALSA"
 and "audio input / microphone capture" as v2 items, and left the sink behind
