@@ -303,6 +303,16 @@ like `instance_print`):
 | `instance_float(instance_id, receiver, value)` | float (double messages fold in) |
 | `instance_symbol(instance_id, receiver, symbol)` | symbol |
 | `instance_list(instance_id, receiver, items)` | mixed `Array`: float items as float64, symbol items as String (≤16 items; pointer items dropped) |
+| `instance_list_typed(instance_id, receiver, items)` | same message, explicit encoding: each item is a `[type, value]` tuple — `type` is `"float"` or `"symbol"`, `value` the float64 / String |
+
+The two list signals carry identical information; pick one per
+subscription. The typed path keeps the type explicit in the payload
+(itself uniform with the message-level model, where the signal name
+IS the type — a bang has no value and is simply
+`instance_bang`, which the implicit mixed-Array form cannot
+represent). pd lists contain only float / symbol / pointer atoms —
+there is no bang atom, so the typed tuple set is complete for what
+patches can actually send.
 
 `unsubscribe_receiver(name)` stops delivery (idempotent); all
 subscriptions are released when the instance's worker shuts down.

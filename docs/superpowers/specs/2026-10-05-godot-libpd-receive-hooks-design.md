@@ -29,8 +29,13 @@ GDScript subscribes to those names on the instance. No pd source patching.
 2. **Delivery: server-level signals** — `instance_bang`, `instance_float`,
    `instance_symbol`, `instance_list` — with `instance_id` first, matching
    `instance_print`'s shape. No receiver filtering; the subscribed name
-   arrives in the payload. The list signal carries a mixed Godot `Array`
-   (float64 / String elements — the Godot value type IS the type identifier).
+   arrives in the payload. List arrives on TWO paths carrying identical
+   data: `instance_list` (mixed Godot `Array` — float64 / String elements,
+   value type is the identifier) and `instance_list_typed` (each item an
+   explicit `[type, value]` tuple, type = `"float"` / `"symbol"`) — the
+   user required the explicit path: the implicit form cannot represent a
+   bang (no Godot Variant type), and pd list atoms are only float/symbol/
+   pointer (no bang atom), so the typed tuple set is complete.
 3. **Pipeline = the existing print-hook path** — worker hook → `PdEvent` →
    `PdEventRing` → main-thread drain → signal. No new threads/queues/locks;
    the hook path stays allocation-free (LIST encodes into fixed arrays).

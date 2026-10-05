@@ -109,6 +109,7 @@ void LibpdServer::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("instance_float", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::FLOAT, "value")));
 	ADD_SIGNAL(MethodInfo("instance_symbol", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::STRING, "symbol")));
 	ADD_SIGNAL(MethodInfo("instance_list", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::ARRAY, "items")));
+	ADD_SIGNAL(MethodInfo("instance_list_typed", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::ARRAY, "items")));
 
 	// MIDI input signals — emitted from _process() (main thread only);
 	// 60 Hz granularity, spec §3/§4.
@@ -741,14 +742,31 @@ void LibpdServer::_drain_ring() {
 				// (the Godot value type IS the type identifier; spec ruling 2).
 				Array items;
 				items.resize((int64_t)e.n_items);
+				// Second path (instance_list_typed): each item is an explicit
+				// [type, value] tuple — type is "float" or "symbol"; the value
+				// type alone does not identify the item (user ruling: explicit
+				// types, uniform with the message-level type model).
+				Array items_typed;
+				items_typed.resize((int64_t)e.n_items);
 				for (uint32_t i = 0; i < e.n_items && i < (uint32_t)godot_libpd::PdEvent::k_max_list_items; i++) {
 					if (e.list_is_symbol[i]) {
 						items[i] = String(e.list_syms[i]);
+						Array tuple;
+						tuple.resize(2);
+						tuple[0] = String("symbol");
+						tuple[1] = String(e.list_syms[i]);
+						items_typed[i] = tuple;
 					} else {
 						items[i] = (double)e.list_floats[i];
+						Array tuple;
+						tuple.resize(2);
+						tuple[0] = String("float");
+						tuple[1] = (double)e.list_floats[i];
+						items_typed[i] = tuple;
 					}
 				}
 				emit_signal("instance_list", (int64_t)e.instance_id, String(e.data), items);
+				emit_signal("instance_list_typed", (int64_t)e.instance_id, String(e.data), items_typed);
 				break;
 			}
 		}
