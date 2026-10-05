@@ -92,6 +92,8 @@ void LibpdInstance::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("start_dsp"), &LibpdInstance::start_dsp);
 	ClassDB::bind_method(D_METHOD("stop_dsp"), &LibpdInstance::stop_dsp);
 	ClassDB::bind_method(D_METHOD("send_pd_message", "receiver", "args"), &LibpdInstance::send_pd_message);
+	ClassDB::bind_method(D_METHOD("subscribe_receiver", "name"), &LibpdInstance::subscribe_receiver);
+	ClassDB::bind_method(D_METHOD("unsubscribe_receiver", "name"), &LibpdInstance::unsubscribe_receiver);
 	ClassDB::bind_method(D_METHOD("set_parameter", "path", "value"), &LibpdInstance::set_parameter);
 	ClassDB::bind_method(D_METHOD("send_midi", "channel", "pitch", "velocity"), &LibpdInstance::send_midi);
 
@@ -464,6 +466,32 @@ void LibpdInstance::send_pd_message(const String &p_receiver, const PackedString
 	cmd.path = p_receiver.utf8().get_data();
 	cmd.args = msg.utf8().get_data();
 	worker.push_command(cmd);
+}
+
+int LibpdInstance::subscribe_receiver(const String &p_name) {
+	if (!worker.is_running()) {
+		return -1;
+	}
+	godot_libpd::PdCommand cmd;
+	cmd.opcode = godot_libpd::PdCommand::SUBSCRIBE;
+	cmd.path = p_name.utf8().get_data();
+	return wait_for_command([&cmd, this](std::shared_ptr<std::promise<int>> *slot) {
+		cmd.result = slot;
+		worker.push_command(cmd);
+	});
+}
+
+void LibpdInstance::unsubscribe_receiver(const String &p_name) {
+	if (!worker.is_running()) {
+		return;
+	}
+	godot_libpd::PdCommand cmd;
+	cmd.opcode = godot_libpd::PdCommand::UNSUBSCRIBE;
+	cmd.path = p_name.utf8().get_data();
+	wait_for_command([&cmd, this](std::shared_ptr<std::promise<int>> *slot) {
+		cmd.result = slot;
+		worker.push_command(cmd);
+	});
 }
 
 void LibpdInstance::set_parameter(const String &p_path, double p_value) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 
 namespace godot_libpd {
@@ -9,17 +10,47 @@ namespace godot_libpd {
  * One event a worker thread (or a hook running on one) pushes toward the
  * main thread. Plain C struct: no Godot types, no allocation.
  */
+
+/**
+ * Truncate p_src so it fits in p_max bytes on a UTF-8 boundary and
+ * write it NUL-terminated into p_dst (capacity p_max + 1). A multi-
+ * byte character straddling the boundary is dropped whole. Shared
+ * by the print and receive-hook emit paths (spec: receive-hooks).
+ */
+inline void pd_event_truncate_utf8(const char *p_src, char *p_dst, int p_max) {
+	size_t len = std::strlen(p_src);
+	if (len > (size_t)p_max) {
+		len = (size_t)p_max;
+		while (len > 0 && ((static_cast<unsigned char>(p_src[len]) & 0xC0) == 0x80)) {
+			len--;
+		}
+	}
+	std::memcpy(p_dst, p_src, len);
+	p_dst[len] = '\0';
+}
+
 struct PdEvent {
+	static constexpr int k_max_list_items = 16;
 	enum Type : uint32_t {
 		PRINT = 0,    // data[0..] = UTF-8 text (NUL-terminated, truncated to 63 bytes)
 		NOTE_ON = 1,  // data[0]=channel, data[1]=pitch, data[2]=velocity
 		DSP_ACTIVE = 2, // data[0] = bool
+		BANG = 3,     // data = `receive` name
+		FLOAT = 4,    // data = `receive` name, fval = value
+		SYMBOL = 5,   // data = `receive` name, sval = symbol text
+		LIST = 6,     // data = `receive` name, list_* arrays (n_items items)
 	};
 
 	int64_t instance_id = 0;
 	uint32_t type = PRINT;
 	uint32_t _pad = 0;
 	char data[64] = {};
+	char sval[32] = {}; // SYMBOL only
+	float fval = 0.0f;  // FLOAT only
+	uint32_t n_items = 0; // LIST only (0..k_max_list_items)
+	float list_floats[k_max_list_items] = {};
+	char list_syms[k_max_list_items][32] = {};
+	uint8_t list_is_symbol[k_max_list_items] = {};
 };
 
 /**

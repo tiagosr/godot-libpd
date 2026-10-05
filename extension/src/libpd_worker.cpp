@@ -41,6 +41,34 @@ void c_printhook(const char *p_s) {
 	}
 }
 
+void c_banghook(const char *p_recv) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr && p_recv != nullptr) {
+		ctx->emit_bang(p_recv);
+	}
+}
+
+void c_floathook(const char *p_recv, float p_x) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr && p_recv != nullptr) {
+		ctx->emit_float(p_recv, p_x);
+	}
+}
+
+void c_symbolhook(const char *p_recv, const char *p_symbol) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr && p_recv != nullptr && p_symbol != nullptr) {
+		ctx->emit_symbol(p_recv, p_symbol);
+	}
+}
+
+void c_listhook(const char *p_recv, int p_argc, t_atom *p_argv) {
+	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
+	if (ctx != nullptr && p_recv != nullptr) {
+		ctx->emit_list(p_recv, p_argc, p_argv);
+	}
+}
+
 void c_noteonhook(int p_channel, int p_pitch, int p_velocity) {
 	auto *ctx = static_cast<LibpdWorker *>(libpd_get_instancedata());
 	if (ctx != nullptr) {
@@ -247,6 +275,75 @@ void LibpdWorker::emit_note_on(int p_channel, int p_pitch, int p_velocity) {
 	config.on_event(e);
 }
 
+void LibpdWorker::emit_bang(const char *p_recv) {
+	if (!config.on_event) {
+		return;
+	}
+	PdEvent e;
+	e.instance_id = config.instance_id;
+	e.type = PdEvent::BANG;
+	pd_event_truncate_utf8(p_recv, e.data, 63);
+	config.on_event(e);
+}
+
+void LibpdWorker::emit_float(const char *p_recv, float p_value) {
+	if (!config.on_event) {
+		return;
+	}
+	PdEvent e;
+	e.instance_id = config.instance_id;
+	e.type = PdEvent::FLOAT;
+	pd_event_truncate_utf8(p_recv, e.data, 63);
+	e.fval = p_value;
+	config.on_event(e);
+}
+
+void LibpdWorker::emit_symbol(const char *p_recv, const char *p_symbol) {
+	if (!config.on_event) {
+		return;
+	}
+	PdEvent e;
+	e.instance_id = config.instance_id;
+	e.type = PdEvent::SYMBOL;
+	pd_event_truncate_utf8(p_recv, e.data, 63);
+	pd_event_truncate_utf8(p_symbol, e.sval, 31);
+	config.on_event(e);
+}
+
+void LibpdWorker::emit_list(const char *p_recv, int p_argc, t_atom *p_argv) {
+	if (!config.on_event) {
+		return;
+	}
+	PdEvent e;
+	e.instance_id = config.instance_id;
+	e.type = PdEvent::LIST;
+	pd_event_truncate_utf8(p_recv, e.data, 63);
+	const int n = (p_argc < 0) ? 0 : p_argc;
+	for (int i = 0; i < n && i < PdEvent::k_max_list_items; i++) {
+		switch (p_argv[i].a_type) {
+			case A_FLOAT:
+			e.list_floats[i] = p_argv[i].a_w.w_float;
+			e.list_is_symbol[i] = 0;
+			break;
+			case A_SYMBOL: {
+				const char *sym = p_argv[i].a_w.w_symbol ? p_argv[i].a_w.w_symbol->s_name : "";
+				pd_event_truncate_utf8(sym, e.list_syms[i], 31);
+				e.list_is_symbol[i] = 1;
+				break;
+			}
+			default:
+				// Pointer items are dropped (documented limitation).
+				e.n_items = i;
+				i = n; // stop
+				break;
+			}
+		if (i < n) {
+			e.n_items = i + 1;
+		}
+	}
+	config.on_event(e);
+}
+
 void LibpdWorker::install_midi_output_hooks(void *p_worker_ptr) {
 	libpd_set_noteonhook(c_noteonhook);
 	libpd_set_controlchangehook(c_controlchangehook);
@@ -256,6 +353,13 @@ void LibpdWorker::install_midi_output_hooks(void *p_worker_ptr) {
 	libpd_set_polyaftertouchhook(c_polyaftertouchhook);
 	libpd_set_midibytehook(c_midibytehook);
 	libpd_set_instancedata(p_worker_ptr, nullptr);
+}
+
+void LibpdWorker::install_message_output_hooks() {
+	libpd_set_banghook(c_banghook);
+	libpd_set_floathook(c_floathook);
+	libpd_set_symbolhook(c_symbolhook);
+	libpd_set_listhook(c_listhook);
 }
 
 void LibpdWorker::run() {
@@ -390,6 +494,10 @@ void LibpdWorker::run() {
 				close_patch();
 				wlog(config.instance_id, "teardown: libpd_closefile done");
 			}
+			for (auto &b : bound_receivers_) {
+				libpd_unbind(b.second);
+			}
+			bound_receivers_.clear();
 			if (pd_instance != nullptr) {
 				wlog(config.instance_id, "teardown: libpd_free_instance start");
 				libpd_free_instance(pd_instance);
@@ -426,6 +534,7 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 					out_buffer.resize((size_t)blocksize * n_out);
 					libpd_set_printhook(c_printhook);
 					install_midi_output_hooks(this);
+					install_message_output_hooks();
 					wlog(config.instance_id, "INIT: done (adopted, blocksize=%d)", blocksize);
 					fulfill(0);
 					return;
@@ -458,6 +567,7 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 				out_buffer.resize((size_t)blocksize * n_out);
 				libpd_set_printhook(c_printhook);
 				install_midi_output_hooks(this);
+				install_message_output_hooks();
 				wlog(config.instance_id, "INIT: done (blocksize=%d)", blocksize);
 				fulfill(0);
 			});
@@ -597,6 +707,44 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			for (uint32_t i = 0; i < len; i++) {
 				libpd_sysex(0, p_command.midi[i]);
 			}
+			return;
+		}
+		case PdCommand::SUBSCRIBE: {
+			// Host-side receive subscription (libpd_bind): creates a virtual
+			// [r name] in THIS instance whose messages fire the receive hooks.
+			// Runs on the worker thread so the thread-local pd_this is this
+			// instance (per-instance symbol table).
+			const std::string name = p_command.path;
+			if (name.empty()) {
+				fulfill(-1);
+				return;
+			}
+			for (const auto &b : bound_receivers_) {
+				if (b.first == name) {
+					fulfill(-1); // duplicate bind
+					return;
+				}
+			}
+			void *handle = libpd_bind(name.c_str());
+			if (handle == nullptr) {
+				fulfill(-1);
+				return;
+			}
+			bound_receivers_.push_back({name, handle});
+			fulfill(0);
+			return;
+		}
+		case PdCommand::UNSUBSCRIBE: {
+			const std::string name = p_command.path;
+			for (auto it = bound_receivers_.begin(); it != bound_receivers_.end(); ++it) {
+				if (it->first == name) {
+					libpd_unbind(it->second);
+					bound_receivers_.erase(it);
+					break;
+				}
+			}
+			// Idempotent: unknown names are a no-op.
+			fulfill(0);
 			return;
 		}
 		case PdCommand::STOP_THREAD: {

@@ -141,6 +141,14 @@ public:
 	void emit_print(const char *p_text);
 	/// Called by the C noteonhook (worker thread context).
 	void emit_note_on(int p_channel, int p_pitch, int p_velocity);
+	/// Called by the C banghook (worker thread context).
+	void emit_bang(const char *p_recv);
+	/// Called by the C floathook (worker thread context).
+	void emit_float(const char *p_recv, float p_value);
+	/// Called by the C symbolhook (worker thread context).
+	void emit_symbol(const char *p_recv, const char *p_symbol);
+	/// Called by the C listhook (worker thread context).
+	void emit_list(const char *p_recv, int p_argc, t_atom *p_argv);
 
 	/**
 	 * Install the pd output hooks that feed midi_out (noteon, controlchange,
@@ -151,6 +159,13 @@ public:
 	 * (un)setting while DSP is stopped).
 	 */
 	static void install_midi_output_hooks(void *p_worker_ptr);
+
+	/**
+	 * Install the receive-object hooks that surface patch -> host messages
+	 * (bang/float/double/symbol) as PdEvents (spec: receive-hooks). Same
+	 * thread/INIT constraints as install_midi_output_hooks.
+	 */
+	static void install_message_output_hooks();
 
 	/**
 	 * Bounded MIDI output queue (spec §4). Worker thread pushes from pd
@@ -204,6 +219,9 @@ private:
 	int n_out = 2;
 	int samplerate = 44100;
 	std::chrono::steady_clock::time_point next_tick{};
+	// Host-side receive subscriptions (SUBSCRIBE/UNSUBSCRIBE): name +
+	// libpd_bind handle; unbound all at teardown.
+	std::vector<std::pair<std::string, void *>> bound_receivers_;
 	// True when the instance was created on the main thread (MIXER) and the
 	// worker only adopts it. The INIT command then skips new_instance/init_audio.
 	bool has_precreated_instance_ = false;

@@ -30,6 +30,8 @@ struct PdCommand {
 		MIDI_POLY_AFTERTOUCH = 11, // i32 = channel, i64 = pitch*256+pressure
 		MIDI_BYTE = 12,           // i64 = byte (0-255)
 		MIDI_SYSEX = 13,          // midi_len bytes in midi[0..midi_len-1], F0..F7 inclusive
+		SUBSCRIBE = 14,           // path = receiver name to bind (libpd_bind)
+		UNSUBSCRIBE = 15,         // path = receiver name to unbind
 	};
 
 	uint32_t opcode = 0;

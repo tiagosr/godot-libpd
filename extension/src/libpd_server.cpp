@@ -105,6 +105,10 @@ void LibpdServer::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("instance_print", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "text")));
 	ADD_SIGNAL(MethodInfo("instance_note_on", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::INT, "channel"), PropertyInfo(Variant::INT, "pitch"), PropertyInfo(Variant::INT, "velocity")));
 	ADD_SIGNAL(MethodInfo("instance_dsp_active", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::BOOL, "active")));
+	ADD_SIGNAL(MethodInfo("instance_bang", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver")));
+	ADD_SIGNAL(MethodInfo("instance_float", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::FLOAT, "value")));
+	ADD_SIGNAL(MethodInfo("instance_symbol", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::STRING, "symbol")));
+	ADD_SIGNAL(MethodInfo("instance_list", PropertyInfo(Variant::INT, "instance_id"), PropertyInfo(Variant::STRING, "receiver"), PropertyInfo(Variant::ARRAY, "items")));
 
 	// MIDI input signals — emitted from _process() (main thread only);
 	// 60 Hz granularity, spec §3/§4.
@@ -723,6 +727,30 @@ void LibpdServer::_drain_ring() {
 			case godot_libpd::PdEvent::DSP_ACTIVE:
 				emit_signal("instance_dsp_active", (int64_t)e.instance_id, e.data[0] != 0);
 				break;
+			case godot_libpd::PdEvent::BANG:
+				emit_signal("instance_bang", (int64_t)e.instance_id, String(e.data));
+				break;
+			case godot_libpd::PdEvent::FLOAT:
+				emit_signal("instance_float", (int64_t)e.instance_id, String(e.data), (double)e.fval);
+				break;
+			case godot_libpd::PdEvent::SYMBOL:
+				emit_signal("instance_symbol", (int64_t)e.instance_id, String(e.data), String(e.sval));
+				break;
+			case godot_libpd::PdEvent::LIST: {
+				// Mixed Array: float items as float64, symbol items as String
+				// (the Godot value type IS the type identifier; spec ruling 2).
+				Array items;
+				items.resize((int64_t)e.n_items);
+				for (uint32_t i = 0; i < e.n_items && i < (uint32_t)godot_libpd::PdEvent::k_max_list_items; i++) {
+					if (e.list_is_symbol[i]) {
+						items[i] = String(e.list_syms[i]);
+					} else {
+						items[i] = (double)e.list_floats[i];
+					}
+				}
+				emit_signal("instance_list", (int64_t)e.instance_id, String(e.data), items);
+				break;
+			}
 		}
 		processed++;
 	}

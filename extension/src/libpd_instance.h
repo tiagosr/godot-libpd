@@ -49,6 +49,12 @@ public:
 
 	/// Send a message to a receiver in the patch (worker-thread execution).
 	void send_pd_message(const String &p_receiver, const PackedStringArray &p_args);
+	/// Subscribe to a receiver name: messages sent to it (via [send name] or
+	/// send_pd_message) fire the instance_bang/float/symbol/list server
+	/// signals. 0 on success, -1 if already subscribed or init failed.
+	int subscribe_receiver(const String &p_name);
+	/// Unsubscribe a previously subscribed receiver name (idempotent).
+	void unsubscribe_receiver(const String &p_name);
 	/// Convenience: send a float to a receiver (e.g. a sig~/(*~) path).
 	void set_parameter(const String &p_path, double p_value);
 	/// Send a MIDI note to the patch's notein objects.

@@ -307,6 +307,23 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp pthread)
     add_test(NAME worker_midi_tests COMMAND $<TARGET_FILE:libpd_worker_midi_tests>)
 
+    # Receive hooks (patch -> host messages): the worker's BANG/FLOAT/SYMBOL
+    # PdEvent emission via the libpd receive hooks (real instance, no DSP).
+    add_executable(libpd_message_hook_tests
+        tests/message_hook_tests.cpp
+        src/libpd_worker.cpp
+        src/core/pd_command_queue.cpp
+        src/core/pd_debug.cpp
+        src/core/pd_audio_sink_generator.cpp
+    )
+    target_include_directories(libpd_message_hook_tests PRIVATE
+        src
+        thirdparty/libpd/libpd_wrapper
+        thirdparty/libpd/libpd_wrapper/util
+    )
+    target_link_libraries(libpd_message_hook_tests PRIVATE libpd_static godot-cpp pthread)
+    add_test(NAME message_hook_tests COMMAND $<TARGET_FILE:libpd_message_hook_tests>)
+
     # Multi-instance regression (P1-1 investigated, disproven): per-instance
     # hook attribution with two real workers + routed fan-out A -> port -> B
     # at the hook level. The fan-out uses the pure header-only

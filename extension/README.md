@@ -278,3 +278,47 @@ See `../docs/superpowers/specs/2026-10-01-godot-libpd-android-midi-design.md`
 (status: implemented), `../docs/superpowers/specs/2026-10-02-godot-libpd-rtmidi-full-design.md`
 (status: implemented), `../docs/superpowers/specs/2026-10-02-godot-libpd-usb-midi-hotplug-design.md`
 (status: implemented), and their plans.
+
+## Patch → GDScript messages (receive hooks)
+
+Patches can message GDScript through the libpd receive hooks. libpd's
+contract: the hooks fire for **host-bound receivers only** —
+`LibpdInstance.subscribe_receiver(name)` creates a virtual `[r name]`
+(`libpd_bind`) in that instance whose incoming messages fire the hooks.
+Patch-side `[receive]` objects do not fire them.
+
+```gdscript
+var inst: LibpdInstance = ...  # initialized
+inst.subscribe_receiver("gd.pitch")          # 0 ok, -1 duplicate/failed
+inst.send_pd_message("gd.pitch", ["64"])     # host -> patch
+# patch: [send gd.volume 0.5]  ->  server.instance_float(inst.id, "gd.volume", 0.5)
+```
+
+Server signals (main thread, one drain per frame; `instance_id` first,
+like `instance_print`):
+
+| signal | payload |
+|---|---|
+| `instance_bang(instance_id, receiver)` | bang to the bound name |
+| `instance_float(instance_id, receiver, value)` | float (double messages fold in) |
+| `instance_symbol(instance_id, receiver, symbol)` | symbol |
+| `instance_list(instance_id, receiver, items)` | mixed `Array`: float items as float64, symbol items as String (≤16 items; pointer items dropped) |
+
+`unsubscribe_receiver(name)` stops delivery (idempotent); all
+subscriptions are released when the instance's worker shuts down.
+
+**Name stealing:** within one instance a symbol binds to exactly one
+receiver, so a subscribed name must NOT also be `[receive]`d by the
+patch — use dedicated send names (the `gd.*` convention). If a patch
+needs both local consumption and host capture, `[send]` to two names.
+Names are per-instance (per-instance symbol table), so the same name
+can be subscribed independently on different instances.
+
+**Control-rate only** — these are control messages (bangs, floats,
+symbols, short lists). Audio-rate work belongs in pd (the mix-down
+instance).
+
+Test app: `test_project/scenes/test_messages.tscn`
+(`test_messages.gd` + `data/msgrecv.pd`, prints `MSG_RECV_OK`).
+See `../docs/superpowers/specs/2026-10-05-godot-libpd-receive-hooks-design.md`
+(status: implemented) and its plan.

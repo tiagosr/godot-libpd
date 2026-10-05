@@ -1,0 +1,4 @@
+#N canvas 0 0 400 200 12;
+#X obj 10 10 r trig;
+#X obj 10 50 send gd.demo.bang;
+#X connect 0 0 1 0;
