@@ -1,0 +1,4 @@
+#N canvas 0 0 200 200 12;
+#X obj 10 10 r track-$1;
+#X obj 10 50 s host.out;
+#X connect 0 0 1 0;

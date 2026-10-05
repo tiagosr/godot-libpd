@@ -332,3 +332,35 @@ Test app: `test_project/scenes/test_messages.tscn`
 (`test_messages.gd` + `data/msgrecv.pd`, prints `MSG_RECV_OK`).
 See `../docs/superpowers/specs/2026-10-05-godot-libpd-receive-hooks-design.md`
 (status: implemented) and its plan.
+
+## Abstraction arguments (`$1`, `$2`, …)
+
+Instantiate a patch as a pd abstraction with creation arguments — the
+patch's `$1 $2 …` are bound to the arguments wherever they appear
+(object args, receiver names, text):
+
+```gdscript
+# data/synth.pd contains:  [r track-$1.volume]  [s track-$1.out]
+inst.load_abstraction("res://data/synth.pd", ["3"])   # Error.OK
+inst.subscribe_receiver("track-3.out")
+inst.send_pd_message("track-3.volume", ["0.5"])
+```
+
+`load_abstraction(name, args)` coexists with `load_patch(path)` (plain
+top-level load). `name` may be a bare name or a path to `name.pd`;
+args are simple tokens (no whitespace / `;` / `,`). `libpd_openfile`
+cannot pass creation arguments, so the worker generates a temp
+top-level loader canvas `[name args…]` in /tmp and loads it — pd's
+standard abstraction machinery does the rest (unknown class →
+`name.pd` from the search path, `$n` substitution); the temp file is
+deleted after load.
+
+Multi-track pattern: one `LibpdInstance` per track, each
+`load_abstraction("synth.pd", [track_index])`, with per-track
+`subscribe_receiver("track-N.…")` — the patch names its own receivers
+by index.
+
+Test app: `test_project/scenes/test_abstraction.tscn`
+(`test_abstraction.gd` + `data/abstr.pd`, prints `ABSTRACTION_OK`).
+See `../docs/superpowers/specs/2026-10-05-godot-libpd-abstraction-args-design.md`
+(status: implemented) and its plan.

@@ -88,6 +88,7 @@ void LibpdInstance::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("init", "samplerate", "n_ins", "n_out"), &LibpdInstance::init, DEFVAL(44100), DEFVAL(0), DEFVAL(2));
 	ClassDB::bind_method(D_METHOD("load_patch", "path", "search_paths"), &LibpdInstance::load_patch, DEFVAL(PackedStringArray()));
+	ClassDB::bind_method(D_METHOD("load_abstraction", "name", "args"), &LibpdInstance::load_abstraction);
 	ClassDB::bind_method(D_METHOD("unload_patch"), &LibpdInstance::unload_patch);
 	ClassDB::bind_method(D_METHOD("start_dsp"), &LibpdInstance::start_dsp);
 	ClassDB::bind_method(D_METHOD("stop_dsp"), &LibpdInstance::stop_dsp);
@@ -370,6 +371,41 @@ int LibpdInstance::load_patch(const String &p_path, const PackedStringArray &p_s
 
 	if (res != 0) {
 		_emit_failure((int)Error::ERR_FILE_NOT_FOUND, "failed to open patch: " + p_path);
+		return (int)Error::ERR_FILE_NOT_FOUND;
+	}
+	has_patch = true;
+	return (int)Error::OK;
+}
+
+int LibpdInstance::load_abstraction(const String &p_name, const PackedStringArray &p_args) {
+	if (!initialized.load()) {
+		_emit_failure(-1, "load_abstraction before init");
+		return (int)Error::ERR_INVALID_DATA;
+	}
+	bool ok = false;
+	const String resolved = resolve_patch_path(p_name, &ok);
+	if (!ok) {
+		_emit_failure((int)Error::ERR_FILE_NOT_FOUND, "abstraction not found: " + p_name);
+		return (int)Error::ERR_FILE_NOT_FOUND;
+	}
+
+	String args;
+	for (int i = 0; i < p_args.size(); i++) {
+		args += (i == 0 ? "" : " ") + p_args[i];
+	}
+
+	godot_libpd::PdCommand cmd;
+	cmd.opcode = godot_libpd::PdCommand::LOAD;
+	cmd.path = resolved.utf8().get_data();
+	cmd.args = args.utf8().get_data();
+	const int res = wait_for_command([&cmd, this](std::shared_ptr<std::promise<int>> *slot) {
+		cmd.result = slot;
+		worker.push_command(cmd);
+	});
+	mlog((uint32_t)worker.instance_id(), "[main] load_abstraction: done (res=%d)", res);
+
+	if (res != 0) {
+		_emit_failure((int)Error::ERR_FILE_NOT_FOUND, "failed to load abstraction: " + p_name);
 		return (int)Error::ERR_FILE_NOT_FOUND;
 	}
 	has_patch = true;

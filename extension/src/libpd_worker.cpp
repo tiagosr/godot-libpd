@@ -4,8 +4,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 
 #include <algorithm>
+#include <unistd.h>
 
 #include "core/pd_debug.h"
 
@@ -580,10 +582,56 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 				const std::string name = p_command.path;
 				// libpd_openfile takes (file, dir).
 				const size_t slash = name.find_last_of("/\\");
-				const std::string file = (slash == std::string::npos) ? name : name.substr(slash + 1);
+				std::string file = (slash == std::string::npos) ? name : name.substr(slash + 1);
 				const std::string dir = (slash == std::string::npos) ? "." : name.substr(0, slash);
 				if (!p_command.search.empty()) {
 					libpd_add_to_search_path(p_command.search.c_str());
+				}
+				if (!p_command.args.empty()) {
+					// Abstraction instantiation with creation arguments
+					// ($1/$2/... substitution; spec: abstraction-args).
+					// libpd_openfile cannot pass arguments, so generate a
+					// temp top-level loader canvas "[name args...]" and load
+					// it: pd's unknown-class fallback (sys_load_lib) loads
+					// name.pd from the search path as an abstraction and
+					// substitutes $n from the loader's creation args.
+					std::string abstr = file;
+					const size_t dot = abstr.rfind(".pd");
+					if (dot != std::string::npos && dot + 3 == abstr.size()) {
+						abstr = abstr.substr(0, dot); // bare name; pd appends .pd
+					}
+					if (!dir.empty() && dir != ".") {
+						libpd_add_to_search_path(dir.c_str());
+					}
+					char tmpl[] = "/tmp/libpd_abstr.XXXXXX";
+					const int fd = mkstemp(tmpl);
+					if (fd < 0) {
+						wlog(config.instance_id, "LOAD: mkstemp failed");
+						fulfill(-1);
+						return;
+					}
+					{
+						std::ofstream out(tmpl, std::ios::binary | std::ios::trunc);
+						std::string text =
+							"#N canvas 0 0 200 100 12;\n"
+							"#X obj 10 10 " + abstr;
+						text += ' ' + p_command.args;
+						text += ";\n";
+						out << text;
+						out.close();
+						::close(fd);
+					}
+					const std::string loader = tmpl; // full path
+					const size_t lslash = loader.find_last_of('/');
+					const std::string lfile = loader.substr(lslash + 1);
+					const std::string ldir = loader.substr(0, lslash);
+					wlog(config.instance_id, "LOAD: abstraction %s args [%s] via loader %s",
+							abstr.c_str(), p_command.args.c_str(), loader.c_str());
+					patch_handle = libpd_openfile(lfile.c_str(), ldir.c_str());
+					std::remove(loader.c_str()); // pd keeps the parsed binbuf
+					wlog(config.instance_id, "LOAD: loader done (ok=%d)", patch_handle != nullptr);
+					fulfill(patch_handle != nullptr ? 0 : -1);
+					return;
 				}
 				wlog(config.instance_id, "LOAD: libpd_openfile start (%s, %s)", file.c_str(), dir.c_str());
 				patch_handle = libpd_openfile(file.c_str(), dir.c_str());

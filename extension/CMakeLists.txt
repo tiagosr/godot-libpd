@@ -324,6 +324,24 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     target_link_libraries(libpd_message_hook_tests PRIVATE libpd_static godot-cpp pthread)
     add_test(NAME message_hook_tests COMMAND $<TARGET_FILE:libpd_message_hook_tests>)
 
+    # Abstraction arguments ($1/$2 instantiation): LOAD with args generates
+    # a temp top-level loader canvas; the temp-dir abstraction's substituted
+    # receiver names are the observable (real instance, no DSP).
+    add_executable(libpd_abstraction_tests
+        tests/abstraction_tests.cpp
+        src/libpd_worker.cpp
+        src/core/pd_command_queue.cpp
+        src/core/pd_debug.cpp
+        src/core/pd_audio_sink_generator.cpp
+    )
+    target_include_directories(libpd_abstraction_tests PRIVATE
+        src
+        thirdparty/libpd/libpd_wrapper
+        thirdparty/libpd/libpd_wrapper/util
+    )
+    target_link_libraries(libpd_abstraction_tests PRIVATE libpd_static godot-cpp pthread)
+    add_test(NAME abstraction_tests COMMAND $<TARGET_FILE:libpd_abstraction_tests>)
+
     # Multi-instance regression (P1-1 investigated, disproven): per-instance
     # hook attribution with two real workers + routed fan-out A -> port -> B
     # at the hook level. The fan-out uses the pure header-only

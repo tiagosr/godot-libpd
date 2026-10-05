@@ -39,6 +39,10 @@ public:
 	/// Open a patch. p_path may be a res:// or absolute path.
 	/// Returns Error::OK on success.
 	int load_patch(const String &p_path, const PackedStringArray &p_search_paths = {});
+	/// Instantiate a pd abstraction with creation arguments ($1/$2/... in the
+	/// patch). p_name: bare name (found via the worker's search path) or a
+	/// path to name.pd; p_args: simple tokens (no whitespace/;/,).
+	int load_abstraction(const String &p_name, const PackedStringArray &p_args);
 	/// Close the current patch (stops dsp first if active).
 	int unload_patch();
 
