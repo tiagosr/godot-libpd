@@ -30,13 +30,6 @@
 // The MIDI I/O thread is the only code that touches open backend
 // handles, so no backend port operation ever leaves the I/O thread.
 
-#ifdef PORTMIDI_ENABLED
-// Kept for midi_open_bounds_tests.cpp, which includes only this
-// header and calls Pm_CountDevices() directly. The router itself no
-// longer touches Pm_* (that is PortMidiBackend's job).
-#include <portmidi.h>
-#endif
-
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>

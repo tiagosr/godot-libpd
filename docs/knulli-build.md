@@ -109,9 +109,9 @@ already isolates the swap).
 ### MIDI I/O (RtMidi — ALSA sequencer; verified on the A133)
 
 v2: MIDI I/O (RtMidi ALSA backend on A133 — `aconnect` loopback
-verified on-device 2026-10-02 with the M3 `RtMidiHostBackend`;
-PortMIDI was the backend until M3, verified 2026-10-01, and remains
-available via `MIDI_BACKEND=portmidi`).
+verified on-device 2026-10-02 with the M3 `RtMidiHostBackend`). The
+M1/M2 PortMIDI backend was retired from the project 2026-10 (the
+upstream patchset remains at `patches/portmidi-upstream/`).
 
 The A133's ALSA sequencer exposes **no SUBS-capable ports**
 (`aconnect -l` shows nothing else, `getPortCount()` == 0 for the
@@ -166,26 +166,26 @@ Caveats:
   feeds back indefinitely (observed on-device: sustained note_on
   re-emission, hundreds of thousands of events per minute). Unwire
   (`aconnect -d`) as soon as verification is done.
-- **Timestamp-queue guard (vendored PortMIDI fix — fallback backend
-  only).** The old PortMIDI ALSA backend stamped each port with a shared
-  seq queue that is lazy-allocated at the first `Pm_Open`; ports created
-  before that carry queue 0, which on the A133 is owned by another
+- **Timestamp-queue guard (upstream PortMIDI patchset — historical
+  context).** The upstream PortMIDI ALSA backend stamped each port with a
+  shared seq queue that is lazy-allocated at the first `Pm_Open`; ports
+  created before that carry queue 0, which on the A133 is owned by another
   client (PipeWire) and Stopped — the kernel never delivers
-tick-timestamped events on a queue the port's client does not own. All
-  virtual ports are created at open time (before the first open), so the
-  vendored PM now keeps the kernel default (real-time) timestamping
-  unless the shared queue already exists. This applies only to the
-  `MIDI_BACKEND=portmidi` build; the default RtMidi backend creates the
-  ports directly and does not use that shared-queue path. `aconnect -l`
+tick-timestamped events on a queue the port's client does not own. The
+  fix (create ports with kernel-default real-time timestamping unless the
+  shared queue already exists) lives in `patches/portmidi-upstream/` for
+  the eventual upstream PR. It does not affect this project's RtMidi
+  backend, which creates the ports directly and does not use that
+  shared-queue path. `aconnect -l`
   / `/proc/asound/seq/queues` show the queue ownership;
   `/proc/asound/seq/ports` does not exist on this kernel (4.9), so
   per-port timestamp flags are not directly observable.
 - **Zero devices is normal here.** Opening an index while the device
   list is empty fails cleanly (a `midi_port_error` signal, no freeze) —
-  router-side index validation plus a backend-side bounds check (for the
-  PortMIDI build this was the vendored `Pm_OpenInput` check; the RtMidi
-  build validates the index against its own enumeration and returns
-  `InvalidParameter`). `Pm_CountDevices()` == 0 made index 0 an
+  router-side index validation plus a backend-side bounds check (the
+  RtMidi backend validates the index against its own enumeration and
+  returns `InvalidParameter`; the PortMIDI build's equivalent was the
+  vendored `Pm_OpenInput` check — now upstream patchset only). `Pm_CountDevices()` == 0 made index 0 an
   out-of-bounds descriptor read on the I/O thread — the original A133
   freeze.
 

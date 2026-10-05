@@ -154,7 +154,7 @@ public:
 
 	/**
 	 * Bounded MIDI output queue (spec §4). Worker thread pushes from pd
-	 * hooks; the MIDI I/O thread (Task 4) drains it for PortMIDI output.
+	 * hooks; the MIDI I/O thread (Task 4) drains it for MIDI output.
 	 */
 	MidiOutputQueue midi_out;
 

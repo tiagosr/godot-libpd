@@ -1,5 +1,9 @@
 # PortMIDI upstream patchset
 
+> **Status (2026-10):** the vendored PortMIDI copy was retired from the
+> project (RtMidi is the only MIDI backend now). This patchset is kept
+> for the eventual pull request to <https://github.com/PortMidi/PortMidi>.
+
 Two fixes for `Pm_OpenInput` / ALSA virtual ports, extracted from the
 `godot-libpd` vendored PortMIDI submodule as a git-applyable patchset
 for a pull request to <https://github.com/PortMidi/PortMidi>.

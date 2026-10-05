@@ -2,8 +2,7 @@
 //
 // CoreMIDI (macOS) + ALSA (Linux) behind the MidiBackend interface.
 // Compiled only for non-Android hosts with RTMIDI_HOST_ENABLED (the
-// factory in midi_backend_factory.cpp picks the backend per platform;
-// MIDI_BACKEND=portmidi restores the M1/M2 PortMIDI path).
+// factory in midi_backend_factory.cpp picks the backend per platform).
 //
 // Recon evidence (M3 Task 0, spec §7): probes/rtmidi_probe_macos.cpp
 // (IAC enumerate/open/note+full-sysex round-trip, openVirtualPort

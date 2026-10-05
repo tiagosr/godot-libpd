@@ -1,10 +1,11 @@
 // MIDI backend abstraction (v2 M2, Task 1 — design spec §3).
 //
 // The seam between the platform MIDI API and MidiRouter. MidiRouter
-// talks to MidiBackend only; every concrete platform call (PortMidi
-// Pm_* on macOS/Linux, RtMidi/AMIDI on Android) lives in one platform
-// backend. Today the only built backend is PortMidiBackend (vendored
-// PortMIDI 2.0.7); the Android RtMidi backend is a later v2 task.
+// talks to MidiBackend only; every concrete platform call lives in one
+// platform backend. The built backends are RtMidi-based: RtMidiHostBackend
+// (CoreMIDI on macOS, ALSA on Linux) and RtMidiAndroidBackend (AMIDI).
+// PortMIDI was the original host backend; it was retired from the
+// project 2026-10 (upstream patchset kept at patches/portmidi-upstream/).
 //
 // Conventions:
 //  - *port index*: the backend's device index (PortMidi: Pm device
@@ -172,8 +173,8 @@ public:
 };
 
 // Builds the platform backend:
-//   macOS/Linux : PortMidiBackend (vendored PortMIDI 2.0.7)
-//   ANDROID     : nullptr for now (RtMidi AMIDI backend, later v2 task)
+//   macOS/Linux : RtMidiHostBackend (CoreMIDI / ALSA)
+//   ANDROID     : RtMidiAndroidBackend (AMIDI)
 //   other hosts : nullptr (no MIDI I/O; the router degrades to the
 //                 inert stub of the pre-v2 builds)
 // The returned backend is uninitialized: the router calls initialize()

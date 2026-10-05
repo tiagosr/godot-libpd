@@ -5,10 +5,10 @@
 // task-4-report.md for the mapping from the brief's illustrative
 // PortMIDI names to the vendored 2.0.7 API.
 //
-// v2 M2 Task 1: this file no longer touches Pm_* — all platform MIDI
-// calls go through the MidiBackend interface (midi_backend.h),
-// implemented by PortMidiBackend on macOS/Linux and (later) the
-// Android RtMidi backend. The lock discipline carries over: no
+// v2 M2 Task 1: this file no longer touches platform MIDI — all platform
+// MIDI calls go through the MidiBackend interface (midi_backend.h),
+// implemented by the RtMidi backends (host: CoreMIDI/ALSA, Android: AMIDI).
+// The lock discipline carries over: no
 // backend call is ever made while a router lock is held.
 
 #include "midi_router.h"
@@ -459,7 +459,7 @@ bool MidiRouter::process_control_ops() {
 
 int MidiRouter::open_port(bool p_is_input, int p_device_index) {
 	// The backend validates the index and opens under one lock scope
-	// (A133 freeze repro — see PortMidiBackend::open_stream); the
+	// (A133 freeze repro — see the backend's open_stream); the
 	// router just maps the backend handle onto a new port record.
 	MidiBackend::PortHandle handle = MidiBackend::NO_HANDLE;
 	const MidiError err = p_is_input

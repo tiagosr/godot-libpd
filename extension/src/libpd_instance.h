@@ -62,7 +62,7 @@ public:
 	void push_midi_command(const godot_libpd::PdCommand &p_command);
 
 	/// The worker's bounded MIDI output queue. The server registers it with
-	/// the router on _enter_tree (MIDI I/O thread drains it for PortMIDI
+	/// the router on _enter_tree (MIDI I/O thread drains it for MIDI
 	/// output); the worker's pd output hooks feed it.
 	godot_libpd::MidiOutputQueue *midi_output_queue() {
 		return &worker.midi_out;

@@ -40,35 +40,17 @@ set(PD_BUILD_C_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/libpd EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
-# PortMidi static (macOS/Linux fallback; no Android — the RtMidi backend
-# there). M3: OFF by default on hosts — the RtMidi host backend is the
-# default; set MIDI_BACKEND=portmidi to restore the M1/M2 build.
-# ---------------------------------------------------------------------------
-set(MIDI_BACKEND "rtmidi" CACHE STRING "Host MIDI backend: rtmidi | portmidi")
-set_property(CACHE MIDI_BACKEND PROPERTY STRINGS rtmidi portmidi)
-option(BUILD_PORTMIDI "Compile PortMIDI into the extension" ON)
-if(ANDROID)
-    set(BUILD_PORTMIDI OFF)
-endif()
-if(NOT ANDROID AND MIDI_BACKEND STREQUAL "rtmidi")
-    set(BUILD_PORTMIDI OFF)
-endif()
-if(BUILD_PORTMIDI)
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    set(BUILD_PORTMIDI_TESTS OFF CACHE BOOL "" FORCE)
-    add_subdirectory(thirdparty/portmidi EXCLUDE_FROM_ALL)
-endif()
-
-# ---------------------------------------------------------------------------
-# RtMidi static. Android: the RtMidiAndroidBackend (AMIDI; the local
-# fixes are pinned at the submodule commit). Hosts (macOS/Linux): the
-# RtMidiHostBackend (M3 Task 1) — CoreMIDI on Apple, ALSA on Linux.
+# RtMidi static (the ONLY MIDI backend). Android: the RtMidiAndroidBackend
+# (AMIDI; the local fixes are pinned at the submodule commit). Hosts
+# (macOS/Linux): the RtMidiHostBackend — CoreMIDI on Apple, ALSA on Linux.
+# (PortMIDI was retired as the in-project backend 2026-10; the upstream
+# patchset remains at patches/portmidi-upstream/.)
 # ---------------------------------------------------------------------------
 set(RTMIDI_HOST OFF)
 if(ANDROID)
     set(RTMIDI_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
     add_subdirectory(thirdparty/rtmidi EXCLUDE_FROM_ALL)
-elseif(NOT ANDROID AND MIDI_BACKEND STREQUAL "rtmidi")
+else()
     set(RTMIDI_HOST ON)
     set(RTMIDI_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
     # Keep the RtMidi sub-tree quiet: no RtMidi demo/test programs, no
@@ -134,7 +116,6 @@ add_library(godot_libpd SHARED
     src/libpd_instance.cpp
     src/libpd_worker.cpp
     src/midi_router.cpp
-    src/midi_backend_portmidi.cpp
     src/midi_backend_rtmidi.cpp
     src/midi_backend_rtmidi_host.cpp
     src/midi_backend_factory.cpp
@@ -162,12 +143,6 @@ target_include_directories(godot_libpd PRIVATE
 )
 
 target_link_libraries(godot_libpd PRIVATE godot-cpp libpd_static)
-if(BUILD_PORTMIDI)
-    target_link_libraries(godot_libpd PRIVATE portmidi)
-    # MidiRouter compiles against the vendored PortMIDI 2.0.7 only when
-    # the backend is built in; otherwise it degrades to inert stubs.
-    target_compile_definitions(godot_libpd PRIVATE PORTMIDI_ENABLED)
-endif()
 if(ANDROID)
     target_link_libraries(godot_libpd PRIVATE rtmidi)
 endif()
@@ -269,7 +244,6 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
     add_executable(midi_backend_fake_tests
         tests/midi_backend_fake_tests.cpp
         src/midi_router.cpp
-        src/midi_backend_portmidi.cpp
         src/midi_backend_factory.cpp
         src/core/pd_midi_framer.cpp
         src/core/pd_command_queue.cpp
@@ -316,34 +290,6 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         endif()
         add_test(NAME midi_rtmidi_host_backend_tests
             COMMAND $<TARGET_FILE:midi_rtmidi_host_backend_tests>)
-    endif()
-
-    if(BUILD_PORTMIDI)
-        # Task 7: PortMIDI virtual device lifecycle (create -> open ->
-        # write -> close -> delete). Host API only; delivery is proven
-        # on-device (A133 aconnect loopback, docs/knulli-build.md).
-        add_executable(midi_virtual_port_tests
-            tests/midi_virtual_port_tests.cpp
-        )
-        target_include_directories(midi_virtual_port_tests PRIVATE src)
-        target_link_libraries(midi_virtual_port_tests PRIVATE portmidi)
-        add_test(NAME midi_virtual_port_tests COMMAND $<TARGET_FILE:midi_virtual_port_tests>)
-
-        # A133 freeze regression (out-of-range PM index on open):
-        # fails fast with the port_error signal; the in-test watchdog
-        # turns a hang regression into a ctest failure instead of
-        # hanging ctest. Links the router itself (the validated layer).
-        add_executable(midi_open_bounds_tests
-            tests/midi_open_bounds_tests.cpp
-            src/midi_router.cpp
-            src/midi_backend_portmidi.cpp
-            src/midi_backend_factory.cpp
-            src/core/pd_midi_framer.cpp
-        )
-        target_include_directories(midi_open_bounds_tests PRIVATE src)
-        target_compile_definitions(midi_open_bounds_tests PRIVATE PORTMIDI_ENABLED)
-        target_link_libraries(midi_open_bounds_tests PRIVATE portmidi pthread)
-        add_test(NAME midi_open_bounds_tests COMMAND $<TARGET_FILE:midi_open_bounds_tests>)
     endif()
 
     add_executable(libpd_worker_midi_tests

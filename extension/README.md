@@ -11,7 +11,6 @@ macOS/Linux, OpenSL ES on Android). See
 |---|---|
 | `thirdparty/godot-cpp` | branch `4.5`, commit `27d9dd2` (godot-4.5-stable-30-g27d9dd2) |
 | `thirdparty/libpd` | `ba0dc63` (libpd 0.16.1, pd vanilla 0.56-5; pure-data submodule @ f009fd8) |
-| `thirdparty/portmidi` | `6be63b7` (v2.0.8-4-g6be63b7; macOS/Linux **fallback** backend behind `MIDI_BACKEND=portmidi`, see `../patches/portmidi-upstream/`) |
 | `thirdparty/rtmidi` | `748eb75` (upstream master `23b8cd5` + 4 local fixes: Android sysex + JavaVM host hook + hotplug-test guard, see below) |
 
 ## Building
@@ -83,14 +82,13 @@ The concrete backend is selected at build time by `src/midi_backend_factory.cpp`
 | Linux | `RtMidiHostBackend` (ALSA) | vendored RtMidi (`thirdparty/rtmidi`) |
 | Android | `RtMidiAndroidBackend` | vendored RtMidi, `ANDROID_AMIDI` API |
 
-RtMidi is the default on **all** platforms (M3). PortMIDI remains
-buildable as a fallback for the macOS/Linux hosts via the CMake option
-`MIDI_BACKEND=portmidi` (restores the M1/M2 `PortMidiBackend`;
-`PortMidiBackend` is still the backend for that build). The router logs
+RtMidi is the **only** MIDI backend on **all** platforms (M3; the M1/M2
+PortMIDI fallback was retired from the project 2026-10 — the upstream
+patchset remains at `../patches/portmidi-upstream/`). The router logs
 `[MIDI] backend=<name>` once at startup so a smoke run shows which backend
 is active.
 
-Both RtMidi backends (and PortMIDI) implement the same godot-free
+Both RtMidi backends implement the same godot-free
 `MidiBackend` interface (`src/midi_backend.h`), so the router and the
 GDScript API are identical across platforms. `tests/midi_backend_fake_tests.cpp`
 pins the interface contract (dual note+CC delivery, full-sysex command,
@@ -135,9 +133,6 @@ does not expose sysex send). A 127-data-byte cap applies per message.
   device-free loopback pair (indices **200** in / **201** out, `WordRing`
   backed) used by the host unit test; macOS uses IAC and the A133 uses
   `aconnect` for real loopback.
-- **Fallback** — `MIDI_BACKEND=portmidi` (CMake) restores PortMIDI on
-  macOS/Linux; the default is RtMidi. The A133 `MIDI_SMOKE_OK` and macOS
-  IAC `MIDI_SMOKE_OK` gates pass on the RtMidi backend.
 
 ### Android specifics (M2)
 
@@ -262,8 +257,6 @@ it never aborts the process).
   negative test clean (unwired re-send produces no new `note_on`);
   baseline `SMOKE_OK`. Full recipe: `../docs/knulli-build.md` →
   "MIDI I/O (RtMidi — ALSA sequencer)".
-- **PortMIDI fallback (M3):** `MIDI_BACKEND=portmidi` builds and its macOS
-  IAC smoke reports `[MIDI] backend=PortMIDI` + `MIDI_SMOKE_OK`.
 - **Hotplug (M4):** A133 (RtMidi ALSA) `HOTPLUG_SMOKE_OK added=1 removed=1`
   (virtual-port add + remove; ALSA reports the full `client:port` name, so
   the smoke matches a name substring); Android (RtMidi) `HOTPLUG_SMOKE_OK

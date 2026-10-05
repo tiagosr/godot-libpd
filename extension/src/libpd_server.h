@@ -37,7 +37,7 @@ class LibpdInstance;
  * No worker thread ever calls into Godot — this is the only thread-crossing
  * mechanism, which keeps the design deadlock-free (spec §4/§5).
  *
- * Also owns the process-wide MidiRouter (MIDI I/O thread, PortMIDI ports,
+ * Also owns the process-wide MidiRouter (MIDI I/O thread, RtMidi ports,
  * input routing to registered LibpdInstances). The I/O thread only enqueues
  * (pull: drain_signal_events() + a pending port-error list); the typed
  * midi_* signals are emitted from _process() like the instance_* signals.
@@ -75,12 +75,12 @@ public:
 
 	// ------------------------------------------------------------------
 	// MIDI I/O API (spec §3; main thread only).
-	// Stub builds (no PortMIDI / BUILD_PORTMIDI=OFF): midi_available()
+	// Stub builds (no platform MIDI backend): midi_available()
 	// is false and every other method push_error()s and returns
 	// -1/no-op; the signals stay declared but never fire.
 	// ------------------------------------------------------------------
 
-	/// True when PortMIDI is initialized (the device list may be empty;
+	/// True when the MIDI backend is initialized (the device list may be empty;
 	/// virtual ports can still be created — see midi_open_virtual_*).
 	bool midi_available();
 	/// PM device indices + names of devices with an input side.
@@ -110,7 +110,7 @@ public:
 	/// The pair appears in midi_list_inputs()/midi_list_outputs() as
 	/// "<p_name> in" / "<p_name> out" (device indices 200/201); open
 	/// them with the ordinary midi_open_input()/midi_open_output().
-	/// PortMidi hosts: unavailable (use IAC / aconnect). Returns 0 on
+	/// RtMidi hosts: unavailable (no virtual-port API; use IAC / aconnect). Returns 0 on
 	/// success, -1 on failure.
 	int midi_create_loopback(const String &p_name);
 	/// Close an open input port (errors surface via the midi_port_error signal).
@@ -232,7 +232,7 @@ private:
 
 	godot_libpd::PdEventRing ring;
 	// Process-wide MIDI router (Task 4). Its constructor starts the MIDI I/O
-	// thread (PortMIDI-enabled builds); its destructor joins it. Callbacks
+	// thread (MIDI-enabled builds); its destructor joins it. Callbacks
 	// are wired in the server constructor; the main-thread side is
 	// _drain_midi_events().
 	godot_libpd::MidiRouter midi_router;

@@ -5,9 +5,6 @@
 [submodule "extension/thirdparty/libpd"]
 	path = extension/thirdparty/libpd
 	url = https://github.com/libpd/libpd.git
-[submodule "extension/thirdparty/portmidi"]
-	path = extension/thirdparty/portmidi
-	url = https://github.com/PortMidi/PortMidi.git
 [submodule "extension/thirdparty/rtmidi"]
 	path = extension/thirdparty/rtmidi
 	url = https://github.com/thestk/rtmidi.git
