@@ -12,22 +12,7 @@ extern "C" {
 #include "z_libpd.h"
 }
 
-// PortAudio terminate-once flag, shared with null_port.h.
-extern "C" {
-#include "portaudio.h"
-}
-
 using namespace godot_libpd;
-
-// PortAudio's Pa_Terminate() is global and one-shot; close() may run from
-// several NativeAudio instances (and tests), so guard it.
-static std::once_flag pa_terminate_once_;
-
-static void terminate_portaudio() {
-	std::call_once(pa_terminate_once_, []() {
-		Pa_Terminate();
-	});
-}
 
 NativeAudio::~NativeAudio() {
 	close();
@@ -93,7 +78,12 @@ void NativeAudio::register_worker_ring(MixInputRing *p_ring) {
 	}
 	for (MixInputRing *r : rings_) {
 		if (r == p_ring) {
-			return; // duplicate
+			// Re-registration (tracked pre-open rings replayed at open time):
+			// refresh the per-kick window + capacity for the ACTUAL stream
+			// blocksize, which may differ from the pre-open default.
+			p_ring->set_mix_blocksize(stream);
+			p_ring->ensure_capacity(stream / p_ring->blocksize());
+			return;
 		}
 	}
 	if (ring_blocksize_ == 0) {
@@ -101,8 +91,12 @@ void NativeAudio::register_worker_ring(MixInputRing *p_ring) {
 	}
 	// Tell the ring how many frames the callback renders per tick, so its
 	// kick-driven SYNTH worker renders that many ring-blocks per kick (a
-	// contiguous window) instead of one block.
+	// contiguous window) instead of one block. The ring must hold at least
+	// that many blocks — a capped gather window leaves the older part of
+	// each mix block silence/stale (warble + crackle; M6' Android 1024-
+	// frame stream vs 8-block rings).
 	p_ring->set_mix_blocksize(stream);
+	p_ring->ensure_capacity(stream / p_ring->blocksize());
 	rings_.push_back(p_ring);
 }
 
@@ -303,5 +297,4 @@ void NativeAudio::close() {
 		rings_.clear();
 		ring_blocksize_ = 0;
 	}
-	terminate_portaudio();
 }

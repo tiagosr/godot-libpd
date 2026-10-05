@@ -9,6 +9,12 @@
 
 #include "libpd_instance.h"
 
+#ifdef NATIVE_AUDIO
+#ifdef __ANDROID__
+#include "core/opensles_port.h"
+#endif
+#endif
+
 using namespace godot;
 
 static LibpdServer *singleton_instance = nullptr;
@@ -166,6 +172,14 @@ bool LibpdServer::audio_open(int p_blocksize, int p_samplerate, int p_mix_in, in
 		UtilityFunctions::push_error(vformat("audio_open: invalid arguments (samplerate=%d, mix_in=%d, mix_out=%d)", p_samplerate, p_mix_in, p_mix_out));
 		return false;
 	}
+#ifdef __ANDROID__
+	// OpenSL ES buffer-queue delivery is smooth only at ≥1024-frame buffers
+	// (M6' T2 device measurement: 256-frame buffers ~26% late). The port has
+	// a fixed 1024-frame buffer; round the stream blocksize up to match it.
+	if (p_blocksize < godot_libpd::OpenSLESPort::frames_per_buffer()) {
+		p_blocksize = godot_libpd::OpenSLESPort::frames_per_buffer();
+	}
+#endif
 	if (native_audio_ == nullptr) {
 		native_audio_ = std::make_unique<godot_libpd::NativeAudio>();
 	}
@@ -177,7 +191,7 @@ bool LibpdServer::audio_open(int p_blocksize, int p_samplerate, int p_mix_in, in
 		port = audio_test_port_.get();
 	} else {
 		if (audio_port_ == nullptr) {
-			audio_port_ = std::make_unique<godot_libpd::PortAudioPort>();
+			audio_port_ = godot_libpd::create_platform_port();
 		}
 		port = audio_port_.get();
 	}
@@ -287,7 +301,7 @@ float LibpdServer::audio_output_latency_ms() {
 
 Array LibpdServer::audio_list_output_devices() {
 	// Listing works on a closed stream, so fall back to a probe port when the
-	// stream is not open (the test port, else a fresh PortAudioPort).
+	// stream is not open (the test port, else a fresh platform port).
 	godot_libpd::AudioPort *port = nullptr;
 	if (audio_open_ && native_audio_ != nullptr && native_audio_->port() != nullptr) {
 		port = native_audio_->port();
@@ -295,7 +309,7 @@ Array LibpdServer::audio_list_output_devices() {
 		port = audio_test_port_.get();
 	} else {
 		if (audio_port_ == nullptr) {
-			audio_port_ = std::make_unique<godot_libpd::PortAudioPort>();
+			audio_port_ = godot_libpd::create_platform_port();
 		}
 		port = audio_port_.get();
 	}
@@ -318,7 +332,7 @@ Array LibpdServer::audio_list_input_devices() {
 		port = audio_test_port_.get();
 	} else {
 		if (audio_port_ == nullptr) {
-			audio_port_ = std::make_unique<godot_libpd::PortAudioPort>();
+			audio_port_ = godot_libpd::create_platform_port();
 		}
 		port = audio_port_.get();
 	}

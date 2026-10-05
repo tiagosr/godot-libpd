@@ -11,13 +11,17 @@
 #include "core/pd_event_ring.h"
 #include "midi_router.h"
 
-#ifdef NATIVE_AUDIO
+// audio_port.h / mix_input_ring.h are platform-free C++ (no audio-backend
+// dependency) — always included: the non-NATIVE_AUDIO stub methods in
+// libpd_server.cpp use their types in their signatures.
 #include <memory>
 
 #include "core/audio_port.h"
 #include "core/mix_input_ring.h"
+
+#ifdef NATIVE_AUDIO
 #include "core/native_audio.h"
-#include "core/portaudio_port.h"
+#include "core/platform_port_factory.h"
 #endif
 
 namespace godot {
@@ -165,11 +169,13 @@ public:
 	/// native audio is present). MIXER worker control ops use this.
 	template <typename F>
 	void audio_with_mixer_lock(F &&p_fn) {
+#ifdef NATIVE_AUDIO
 		if (native_audio_ != nullptr) {
 			native_audio_->with_mixer_lock(std::forward<F>(p_fn));
-		} else {
-			p_fn();
+			return;
 		}
+#endif
+		p_fn();
 	}
 	/// True when this build has the native audio path compiled in (false on
 	/// Android, where the Godot generator path is used).
@@ -197,7 +203,7 @@ public:
 	void audio_unregister_ring(LibpdInstance *p_instance, godot_libpd::MixInputRing *p_ring);
 
 	/// Test seam (host tests cannot open a real device): audio_open() uses
-	/// p_port instead of a PortAudioPort. Must be set while audio is closed.
+	/// p_port instead of the platform port. Must be set while audio is closed.
 	void _set_audio_port_for_test(std::unique_ptr<godot_libpd::AudioPort> p_port);
 
 	void _process(double p_delta) override;
@@ -260,7 +266,7 @@ private:
 	std::unique_ptr<godot_libpd::NativeAudio> native_audio_;
 	// Server-owned PortAudio stream (created on first audio_open). NativeAudio
 	// only borrows the port — exactly one object owns the stream lifecycle.
-	std::unique_ptr<godot_libpd::PortAudioPort> audio_port_;
+	std::unique_ptr<godot_libpd::AudioPort> audio_port_;
 	// Test seam replacement for audio_port_ (e.g. a NullPort); owned here.
 	std::unique_ptr<godot_libpd::AudioPort> audio_test_port_;
 	std::mutex audio_mutex;

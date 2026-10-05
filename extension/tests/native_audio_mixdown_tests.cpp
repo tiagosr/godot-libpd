@@ -255,6 +255,80 @@ static float measure_one_ring(const char *p_tag, int p_adc_channel, int p_ring_i
 }
 
 /** 2: ring i maps to mix input channels 2i, 2i+1 (ring 0 -> ch 1; ring 7 -> ch 16). */
+/**
+ * M6' regression (Android OpenSLESPort): a 1024-frame stream needs
+ * K = 1024/64 = 16 ring blocks per gather window, but the rings are created
+ * with depth 8. register_worker_ring() must widen the ring to cover the
+ * window — otherwise gather_latest_n() caps at the ring depth and the first
+ * half of every mix block is silence/stale (device symptom: warble +
+ * crackle at the 21.5 Hz block-boundary rate).
+ */
+static void test_deep_stream_full_window() {
+	char text[512];
+	std::snprintf(text, sizeof(text), kAdcPatchTemplate, 1);
+	write_patch("na_t_deep.pd", text);
+	PdInstance mix = init_pd_instance(2, 2, "na_t_deep.pd");
+	CHECK(mix.file_handle != nullptr);
+
+	NullPort port;
+	NativeAudio na;
+	CHECK(na.open(&port, 2, 2, 1024, 44100)); // 1024-frame stream (Android shape)
+	CHECK(na.set_mixer(mix.pd, 2, 2));
+
+	MixInputRing ring(2, 64, 8); // shallow: depth 8 < K=16
+	na.register_worker_ring(&ring);
+	CHECK(ring.num_blocks() >= 16); // registration widened the ring
+	CHECK(ring.mix_blocksize() == 1024);
+
+	std::atomic<bool> stop{false};
+	std::thread feeder([&ring, &stop]() {
+		std::vector<float> block(64 * 2, 0.5f);
+		while (true) {
+			const int target = ring.wait_for_kick(stop);
+			if (target < 0) {
+				break;
+			}
+			const int k = ring.mix_blocksize() > ring.blocksize()
+					? ring.mix_blocksize() / ring.blocksize()
+					: 1;
+			for (int i = 0; i < k; ++i) {
+				ring.push(block.data(), 64);
+			}
+			ring.signal_done(target);
+		}
+	});
+
+	// Warm up: let the callback run a few ticks.
+	int waited = 0;
+	while (port.last_out_peak() < 0.4f && waited < 2000) {
+		sleep_ms(10);
+		waited += 10;
+	}
+	CHECK(port.last_out_peak() > 0.4f);
+
+	// The gather window must be FULL: 16 blocks x 64 frames x 2 ch, every
+	// sample the fed value — no silence in the first half (pre-fix the
+	// window capped at 8 blocks and frames 512..1023 were stale/zero).
+	std::vector<float> dst(1024 * 2, 0.0f);
+	const int got = ring.gather_latest_n(dst.data(), 16);
+	CHECK(got == 16);
+	bool full = true;
+	for (int i = 0; i < 1024 * 2; ++i) {
+		if (std::fabs(dst[i] - 0.5f) > 0.01f) {
+			full = false;
+			break;
+		}
+	}
+	CHECK(full);
+
+	stop.store(true);
+	ring.wakeup();
+	feeder.join();
+	na.close();
+	std::printf("deep_stream_full_window done (frames=%llu, peak=%.3f)\n",
+			(unsigned long long)port.frames_rendered(), port.last_out_peak());
+}
+
 static void test_gather_16ch() {
 	// ring 0 fed only: [adc~ 1] sees 0.5, [adc~ 16] sees silence
 	const float ch1_ring0 = measure_one_ring("a", 1, 0);
@@ -468,6 +542,7 @@ int main() {
 	CHECK(libpd_init() == 0);
 
 	test_mixdown_renders();
+	test_deep_stream_full_window();
 	test_gather_16ch();
 	test_no_mixer_is_silence();
 	test_with_mixer_lock_serializes();

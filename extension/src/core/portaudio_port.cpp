@@ -1,20 +1,34 @@
 #include "core/portaudio_port.h"
 
+#include <atomic>
 #include <mutex>
 
 namespace godot_libpd {
 
 namespace {
 
-// Pa_Initialize() exactly once per process. Failures surface through the
-// device queries that every entry point makes (Pa_GetDeviceCount() == 0,
-// no default device).
-std::once_flag g_pa_init_flag;
+// Pa_Initialize()/Pa_Terminate() lifecycle for the whole process:
+// initialized on the first open() of any port, terminated when the LAST
+// live port is destroyed. The library global must stay initialized across
+// the server's open/close cycles (the port object persists between them).
+std::mutex g_pa_mu;
+bool g_pa_initialized = false;
+std::atomic<int> g_pa_port_count{0};
 
 void ensure_portaudio_initialized() {
-	std::call_once(g_pa_init_flag, []() {
+	std::lock_guard<std::mutex> lk(g_pa_mu);
+	if (!g_pa_initialized) {
 		(void)Pa_Initialize();
-	});
+		g_pa_initialized = true;
+	}
+}
+
+void port_destroyed() {
+	std::lock_guard<std::mutex> lk(g_pa_mu);
+	if (g_pa_port_count.fetch_sub(1) == 1 && g_pa_initialized) {
+		Pa_Terminate();
+		g_pa_initialized = false;
+	}
 }
 
 // Scans device d for capability and appends it to p_out if it has the
@@ -33,10 +47,14 @@ void add_device_if_capable(std::vector<AudioDeviceInfo> &p_out, int p_d, bool p_
 
 } // namespace
 
-PortAudioPort::PortAudioPort() = default;
+PortAudioPort::PortAudioPort() {
+	ensure_portaudio_initialized();
+	g_pa_port_count.fetch_add(1);
+}
 
 PortAudioPort::~PortAudioPort() {
 	close();
+	port_destroyed();
 }
 
 int PortAudioPort::pa_cb(const void *p_in, void *p_out, unsigned long p_frames,

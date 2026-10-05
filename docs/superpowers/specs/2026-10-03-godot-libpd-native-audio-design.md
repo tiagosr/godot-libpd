@@ -3,7 +3,10 @@
 Status: **M5 (macOS + Linux) COMPLETE — verified 2026-10-04** (commit
 ed2fe5c6e1): 8 kick-driven SYNTH workers + mix-down rendered in the PortAudio
 callback, clean summed chord, no crackle, no heap corruption, no atonal hum.
-M6 (Android AAudio) pending. Architecture revised 2026-10-03 (Approach A's
+**M6 (Android AAudio) CLOSED BLOCKED 2026-10-05** (AAudio streams never reach
+the RG DS codec — OEM HAL/routing; HAL-direct also silent). **M6' (Android,
+custom `OpenSLESPort : AudioPort` on the OpenSL ES C API) COMPLETE — verified
+on the RG DS 2026-10-05.** Architecture revised 2026-10-03 (Approach A's
 single shared RT thread is infeasible for multi-instance — pd global state
 breaks on `pd_this` switching; revised to per-instance workers + a mix-down
 instance rendered in the PortAudio callback; repro-validated at 9 concurrent
@@ -337,10 +340,24 @@ instance); output is per-instance then mixed.
 |---|---|---|---|
 | macOS | **M5** | `coreaudio` (present) | low latency; default input = built-in mic |
 | Linux / Knulli (arm64) | **M5** | `alsa` (present) | codec is typically 8 kHz mono → block size bounded by HW period; measure on-device (§8.3) |
-| Android / RG DS | **M6** | **new `aaudio` hostapi** (AAudio C API, or Oboe underneath) | AAudio from API 28+ (minSdk 29); the "OpenSL" v1 item is superseded — PortAudio has no OpenSL hostapi, and AAudio is the modern low-latency path |
+| Android / RG DS | **M6' (COMPLETE)** | `OpenSLESPort : AudioPort` (custom, OpenSL ES C API — NDK-shipped; NOT a PortAudio hostapi) | int16 stereo, 2× fixed 1024-frame buffer-queue buffers; 44.1k/48k; AAudio was tried first (M6) and is silent on this OEM build |
 | Windows | future | `wasapi` (+ optional `asio`) (present) | not a target this effort; available for free if wanted |
 
-**M6 backend shape:** a new PortAudio hostapi under
+**M6' backend shape (as built):** `extension/src/core/opensles_port.{h,cpp}` —
+`OpenSLESPort : AudioPort` on the AndroidSimpleBufferQueue source (the same
+shape Godot's own Android audio driver uses). `create_platform_port()`
+(`core/platform_port_factory.{h,cpp}`) returns `PortAudioPort` on host /
+`OpenSLESPort` on `__ANDROID__`; `NATIVE_AUDIO` is now ON on Android (the
+mix-down render path compiles everywhere; PortAudio is NOT built on Android).
+Device-verified constraints: int16 only (no float PCM format in the NDK
+OpenSL headers); 44100/48000 only (SL_SAMPLINGRATE_* constants); 256-frame
+buffers deliver bursty on the RG DS → fixed 1024-frame buffers + server-side
+blocksize round-up; **ring-depth invariant** — `MixInputRing::ensure_capacity`
+widens each synth ring to ≥ stream_blocksize/ring_blocksize at registration
+(a capped gather window truncates every mix block → warble + crackle).
+The original AAudio hostapi plan below is superseded (M6 closed BLOCKED).
+
+**M6 backend shape (SUPERSEDED — historical):** a new PortAudio hostapi under
 `src/hostapi/aaudio/` implementing the `PaHostApi` vtable (init/teardown,
 device enumeration via `AAudio_*_Availability`/`AAudio_get*`, open/close/
 start/stop stream, buffer-size/latency queries, and the

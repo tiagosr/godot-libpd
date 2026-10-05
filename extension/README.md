@@ -1,7 +1,8 @@
 # godot-libpd GDExtension
 
 Multi-instance, worker-threaded libpd (Pure Data) GDExtension for Godot 4.6,
-with Godot-native audio (AudioStreamGenerator). See
+with native multi-instance audio (mix-down backend: PortAudio on
+macOS/Linux, OpenSL ES on Android). See
 `../docs/superpowers/specs/2026-09-27-godot-libpd-gdextension-design.md`.
 
 ## Pinned third-party versions

@@ -42,7 +42,7 @@ public:
 	 *   instance, so the worker never calls libpd_process_float; its
 	 *   RT-sensitive control ops run under config.with_mixer_lock.
 	 */
-	enum class WorkerRole { SYNTH, MIXER, ANDROID };
+	enum class WorkerRole { SYNTH, MIXER, GENERATOR };
 
 	struct Config {
 		int64_t instance_id = 0;
@@ -53,8 +53,8 @@ public:
 		// Hook event delivery (thread-safe; may be null).
 		std::function<void(const PdEvent &)> on_event;
 
-		// M5 role (default: ANDROID — the existing a1/generator behavior).
-		WorkerRole role = WorkerRole::ANDROID;
+		// M5 role (default: GENERATOR — the existing a1/generator behavior).
+		WorkerRole role = WorkerRole::GENERATOR;
 		// SYNTH only: ring the DSP loop pushes rendered blocks to instead
 		// of config.sink. null = SYNTH renders to nowhere.
 		MixInputRing *worker_ring = nullptr;

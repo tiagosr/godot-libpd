@@ -141,7 +141,7 @@ static float block_peak(const float *p_block, int p_n) {
  */
 static void test_config_default_is_android() {
 	LibpdWorker::Config cfg;
-	CHECK(cfg.role == LibpdWorker::WorkerRole::ANDROID);
+	CHECK(cfg.role == LibpdWorker::WorkerRole::GENERATOR);
 	CHECK(cfg.worker_ring == nullptr);
 	CHECK(!cfg.with_mixer_lock);
 	CHECK(cfg.sink == nullptr);
@@ -278,7 +278,7 @@ static void test_android_worker_still_renders() {
 
 	LibpdWorker::Config cfg;
 	cfg.instance_id = 52;
-	cfg.role = LibpdWorker::WorkerRole::ANDROID; // explicit (== the default)
+	cfg.role = LibpdWorker::WorkerRole::GENERATOR; // explicit (== the default)
 	cfg.samplerate = 44100;
 	cfg.n_ins = 0;
 	cfg.n_out = 2;

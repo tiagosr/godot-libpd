@@ -1,6 +1,6 @@
 # M6' — Android Native Audio via `OpenSLESPort` (OpenSL ES)
 
-Status: **ACTIVE** (2026-10-05)
+Status: **COMPLETE** (2026-10-05) — Android native audio via `OpenSLESPort`
 Supersedes: `docs/superpowers/plans/2026-10-05-godot-libpd-aaudio-android.md` (M6, closed as BLOCKED)
 Spec: `docs/superpowers/specs/2026-10-03-godot-libpd-native-audio-design.md`
 
@@ -44,15 +44,18 @@ Spec: `docs/superpowers/specs/2026-10-03-godot-libpd-native-audio-design.md`
   `audio_open()` returns false → `audio_open_` stays false → instances keep
   the a1 generator sinks. No new fallback code.
 
-## New files
+## New files (as built)
 
 - `extension/src/core/opensles_port.{h,cpp}` — `OpenSLESPort : AudioPort`.
 - `extension/src/core/platform_port_factory.{h,cpp}` — `create_platform_port()`.
-- `extension/thirdparty/opensl-asl/ASL/*.h` — OpenSL ES API headers
-  (AOSP `frameworks/native` @ android14-release, `opengl/include/ASL/`),
-  + `README.md` (provenance, license Apache-2.0).
-- `spike/opensl/opensles_spike.c` — device gate spike (scratch, gitignored
-  build output).
+- OpenSL ES headers: **NOT vendored** — the NDK r25 sysroot ships
+  `SLES/OpenSLES.h` + `SLES/OpenSLES_Android.h` (simple-buffer-queue API,
+  raw-pointer Enqueue — no AOSP `SLBufferItf`) and
+  `libOpenSLES.so` for arm64-v8a. T1 resolved to "nothing to vendor".
+- `spike/opensl/opensles_spike.c` — device gate spike (committed;
+  argv: rate [int16] [frames] [nbuf]; dumps enqueued PCM to tone.wav).
+- `extension/src/core/mix_input_ring.h`: `ensure_capacity()` — ring-depth
+  invariant fix (see T5 finding below).
 
 ## OpenSL ES design notes
 
@@ -74,6 +77,19 @@ Spec: `docs/superpowers/specs/2026-10-03-godot-libpd-native-audio-design.md`
 - Latency: estimate from `SLPlayIt_Temporal` latency query where possible,
   else `buffer_count * blocksize / rate * 1000` (best-effort).
 - Stream usage: `AUDIO_STREAM_MUSIC` (the path the user verified works).
+
+## T5 on-device finding (ring-depth invariant)
+
+First on-device run of the full pipeline (8 synths + mix-down) was
+warble + crackle. Root cause: the 1024-frame stream needs a 16-block gather
+window (K = 1024/64), but synth rings are created with depth 8 —
+`gather_latest_n()` capped the window at 8 blocks, leaving the first half
+of every mix block silence/stale (a 21.5 Hz on/off pattern = warble +
+crackle). macOS (256-frame stream, K=4) never hit the cap. Fix:
+`MixInputRing::ensure_capacity(stream/ring_blocksize)` called from
+`NativeAudio::register_worker_ring()` (safe: before the first kick the
+worker is blocked in wait_for_kick); host regression test
+test_deep_stream_full_window. Post-fix device run: clean chord.
 
 ## Tasks
 

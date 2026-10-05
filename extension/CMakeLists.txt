@@ -92,14 +92,15 @@ elseif(NOT ANDROID AND MIDI_BACKEND STREQUAL "rtmidi")
 endif()
 
 # ---------------------------------------------------------------------------
-# Native audio (M5): vendored PortAudio built in place (the pd-bundled copy
-# has no CMakeLists; compile its C sources directly). macOS (CoreAudio) +
-# Linux (ALSA); OFF on Android, which keeps the a1 Godot-generator path
-# until M6. NATIVE_AUDIO compiles the mix-down render path into the extension.
+# Native audio (M5 + M6'): the mix-down render path is compiled into the
+# extension on ALL platforms (NATIVE_AUDIO ON). The backend AudioPort is
+# platform-specific: PortAudio (CoreAudio on macOS, ALSA on Linux) built in
+# place from the pd-bundled copy (no Android hostapi upstream), OpenSL ES on
+# Android (NDK-shipped headers + libOpenSLES). PortAudio is NOT built on
+# Android.
 # ---------------------------------------------------------------------------
-set(NATIVE_AUDIO OFF)
+set(NATIVE_AUDIO ON)
 if(NOT ANDROID)
-    set(NATIVE_AUDIO ON)
     set(PA_ROOT thirdparty/libpd/pure-data/portaudio/portaudio)
     file(GLOB PA_COMMON_SOURCES ${PA_ROOT}/src/common/*.c)
     file(GLOB PA_UNIX_SOURCES ${PA_ROOT}/src/os/unix/*.c)
@@ -186,20 +187,26 @@ if(RTMIDI_HOST)
     target_compile_definitions(godot_libpd PRIVATE RTMIDI_HOST_ENABLED)
 endif()
 
-# M5 native audio: the mix-down render path (PortAudio callback) + the
-# PortAudio stream object. NATIVE_AUDIO is OFF on Android (a1 generator).
+# M5/M6' native audio: the mix-down render path + the platform AudioPort
+# (PortAudio host, OpenSL ES on Android).
 if(NATIVE_AUDIO)
     target_sources(godot_libpd PRIVATE
         src/core/native_audio.cpp
-        src/core/portaudio_port.cpp)
-    target_link_libraries(godot_libpd PRIVATE portaudio_lib)
+        src/core/platform_port_factory.cpp)
     target_compile_definitions(godot_libpd PRIVATE NATIVE_AUDIO)
-    if(APPLE)
-        target_link_libraries(godot_libpd PRIVATE
-            "-framework CoreAudio" "-framework CoreFoundation"
-            "-framework CoreServices" "-framework AudioToolbox")
+    if(ANDROID)
+        target_sources(godot_libpd PRIVATE src/core/opensles_port.cpp)
+        target_link_libraries(godot_libpd PRIVATE openSLES)
     else()
-        target_link_libraries(godot_libpd PRIVATE asound)
+        target_sources(godot_libpd PRIVATE src/core/portaudio_port.cpp)
+        target_link_libraries(godot_libpd PRIVATE portaudio_lib)
+        if(APPLE)
+            target_link_libraries(godot_libpd PRIVATE
+                "-framework CoreAudio" "-framework CoreFoundation"
+                "-framework CoreServices" "-framework AudioToolbox")
+        else()
+            target_link_libraries(godot_libpd PRIVATE asound)
+        endif()
     endif()
 endif()
 

@@ -193,6 +193,29 @@ public:
 		return blocksize_;
 	}
 
+	/**
+	 * Control-thread only (safe at ring registration: before the first kick
+	 * the worker is blocked in wait_for_kick() and pushes nothing): grow the
+	 * ring to at least p_min_blocks so the consumer's gather window
+	 * (stream_blocksize / ring_blocksize) is never capped by ring depth. A
+	 * capped window leaves the older part of each mix block silence/stale
+	 * (device symptom: warble + crackle at the block-boundary rate).
+	 * Growing resets the fill state: gathers return silence until the window
+	 * refills (one stream block of startup silence).
+	 */
+	void ensure_capacity(int p_min_blocks) {
+		if (p_min_blocks <= 0) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (p_min_blocks <= num_blocks_) {
+			return;
+		}
+		num_blocks_ = p_min_blocks;
+		storage_.assign((size_t)num_blocks_ * slot_samples(), 0.0f);
+		count_ = 0;
+	}
+
 	int num_blocks() const {
 		return num_blocks_;
 	}
