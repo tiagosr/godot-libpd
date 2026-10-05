@@ -22,7 +22,7 @@
 
 #define PI 3.14159265358979323846
 
-static double kSampleRate = 44100.0;
+static double kSampleRate = 48000.0;
 static double kFreq = 440.0;
 static double phase = 0.0;
 static long cb_calls = 0;
@@ -58,7 +58,8 @@ static void dump_result(const char *what, aaudio_result_t r) {
     }
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    if (argc > 1) kSampleRate = atof(argv[1]);
     printf("[aaudio_spike] start\n");
     fflush(stdout);
 
