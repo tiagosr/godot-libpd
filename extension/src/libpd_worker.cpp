@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "core/pd_debug.h"
+#include "core/pdexternals.h"
 
 namespace godot_libpd {
 
@@ -178,7 +179,11 @@ void LibpdWorker::init_pd_globals_once() {
 		const int err = libpd_init();
 		if (err != 0) {
 			std::fprintf(stderr, "godot-libpd: libpd_init() failed (%d)\n", err);
+			return;
 		}
+		// Register the vendored externals (cyclone + else) once per process;
+		// the classes reach every instance (see core/pdexternals.h).
+		register_pdexternals();
 	});
 }
 

@@ -8,3 +8,11 @@
 [submodule "extension/thirdparty/rtmidi"]
 	path = extension/thirdparty/rtmidi
 	url = https://github.com/thestk/rtmidi.git
+[submodule "extension/thirdparty/cyclone"]
+	path = extension/thirdparty/cyclone
+	url = https://github.com/porres/pd-cyclone.git
+	branch = master
+[submodule "extension/thirdparty/else"]
+	path = extension/thirdparty/else
+	url = https://github.com/porres/pd-else.git
+	branch = master

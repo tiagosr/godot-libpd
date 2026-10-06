@@ -599,6 +599,13 @@ bool LibpdInstance::dsp_active() const {
 }
 
 uint64_t LibpdInstance::debug_blocks_pushed() const {
+#ifdef NATIVE_AUDIO
+	// Native builds render through the PortAudio callback; the worker pushes
+	// to synth_ring, not the Godot sink (the sink stays at 0 there).
+	if (synth_ring != nullptr) {
+		return synth_ring->blocks_pushed();
+	}
+#endif
 	return sink.blocks_pushed();
 }
 

@@ -40,6 +40,12 @@ set(PD_BUILD_C_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/libpd EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
+# Vendored pd externals (cyclone + else) - static, control + sound
+# generation scope; registration via core/pdexternals.cpp.
+# ---------------------------------------------------------------------------
+include(cmake/pdexternals.cmake)
+
+# ---------------------------------------------------------------------------
 # RtMidi static (the ONLY MIDI backend). Android: the RtMidiAndroidBackend
 # (AMIDI; the local fixes are pinned at the submodule commit). Hosts
 # (macOS/Linux): the RtMidiHostBackend — CoreMIDI on Apple, ALSA on Linux.
@@ -124,6 +130,7 @@ add_library(godot_libpd SHARED
     src/core/pd_midi_framer.cpp
     src/core/pd_debug.cpp
     src/core/pd_audio_sink_generator.cpp
+    src/core/pdexternals.cpp
 )
 if(ANDROID)
     # bionic lacks glob(3) below API 28; libpd links it (see file header).
@@ -142,7 +149,7 @@ target_include_directories(godot_libpd PRIVATE
     thirdparty/libpd/libpd_wrapper/util
 )
 
-target_link_libraries(godot_libpd PRIVATE godot-cpp libpd_static)
+target_link_libraries(godot_libpd PRIVATE godot-cpp libpd_static cyclone pdelse)
 if(ANDROID)
     target_link_libraries(godot_libpd PRIVATE rtmidi)
 endif()
@@ -298,13 +305,14 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         src/core/pd_command_queue.cpp
         src/core/pd_debug.cpp
         src/core/pd_audio_sink_generator.cpp
+        src/core/pdexternals.cpp
     )
     target_include_directories(libpd_worker_midi_tests PRIVATE
         src
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp pthread)
+    target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
     add_test(NAME worker_midi_tests COMMAND $<TARGET_FILE:libpd_worker_midi_tests>)
 
     # Receive hooks (patch -> host messages): the worker's BANG/FLOAT/SYMBOL
@@ -315,13 +323,14 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         src/core/pd_command_queue.cpp
         src/core/pd_debug.cpp
         src/core/pd_audio_sink_generator.cpp
+        src/core/pdexternals.cpp
     )
     target_include_directories(libpd_message_hook_tests PRIVATE
         src
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_message_hook_tests PRIVATE libpd_static godot-cpp pthread)
+    target_link_libraries(libpd_message_hook_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
     add_test(NAME message_hook_tests COMMAND $<TARGET_FILE:libpd_message_hook_tests>)
 
     # Abstraction arguments ($1/$2 instantiation): LOAD with args generates
@@ -333,14 +342,34 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         src/core/pd_command_queue.cpp
         src/core/pd_debug.cpp
         src/core/pd_audio_sink_generator.cpp
+        src/core/pdexternals.cpp
     )
     target_include_directories(libpd_abstraction_tests PRIVATE
         src
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_abstraction_tests PRIVATE libpd_static godot-cpp pthread)
+    target_link_libraries(libpd_abstraction_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
     add_test(NAME abstraction_tests COMMAND $<TARGET_FILE:libpd_abstraction_tests>)
+
+    # Vendored pd externals (cyclone + else): control objects, non-
+    # alphanumeric objects, audio-rate objects (real instance; the audio
+    # test renders into a DrySink).
+    add_executable(libpd_external_tests
+        tests/external_tests.cpp
+        src/libpd_worker.cpp
+        src/core/pd_command_queue.cpp
+        src/core/pd_debug.cpp
+        src/core/pd_audio_sink_generator.cpp
+        src/core/pdexternals.cpp
+    )
+    target_include_directories(libpd_external_tests PRIVATE
+        src
+        thirdparty/libpd/libpd_wrapper
+        thirdparty/libpd/libpd_wrapper/util
+    )
+    target_link_libraries(libpd_external_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
+    add_test(NAME external_tests COMMAND $<TARGET_FILE:libpd_external_tests>)
 
     # Multi-instance regression (P1-1 investigated, disproven): per-instance
     # hook attribution with two real workers + routed fan-out A -> port -> B
@@ -353,13 +382,14 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         src/core/pd_command_queue.cpp
         src/core/pd_debug.cpp
         src/core/pd_audio_sink_generator.cpp
+        src/core/pdexternals.cpp
     )
     target_include_directories(multi_instance_midi_tests PRIVATE
         src
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(multi_instance_midi_tests PRIVATE libpd_static godot-cpp pthread)
+    target_link_libraries(multi_instance_midi_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
     add_test(NAME multi_instance_midi_tests COMMAND $<TARGET_FILE:multi_instance_midi_tests>)
 
     # M5 native audio. Pure (no godot-cpp): libpd + the core C++ + PortAudio.
@@ -398,6 +428,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             src/libpd_worker.cpp
             src/core/pd_command_queue.cpp
             src/core/pd_debug.cpp
+            src/core/pdexternals.cpp
         )
         target_include_directories(native_worker_tests PRIVATE
             src
@@ -405,7 +436,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             thirdparty/libpd/libpd_wrapper/util
         )
         target_compile_definitions(native_worker_tests PRIVATE NATIVE_AUDIO)
-        target_link_libraries(native_worker_tests PRIVATE libpd_static pthread)
+        target_link_libraries(native_worker_tests PRIVATE libpd_static cyclone pdelse pthread)
         add_test(NAME native_worker_tests COMMAND $<TARGET_FILE:native_worker_tests>)
 
         # T6: server audio API + ring wiring (Option B end-to-end, NullPort).
@@ -415,6 +446,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             src/libpd_worker.cpp
             src/core/pd_command_queue.cpp
             src/core/pd_debug.cpp
+            src/core/pdexternals.cpp
         )
         target_include_directories(server_audio_tests PRIVATE
             src
@@ -423,7 +455,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             thirdparty/libpd/pure-data/src
         )
         target_compile_definitions(server_audio_tests PRIVATE NATIVE_AUDIO)
-        target_link_libraries(server_audio_tests PRIVATE libpd_static portaudio_lib pthread)
+        target_link_libraries(server_audio_tests PRIVATE libpd_static portaudio_lib cyclone pdelse pthread)
         if(APPLE)
             target_link_libraries(server_audio_tests PRIVATE
                 "-framework CoreAudio" "-framework CoreFoundation"

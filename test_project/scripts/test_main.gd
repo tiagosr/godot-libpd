@@ -10,6 +10,7 @@ extends Control
 ## 1 on failure). Used by all platform verifications.
 
 const PATCH := "res://data/test_patch.pd"
+const PATCH_EXTERNALS := "res://data/external_patch.pd" # cyclone + else objects
 const MAX_LOG_LINES := 20
 
 # --smoke diagnostics: a flushed progress file (survives a hard kill, unlike
@@ -171,6 +172,32 @@ func _run_smoke() -> void:
 	if inst.load_patch(PATCH) != Error.OK:
 		_smoke_log("SMOKE_FAIL load"); _finish_smoke(1); return
 	_smoke_log("step2 load ok")
+	# 2b) externals: the vendored cyclone + else objects must be
+	#     registered in-process (else [op + 1] + cyclone [phasor~]).
+	_smoke_log("step2b load external patch")
+	if inst.load_patch(PATCH_EXTERNALS) != Error.OK:
+		_smoke_log("SMOKE_FAIL externals load"); _finish_smoke(1); return
+	_smoke_log("step2b externals load ok")
+	# 2c) native audio: open the PortAudio mix stream AND bind a MIXER
+	#     instance - the render callback only kicks the synth rings once
+	#     a mixer is bound (same flow as test_native_mix), so without it
+	#     the kick-driven SYNTH worker renders nothing.
+	_smoke_log("step2c audio_open + mixer")
+	if not Libpd.server.audio_available():
+		_smoke_log("SMOKE_FAIL audio_available"); _finish_smoke(1); return
+	if not Libpd.server.audio_open(256, _mix_rate):
+		_smoke_log("SMOKE_FAIL audio_open"); _finish_smoke(1); return
+	var mixer := LibpdInstance.new()
+	add_child(mixer)
+	mixer.set_role(1) # ROLE_MIXER
+	if not mixer.init(_mix_rate, 16, 2):
+		_smoke_log("SMOKE_FAIL mixer init"); _finish_smoke(1); return
+	if mixer.load_patch("res://data/mixdown_16.pd") != Error.OK:
+		_smoke_log("SMOKE_FAIL mixer load"); _finish_smoke(1); return
+	if not Libpd.server.set_mixer(mixer):
+		_smoke_log("SMOKE_FAIL set_mixer"); _finish_smoke(1); return
+	mixer.start_dsp()
+	_smoke_log("step2c mixer bound")
 	# 3) start dsp, expect rendered blocks
 	if inst.start_dsp() != Error.OK:
 		_smoke_log("SMOKE_FAIL start"); _finish_smoke(1); return
@@ -182,14 +209,18 @@ func _run_smoke() -> void:
 	# 4) send a note, expect a print
 	var got_print := []
 	Libpd.server.instance_print.connect(func(id, text):
-		if "test_patch" in text:
-			got_print.append(1))
+		if "test_patch" in text or "external_patch" in text:
+			got_print.append(text))
 	inst.send_midi(0, 60, 100)
 	_smoke_log("step4 midi sent, await 0.5s")
 	await get_tree().create_timer(0.5).timeout
 	_smoke_log("step4 woke, got_print=%d" % got_print.size())
 	if got_print.is_empty():
 		_smoke_log("SMOKE_FAIL print"); _finish_smoke(1); return
+	var got_external := got_print.any(func(t): return t.strip_edges().begins_with("external_patch") and t.ends_with("61"))
+	if not got_external:
+		_smoke_log("SMOKE_FAIL externals print: %s" % str(got_print)); _finish_smoke(1); return
+	_smoke_log("step4 externals confirmed (else op: 60+1=61)")
 	# 5) spawn a second instance, run, free it
 	_smoke_log("step5 second instance new+init+load+start")
 	var inst2 := LibpdInstance.new()
@@ -203,12 +234,15 @@ func _run_smoke() -> void:
 	inst2.queue_free()
 	await get_tree().process_frame
 	_smoke_log("step5 inst2 freed (dtor+worker.join done)")
-	# 6) stop + free first, success
+	# 6) stop + free first, free the mixer, success
 	_smoke_log("step6 stopping+freeing first")
 	inst.stop_dsp()
 	inst.queue_free()
+	mixer.stop_dsp()
+	mixer.queue_free()
 	await get_tree().process_frame
-	_smoke_log("step6 first freed")
+	_smoke_log("step6 first + mixer freed")
+	Libpd.server.audio_close()
 	print("SMOKE_OK")
 	_smoke_log("SMOKE_OK calling quit(0)")
 	_finish_smoke(0)

@@ -189,6 +189,12 @@ public:
 		return channels_;
 	}
 
+	/** Total blocks pushed since construction (main-thread readable). */
+	uint64_t blocks_pushed() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return count_;
+	}
+
 	int blocksize() const {
 		return blocksize_;
 	}
