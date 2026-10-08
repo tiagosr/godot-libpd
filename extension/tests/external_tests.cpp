@@ -302,11 +302,101 @@ static void test_dsp_objects() {
 	worker.join();
 }
 
+
+// 4) in-house external tjcount (externals/tjcount): up-only 0..3 counter.
+//    Bangs give 1,2,3,wrap->0; the wrap bang (right outlet -> host.wrap)
+//    must arrive BEFORE the wrapped count (left outlet -> host.count).
+//    Out-of-range floats clamp; "set" is silent; an invalid "min 5"
+//    (>= max) is rejected without changing the range.
+static void test_tjcount() {
+	std::printf("-- tjcount (in-house external)\n");
+	const PatchFile patch = write_temp_patch(
+			"#N canvas 0 0 400 300 12;\n"
+			"#X obj 10 10 r trig;\n"
+			"#X obj 10 40 r setin;\n"
+			"#X obj 10 70 tjcount 0 3;\n"
+			"#X obj 10 110 s host.count;\n"
+			"#X obj 10 140 s host.wrap;\n"
+			"#X connect 0 0 2 0;\n"
+			"#X connect 1 0 2 0;\n"
+			"#X connect 2 0 3 0;\n"
+			"#X connect 2 1 4 0;\n");
+
+	std::mutex ev_mutex;
+	std::vector<PdEvent> events;
+	DrySink sink;
+
+	LibpdWorker worker(make_config(24, 0, ev_mutex, events, &sink));
+	worker.start();
+	const int init_result = init_worker(worker, 0);
+	if (init_result == k_command_timeout || init_result != 0) {
+		worker.request_stop();
+		worker.join();
+		return;
+	}
+
+	CHECK(subscribe(worker, "host.count") == 0);
+	CHECK(subscribe(worker, "host.wrap") == 0);
+	PdCommand load;
+	load.opcode = PdCommand::LOAD;
+	load.path = patch.path;
+	CHECK(push_and_wait(worker, load) == 0);
+	sleep_ms(100);
+
+	// wrap: 1, 2, 3, 0 (bang on the 0)
+	for (int i = 0; i < 4; i++)
+		send_message(worker, "trig", "");
+	sleep_ms(200);
+	// 1 (no wrap), then clamp 99 -> 3, then set 1 (silent) + bang -> 2,
+	// then rejected min + bang -> 3 (no wrap: range unchanged).
+	send_message(worker, "trig", "");
+	send_message(worker, "trig", "99");
+	send_message(worker, "setin", "set 1");
+	send_message(worker, "trig", "");
+	send_message(worker, "setin", "min 5");
+	send_message(worker, "trig", "");
+	sleep_ms(300);
+
+	const std::vector<PdEvent> snap = snapshot(ev_mutex, events);
+	const std::vector<float> vals = floats_for(snap, "host.count");
+	std::printf("   count:");
+	for (float v : vals)
+		std::printf(" %g", v);
+	std::printf("\n");
+	int wrap_bangs = 0;
+	int wrap_idx = -1, wrapped_zero_idx = -1;
+	for (size_t i = 0; i < snap.size(); i++) {
+		const PdEvent &e = snap[i];
+		if (e.type == PdEvent::BANG && std::string(e.data) == "host.wrap") {
+			wrap_bangs++;
+			if (wrap_idx < 0) {
+				wrap_idx = (int)i;
+			}
+		}
+		if (e.type == PdEvent::FLOAT && std::string(e.data) == "host.count"
+				&& e.fval == 0.0f) {
+			wrapped_zero_idx = (int)i; // last one is the wrap
+		}
+	}
+	std::vector<float> expected = { 1.f, 2.f, 3.f, 0.f, 1.f, 3.f, 2.f, 3.f };
+	CHECK(vals.size() == expected.size());
+	if (vals.size() == expected.size()) {
+		for (size_t i = 0; i < expected.size(); i++)
+			CHECK(std::fabsf(vals[i] - expected[i]) < 1e-6f);
+	}
+	CHECK(wrap_bangs == 1);
+	CHECK(wrap_idx >= 0 && wrap_idx < wrapped_zero_idx); // bang before count
+
+	worker.request_stop();
+	worker.join();
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	test_control_objects();
 	test_nonalphanumeric();
 	test_dsp_objects();
+	test_tjcount();
 	std::printf("externals done\n");
 	std::printf("%d FAILURES\n", failures);
 	return failures == 0 ? 0 : 1;

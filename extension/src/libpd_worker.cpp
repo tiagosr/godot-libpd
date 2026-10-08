@@ -681,8 +681,13 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 			// goes through receive_anything() -> outlet_anything(), which
 			// forwards an empty-selector typedmess that audio objects (osc~,
 			// dac~, ...) reject with "error: <obj>: no method for ''". Use the
-			// typed entry points: bang (no args), float/symbol (one arg), or
-			// list (multiple args).
+			// typed entry points: bang (no args), float/symbol (one arg), or a
+			// multi-atom message. Multi-atom split: a SYMBOL first atom is a
+			// message-box selector ("set 1" -> obj's "set" method) and must go
+			// through libpd_message()/pd_typedmess; a FLOAT first atom is a pure
+			// list (host LIST hook + [r] list forwarding) and goes through
+			// libpd_list() — a pure s_list does NOT trigger method dispatch,
+			// so symbol-first messages must not use it.
 			const char *recv = p_command.path.c_str();
 			if (argc == 0) {
 				libpd_bang(recv);
@@ -692,6 +697,8 @@ void LibpdWorker::execute_command(const PdCommand &p_command) {
 				} else {
 					libpd_symbol(recv, atoms[0].a_w.w_symbol->s_name);
 				}
+			} else if (atoms[0].a_type == A_SYMBOL) {
+				libpd_message(recv, atoms[0].a_w.w_symbol->s_name, argc - 1, atoms + 1);
 			} else {
 				libpd_list(recv, argc, atoms);
 			}

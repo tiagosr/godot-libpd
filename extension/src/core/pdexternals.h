@@ -1,6 +1,6 @@
 /**
- * One-time registration of the vendored pd externals (cyclone + else;
- * see cmake/pdexternals.cmake). Must run after libpd_init() and before
+ * One-time registration of the vendored pd externals (cyclone + else +
+ * in-house tj externals; see cmake/pdexternals.cmake). Must run after libpd_init() and before
  * any patch load; called from LibpdWorker::init_pd_globals_once().
  *
  * class_new() registers into the global class list and into the method

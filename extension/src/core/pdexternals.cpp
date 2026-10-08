@@ -9,6 +9,9 @@ void cyclone_setup(void);
 // every *_setup of the compiled else objects (the else.c bootstrap is
 // excluded on purpose - it pulls in lua + TCL GUI plugins).
 void register_else_objects(void);
+// tj externals (in-house; externals/tjcount - also a classic Pd/Plugdata
+// external; see its README).
+void tjcount_setup(void);
 }
 
 namespace godot_libpd {
@@ -16,6 +19,7 @@ namespace godot_libpd {
 void register_pdexternals() {
 	cyclone_setup();
 	register_else_objects();
+	tjcount_setup();
 }
 
 } // namespace godot_libpd

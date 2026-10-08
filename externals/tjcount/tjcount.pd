@@ -1,0 +1,11 @@
+#N canvas 100 100 500 300 12;
+#X text 20 20 tjcount [min max] — up-only ranged counter (tj externals);
+#X text 20 40 inlets: bang / float (clamped set + output) / "set f" / "min f" / "max f";
+#X text 20 60 1) min  2) max — outlets: left = count, right = bang on max->min wrap (bang BEFORE the count);
+#X obj 120 120 tjcount 0 3;
+#X obj 120 180 print tjcount;
+#X obj 190 180 print tjcount-wrap;
+#X obj 120 60 bng 15 250 50 0 empty empty bang 0 -8 0 10 #fcfcfc #000000 #000000;
+#X connect 6 0 0 0;
+#X connect 0 0 1 0;
+#X connect 0 1 2 0;

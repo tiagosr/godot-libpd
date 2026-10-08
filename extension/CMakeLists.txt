@@ -149,7 +149,7 @@ target_include_directories(godot_libpd PRIVATE
     thirdparty/libpd/libpd_wrapper/util
 )
 
-target_link_libraries(godot_libpd PRIVATE godot-cpp libpd_static cyclone pdelse)
+target_link_libraries(godot_libpd PRIVATE godot-cpp libpd_static cyclone pdelse tjcount)
 if(ANDROID)
     target_link_libraries(godot_libpd PRIVATE rtmidi)
 endif()
@@ -312,7 +312,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
+    target_link_libraries(libpd_worker_midi_tests PRIVATE libpd_static godot-cpp cyclone pdelse tjcount pthread)
     add_test(NAME worker_midi_tests COMMAND $<TARGET_FILE:libpd_worker_midi_tests>)
 
     # Receive hooks (patch -> host messages): the worker's BANG/FLOAT/SYMBOL
@@ -330,7 +330,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_message_hook_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
+    target_link_libraries(libpd_message_hook_tests PRIVATE libpd_static godot-cpp cyclone pdelse tjcount pthread)
     add_test(NAME message_hook_tests COMMAND $<TARGET_FILE:libpd_message_hook_tests>)
 
     # Abstraction arguments ($1/$2 instantiation): LOAD with args generates
@@ -349,7 +349,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_abstraction_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
+    target_link_libraries(libpd_abstraction_tests PRIVATE libpd_static godot-cpp cyclone pdelse tjcount pthread)
     add_test(NAME abstraction_tests COMMAND $<TARGET_FILE:libpd_abstraction_tests>)
 
     # Vendored pd externals (cyclone + else): control objects, non-
@@ -368,7 +368,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(libpd_external_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
+    target_link_libraries(libpd_external_tests PRIVATE libpd_static godot-cpp cyclone pdelse tjcount pthread)
     add_test(NAME external_tests COMMAND $<TARGET_FILE:libpd_external_tests>)
 
     # Multi-instance regression (P1-1 investigated, disproven): per-instance
@@ -389,7 +389,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
         thirdparty/libpd/libpd_wrapper
         thirdparty/libpd/libpd_wrapper/util
     )
-    target_link_libraries(multi_instance_midi_tests PRIVATE libpd_static godot-cpp cyclone pdelse pthread)
+    target_link_libraries(multi_instance_midi_tests PRIVATE libpd_static godot-cpp cyclone pdelse tjcount pthread)
     add_test(NAME multi_instance_midi_tests COMMAND $<TARGET_FILE:multi_instance_midi_tests>)
 
     # M5 native audio. Pure (no godot-cpp): libpd + the core C++ + PortAudio.
@@ -436,7 +436,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             thirdparty/libpd/libpd_wrapper/util
         )
         target_compile_definitions(native_worker_tests PRIVATE NATIVE_AUDIO)
-        target_link_libraries(native_worker_tests PRIVATE libpd_static cyclone pdelse pthread)
+        target_link_libraries(native_worker_tests PRIVATE libpd_static cyclone pdelse tjcount pthread)
         add_test(NAME native_worker_tests COMMAND $<TARGET_FILE:native_worker_tests>)
 
         # T6: server audio API + ring wiring (Option B end-to-end, NullPort).
@@ -455,7 +455,7 @@ if(BUILD_LIBPD_TESTS AND NOT ANDROID)
             thirdparty/libpd/pure-data/src
         )
         target_compile_definitions(server_audio_tests PRIVATE NATIVE_AUDIO)
-        target_link_libraries(server_audio_tests PRIVATE libpd_static portaudio_lib cyclone pdelse pthread)
+        target_link_libraries(server_audio_tests PRIVATE libpd_static portaudio_lib cyclone pdelse tjcount pthread)
         if(APPLE)
             target_link_libraries(server_audio_tests PRIVATE
                 "-framework CoreAudio" "-framework CoreFoundation"

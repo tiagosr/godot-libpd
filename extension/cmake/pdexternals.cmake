@@ -274,3 +274,18 @@ target_include_directories(pdelse PUBLIC
 target_compile_definitions(pdelse PRIVATE PDINSTANCE=1 PDTHREADS=1 PD_INTERNAL=1)
 target_compile_options(pdelse PRIVATE
     -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast)
+
+# ---------------------------------------------------------------------------
+# In-house external: externals/tjcount (tj externals series). The same
+# source builds as a classic Pd/Plugdata external (its own makefile) and
+# here as a static lib for the embedded build; registration via
+# core/pdexternals.cpp -> tjcount_setup().
+# ---------------------------------------------------------------------------
+set(PDEXTERNALS_TJ_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../externals/tjcount")
+add_library(tjcount STATIC
+    "${PDEXTERNALS_TJ_ROOT}/tjcount.c")
+target_include_directories(tjcount PUBLIC "${PDEXTERNALS_PD_SRC}")
+target_compile_definitions(tjcount PRIVATE
+    PDINSTANCE=1 PDTHREADS=1 PD_INTERNAL=1)
+target_compile_options(tjcount PRIVATE
+    -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast)
