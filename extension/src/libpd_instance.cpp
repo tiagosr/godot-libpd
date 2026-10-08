@@ -132,9 +132,27 @@ void LibpdInstance::_exit_tree() {
 	if (is_mixer() && LibpdServer::get_singleton() != nullptr) {
 		LibpdServer::get_singleton()->audio_unbind_mixer(this);
 	}
+	// SYNTH: unregister the ring BEFORE stopping the worker (see the
+	// ordering note above) - waits at most one callback tick.
+	if (!is_mixer() && synth_ring != nullptr && LibpdServer::get_singleton() != nullptr) {
+		LibpdServer::get_singleton()->audio_unregister_ring(this, synth_ring);
+	}
 #endif
 	// Synchronous teardown (spec §5): stop, join, then the pd instance is
 	// freed on the worker thread.
+	//
+	// Ordering (teardown deadlock, 2026-10-08): the SYNTH ring must be
+	// UNREGISTERED while the worker is still alive. The PortAudio callback
+	// holds NativeAudio's rings mutex for a whole tick - kick + unbounded
+	// wait_done() on every registered ring + gather - so a tick that finds
+	// this ring still registered after its worker has exited would wait in
+	// wait_done() forever and keep the mutex; _exit_tree's unregister would
+	// then block on it forever (repro: smoke step5/6 hung ~20% of runs).
+	// Unregistering first is bounded: the mutex is held for at most one
+	// tick, and every worker the tick is waiting on is still alive. The
+	// worker then stops (request_stop nudges the ring's CV so its
+	// wait_for_kick() exits even without further kicks) and the now-
+	// unregistered ring is freed after the join.
 	if (worker.is_running()) {
 		mlog((uint32_t)worker.instance_id(), "[main] _exit_tree: request_stop+join start");
 		worker.request_stop();
@@ -150,12 +168,9 @@ void LibpdInstance::_exit_tree() {
 		player = nullptr; // avoid dangling after the tree frees it
 	}
 #ifdef NATIVE_AUDIO
-	// SYNTH: the worker is joined above (no more ring pushes); unregister the
-	// ring with the server, then free it.
+	// SYNTH: the worker is joined above (no more ring pushes) and the ring
+	// was already unregistered before the stop; free it now.
 	if (!is_mixer() && synth_ring != nullptr) {
-		if (LibpdServer::get_singleton() != nullptr) {
-			LibpdServer::get_singleton()->audio_unregister_ring(this, synth_ring);
-		}
 		delete synth_ring;
 		synth_ring = nullptr;
 	}
