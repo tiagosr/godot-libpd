@@ -391,12 +391,97 @@ static void test_tjcount() {
 	worker.join();
 }
 
+static void test_tjlistfind() {
+	std::printf("-- tjlistfind (in-house external)\n");
+	const PatchFile patch = write_temp_patch(
+			"#N canvas 0 0 400 300 12;\n"
+			"#X obj 10 10 r l;\n"
+			"#X obj 10 40 r cmd;\n"
+			"#X obj 10 70 tjlistfind 2.0;\n"
+			"#X obj 10 100 tjlistfind 0.1 0.001;\n"
+			"#X obj 10 130 s host.idxA;\n"
+			"#X obj 10 160 s host.idxB;\n"
+			"#X connect 0 0 2 0;\n"
+			"#X connect 1 0 2 0;\n"
+			"#X connect 2 0 4 0;\n"
+			"#X connect 0 0 3 0;\n"
+			"#X connect 3 0 5 0;\n");
+
+	std::mutex ev_mutex;
+	std::vector<PdEvent> events;
+	DrySink sink;
+
+	LibpdWorker worker(make_config(24, 0, ev_mutex, events, &sink));
+	worker.start();
+	const int init_result = init_worker(worker, 0);
+	if (init_result == k_command_timeout || init_result != 0) {
+		worker.request_stop();
+		worker.join();
+		return;
+	}
+
+	CHECK(subscribe(worker, "host.idxA") == 0);
+	CHECK(subscribe(worker, "host.idxB") == 0);
+	PdCommand load;
+	load.opcode = PdCommand::LOAD;
+	load.path = patch.path;
+	CHECK(push_and_wait(worker, load) == 0);
+	sleep_ms(100);
+
+	// A: target 2.0 exact.  B: target 0.1, tolerance 0.001.
+	// 1. list 1 2 3        -> A:2 (match at 1-indexed 2), B:0
+	// 2. list 9 foo 2 7    -> A:3 (symbol skipped), B:0
+	// 3. float 2           -> A:1 (single float = 1-element list), B:0
+	// 4. float 7           -> A:0
+	// 5. list 5.5 0.1005 3 -> A:0, B:2 (|0.1005-0.1| <= 0.001)
+	// 6. find 0.1005, list 5 0.1005 -> A:2, B:2 (method retargets)
+	// 7. find 2.0, tolerance 0.05, list 2.03 -> A:1 (within new tolerance), B:0
+	send_message(worker, "l", "1 2 3");
+	send_message(worker, "l", "9 foo 2 7");
+	send_message(worker, "l", "2");
+	send_message(worker, "l", "7");
+	send_message(worker, "l", "5.5 0.1005 3");
+	send_message(worker, "cmd", "find 0.1005");
+	send_message(worker, "l", "5 0.1005");
+	send_message(worker, "cmd", "find 2.0");
+	send_message(worker, "cmd", "tolerance 0.05");
+	send_message(worker, "l", "2.03");
+	sleep_ms(300);
+
+	const std::vector<PdEvent> snap = snapshot(ev_mutex, events);
+	const std::vector<float> idxA = floats_for(snap, "host.idxA");
+	const std::vector<float> idxB = floats_for(snap, "host.idxB");
+	std::printf("   idxA:");
+	for (float v : idxA)
+		std::printf(" %g", v);
+	std::printf("\n   idxB:");
+	for (float v : idxB)
+		std::printf(" %g", v);
+	std::printf("\n");
+	std::vector<float> expA = { 2.f, 3.f, 1.f, 0.f, 0.f, 2.f, 1.f };
+	std::vector<float> expB = { 0.f, 0.f, 0.f, 0.f, 2.f, 2.f, 0.f };
+	CHECK(idxA.size() == expA.size());
+	CHECK(idxB.size() == expB.size());
+	if (idxA.size() == expA.size()) {
+		for (size_t i = 0; i < expA.size(); i++)
+			CHECK(std::fabsf(idxA[i] - expA[i]) < 1e-6f);
+	}
+	if (idxB.size() == expB.size()) {
+		for (size_t i = 0; i < expB.size(); i++)
+			CHECK(std::fabsf(idxB[i] - expB[i]) < 1e-6f);
+	}
+
+	worker.request_stop();
+	worker.join();
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	test_control_objects();
 	test_nonalphanumeric();
 	test_dsp_objects();
 	test_tjcount();
+	test_tjlistfind();
 	std::printf("externals done\n");
 	std::printf("%d FAILURES\n", failures);
 	return failures == 0 ? 0 : 1;

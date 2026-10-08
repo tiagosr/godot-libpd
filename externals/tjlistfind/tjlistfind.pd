@@ -1,0 +1,17 @@
+#N canvas 0 0 420 320 12;
+#X text 10 10 tjlistfind <target> <tolerance>;
+#X text 10 30 Takes a list of floats and outputs the 1-INDEXED position
+;
+#X text 10 45 of the first float within tolerance of the target (0 when
+;
+#X text 10 60 absent). Non-float atoms are skipped. A single float is a
+;
+#X text 10 75 one-element list. "find f" / "tolerance f" change the search
+;
+#X text 10 90 at runtime (no output).;
+#X obj 20 120 r in;
+#X obj 20 150 tjlistfind 2.0;
+#X obj 20 180 s out;
+#X connect 0 0 1 0;
+#X connect 1 0 2 0;
+#X text 120 150 example: [1.5 2 3] -> 2  ;

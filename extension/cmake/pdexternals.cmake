@@ -289,3 +289,14 @@ target_compile_definitions(tjcount PRIVATE
     PDINSTANCE=1 PDTHREADS=1 PD_INTERNAL=1)
 target_compile_options(tjcount PRIVATE
     -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast)
+
+# In-house external: externals/tjlistfind (tj externals series) - same
+# dual build as tjcount.
+set(PDEXTERNALS_TJLISTFIND_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../externals/tjlistfind")
+add_library(tjlistfind STATIC
+    "${PDEXTERNALS_TJLISTFIND_ROOT}/tjlistfind.c")
+target_include_directories(tjlistfind PUBLIC "${PDEXTERNALS_PD_SRC}")
+target_compile_definitions(tjlistfind PRIVATE
+    PDINSTANCE=1 PDTHREADS=1 PD_INTERNAL=1)
+target_compile_options(tjlistfind PRIVATE
+    -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast)
